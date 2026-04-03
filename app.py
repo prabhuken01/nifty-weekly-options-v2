@@ -1,0 +1,324 @@
+"""
+Nifty Weekly Options Strategy Dashboard
+Tabs: 1-Backtest  2-Live Signal  3-IV History
+"""
+import streamlit as st
+import pandas as pd
+import numpy as np
+from scipy.stats import norm
+from datetime import date, timedelta
+import math
+
+st.set_page_config(page_title="Nifty Options Dashboard", layout="wide",
+                   page_icon="chart_with_upwards_trend",
+                   initial_sidebar_state="expanded")
+
+# NSE holidays 2026 - update yearly
+NSE_HOLIDAYS_2026 = {
+    date(2026, 1, 26), date(2026, 3, 25), date(2026, 4, 2),
+    date(2026, 4, 5),  date(2026, 4, 6),  date(2026, 4, 14),
+    date(2026, 5, 1),  date(2026, 8, 15), date(2026, 10, 2),
+    date(2026, 10, 26),date(2026, 11, 4), date(2026, 12, 25),
+}
+
+def effective_dte(from_date, expiry):
+    count = 0
+    d = from_date + timedelta(days=1)
+    while d <= expiry:
+        if d.weekday() < 5 and d not in NSE_HOLIDAYS_2026:
+            count += 1
+        d += timedelta(days=1)
+    return max(count, 1)
+
+def bs_nd2(spot, strike, iv_ann, dte_days, r=0.065):
+    if iv_ann <= 0 or dte_days <= 0:
+        return 0.99
+    T = dte_days / 365
+    d2 = (math.log(spot / strike) + (r - 0.5 * iv_ann**2) * T) / (iv_ann * math.sqrt(T))
+    return float(norm.cdf(d2))
+
+def ivp_quality(ivp_pct):
+    return min(100, ivp_pct * 1.25)
+
+def comp_score(prob, ivp_pct):
+    return round(prob * 60 + ivp_quality(ivp_pct) * 0.40)
+
+def sig_label(score, threshold=65):
+    if score >= threshold: return "SELL"
+    if score >= 50:        return "MONITOR"
+    return "AVOID"
+
+def sig_color(label):
+    return {"SELL": "#C6EFCE", "MONITOR": "#FFEB9C", "AVOID": "#FFC7CE"}[label]
+
+def cushion_color(ratio):
+    if ratio >= 2.0: return "#C6EFCE"
+    if ratio >= 1.0: return "#FFEB9C"
+    return "#FFC7CE"
+
+# Sidebar
+with st.sidebar:
+    st.markdown("### Controls")
+    data_src   = st.selectbox("Data source", ["NSE Bhavcopy (EOD)", "DhanHQ API", "Kite Connect"])
+    instrument = st.selectbox("Instrument", ["NIFTY 50", "SENSEX"])
+    lookback_m = st.selectbox("Lookback (months)", [6, 12, 24, 36], index=1)
+    entry_time = st.selectbox("Entry time", ["T-2 closing","T-1 opening","T-1 closing","T opening","T closing"])
+    exit_time  = st.selectbox("Exit time",  ["T-1 closing","T opening","T closing"])
+    st.markdown("---")
+    ivp_range  = st.slider("IVP regime filter (%)", 0, 100, (20, 80))
+    excl_fri   = st.toggle("Exclude Friday entries", value=True)
+    sig_thresh = st.slider("Signal threshold", 50, 90, 65)
+    st.markdown("---")
+    expiry_dt  = st.date_input("Next expiry", value=date(2026, 4, 7))
+    today_dt   = st.date_input("Today's date", value=date(2026, 4, 3))
+    dte_adj    = effective_dte(today_dt, expiry_dt)
+    st.info(f"Effective DTE: **{dte_adj} days** (holidays excluded)")
+    st.markdown("---")
+    lot_size     = 65 if instrument == "NIFTY 50" else 10
+    capital_base = 500_000
+    st.caption(f"Lot: {lot_size} | Capital: Rs {capital_base:,}")
+
+# Mock live data - replace with API
+SPOT   = {"NIFTY 50": 22700, "SENSEX": 79408}
+IV_ANN = {"NIFTY 50": 0.142, "SENSEX": 0.138}
+IVP    = {"NIFTY 50": 42,    "SENSEX": 38}
+CHG    = {"NIFTY 50": "+87 (+0.38%)", "SENSEX": "-112 (-0.14%)"}
+
+spot   = SPOT[instrument]
+iv     = IV_ANN[instrument]
+ivp    = IVP[instrument]
+ivp_ok = ivp_range[0] <= ivp <= ivp_range[1]
+
+PUT_OFFSETS  = [-0.045, -0.040, -0.035, -0.030, -0.025]
+CALL_OFFSETS = [+0.025, +0.030, +0.035, +0.040, +0.045]
+
+def top_bar():
+    c1, c2, c3, c4, c5 = st.columns([2, 2, 2, 2, 3])
+    c1.metric("NIFTY 50", f"Rs {SPOT['NIFTY 50']:,}", CHG["NIFTY 50"])
+    c2.metric("NIFTY IV", f"{IV_ANN['NIFTY 50']*100:.1f}%", f"IVP {IVP['NIFTY 50']}")
+    c3.metric("SENSEX",   f"Rs {SPOT['SENSEX']:,}", CHG["SENSEX"])
+    c4.metric("SENSEX IV", f"{IV_ANN['SENSEX']*100:.1f}%", f"IVP {IVP['SENSEX']}")
+    regime = "ALLOW" if ivp_ok else "SKIP"
+    c5.info(f"**Regime:** {regime} | IVP {ivp} | DTE {dte_adj} | {'Fri excluded' if excl_fri else 'All days'}")
+
+# Tabs
+tab1, tab2, tab3 = st.tabs(["Tab 1 - Backtest", "Tab 2 - Live Signal", "Tab 3 - IV History"])
+
+# ── TAB 1 ─────────────────────────────────────────────────────────────────────
+with tab1:
+    top_bar()
+    st.markdown("---")
+    bt = {
+        "Strike offset": ["+-2.5%", "+-3.0%", "+-3.5% Best", "+-4.0%", "+-4.5%"],
+        "Gross P&L":  [16840, 20480, 24960, 18700, 11200],
+        "Costs":      [1980,  2060,  2200,  2110,  2010],
+        "Vega":       [-340,  -290,  -220,  -160,  -110],
+        "Theta":      [620,   510,   440,   370,   290],
+        "Win rate":   [68,    74,    81,    77,    72],
+        "Max DD":     [-11200,-8400, -6100, -4400, -3100],
+    }
+    df = pd.DataFrame(bt)
+    df["Net P&L"]        = df["Gross P&L"] - df["Costs"]
+    df["Net/month %"]    = (df["Net P&L"] / (capital_base * lookback_m) * 100).round(1)
+    df["Return on 5L %"] = (df["Net P&L"] / capital_base * 100).round(1)
+    df["DD/month %"]     = (df["Max DD"] / (capital_base * lookback_m) * 100).round(1)
+    df["Cushion"]        = (df["Theta"] / df["Vega"].abs()).round(1)
+
+    ca, cb, cc = st.columns(3)
+    with ca:
+        st.markdown("**Return on capital (%)**")
+        st.bar_chart(df.set_index("Strike offset")["Return on 5L %"], color="#1D9E75")
+    with cb:
+        st.markdown("**Win rate (%)**")
+        st.bar_chart(df.set_index("Strike offset")["Win rate"], color="#378ADD")
+    with cc:
+        st.markdown("**Max drawdown (Rs)**")
+        st.bar_chart(df.set_index("Strike offset")["Max DD"].abs(), color="#E24B4A")
+
+    st.markdown("---")
+    st.caption(f"Capital: Rs {capital_base:,} | Lookback: {lookback_m}m | Entry: {entry_time} | Exit: {exit_time} | {'Fridays excluded' if excl_fri else 'All days'} | IVP filter: {ivp_range[0]}-{ivp_range[1]}%")
+
+    disp = df.rename(columns={
+        "Gross P&L": "Gross P&L (Rs)", "Costs": "Costs (Rs)",
+        "Net P&L": "Net P&L (Rs)", "Vega": "Vega (Rs/1%IV)",
+        "Theta": "Theta (Rs/day)", "Win rate": "Win rate (%)",
+        "Max DD": "Max DD (Rs)", "Net/month %": "Net/month (%)",
+        "Return on 5L %": "Return on Rs5L (%)", "DD/month %": "DD/month (%)",
+        "Cushion": "Cushion (T/V)"
+    })
+    st.dataframe(disp[[
+        "Strike offset","Gross P&L (Rs)","Costs (Rs)","Net P&L (Rs)",
+        "Net/month (%)","Return on Rs5L (%)","Vega (Rs/1%IV)",
+        "Theta (Rs/day)","Cushion (T/V)","Win rate (%)","Max DD (Rs)","DD/month (%)"
+    ]], use_container_width=True, hide_index=True)
+
+    with st.expander("Glossary & display rules"):
+        st.markdown("""
+**Net/month (%)** — Net P&L / (Rs 5,00,000 x lookback months). Shows return pace per month.
+
+**Max DD/month (%)** — Largest loss / (Rs 5L x months). Negative = monthly capital at risk.
+
+**Vega (Rs per 1% IV)** — P&L change for every 1% rise in IV. Negative because you are SHORT vol. Example: Vega=-220 means IV +5% costs you Rs 1,100.
+
+**Theta (Rs/day)** — Daily time-decay income. Positive because you are short options. Theta=+440 means you earn Rs 440 per calendar day held.
+
+**Cushion ratio (Theta / |Vega|)** — How many IV points must spike in ONE day to wipe today's Theta. 2x = IV needs to jump 2 full points to cancel one day's decay. Green >= 2x, Amber 1-2x, Red < 1x.
+
+**Signal score** — 60% x BS probability N(d2) + 40% x IVP quality (IVP x 1.25, capped 100). Threshold adjustable in sidebar.
+
+**Holiday DTE** — Calendar days minus weekends and NSE holidays. Example: Apr 3 to Apr 7 — Sat (5th) + Sun (6th) excluded = effective DTE of 2 days. Makes probability higher, Theta steeper.
+
+**Display rules** — Rs: integers, Indian comma format. Percentages: one decimal. Ratios: one decimal + x. Negatives: in brackets.
+        """)
+
+# ── TAB 2 ─────────────────────────────────────────────────────────────────────
+with tab2:
+    top_bar()
+    st.markdown("---")
+
+    if not ivp_ok:
+        st.error(f"REGIME: SKIP - IVP={ivp} outside {ivp_range[0]}-{ivp_range[1]}%. No trades today.")
+    else:
+        st.success(f"REGIME: ALLOW - IVP={ivp} in range. DTE={dte_adj} days (holiday-adjusted).")
+
+    def make_leg(offsets, side):
+        rows = []
+        for off in offsets:
+            strike    = round(spot * (1 + off))
+            prem      = max(1, int(abs(off) * spot * 0.08 * (dte_adj / 5) * 100))
+            profit    = prem * lot_size
+            cap_req   = int(spot * lot_size * 0.18 * (1 + abs(off)))
+            ret_pct   = round(profit / cap_req * 100, 1)
+            prob      = bs_nd2(spot, strike, iv, dte_adj) if side == "put" \
+                        else 1 - bs_nd2(spot, strike, iv, dte_adj)
+            theta     = round(prem * lot_size / dte_adj)
+            vega      = round(-prem * lot_size * 0.15)
+            cushion   = round(theta / abs(vega), 1) if vega != 0 else 0
+            score     = comp_score(prob, ivp)
+            action    = sig_label(score, sig_thresh)
+            ext_spot  = strike * (0.995 if side == "put" else 1.005)
+            ext_loss  = round((strike - ext_spot) * lot_size) if side == "put" \
+                        else round((ext_spot - strike) * lot_size)
+            rows.append({
+                "Offset": f"{off*100:+.1f}%",
+                "Strike": strike,
+                "Premium (Rs)": prem,
+                "Profit/lot (Rs)": profit,
+                "Capital (Rs)": cap_req,
+                "Return/lot (%)": ret_pct,
+                "Prob N(d2) (%)": round(prob * 100),
+                "Theta (Rs/day)": theta,
+                "Vega (Rs/1%IV)": vega,
+                "Cushion": cushion,
+                "Score": score,
+                "Action": action,
+                "Extreme loss (Rs)": ext_loss,
+            })
+        return pd.DataFrame(rows)
+
+    put_df  = make_leg(PUT_OFFSETS,  "put")
+    call_df = make_leg(CALL_OFFSETS, "call")
+    bp = put_df.loc[put_df["Score"].idxmax()]
+    bc = call_df.loc[call_df["Score"].idxmax()]
+
+    v1, v2, v3, v4 = st.columns(4)
+    v1.metric("Best put strike",  f"{bp['Strike']:,} ({bp['Offset']})",
+              f"Score {bp['Score']} | Prob {bp['Prob N(d2) (%)']}%")
+    v2.metric("Best call strike", f"{bc['Strike']:,} ({bc['Offset']})",
+              f"Score {bc['Score']} | Prob {bc['Prob N(d2) (%)']}%")
+    strangle = bp["Score"] >= sig_thresh and bc["Score"] >= sig_thresh
+    rec = "Strangle" if strangle else \
+          ("Sell call" if bc["Score"] >= sig_thresh else
+           ("Sell put" if bp["Score"] >= sig_thresh else "Stay out"))
+    v3.metric("Recommendation", rec, f"Threshold: {sig_thresh}")
+    v4.metric("Best call cushion", f"{bc['Cushion']}x", ">=2x safe | 1-2x watch | <1x risky")
+
+    st.markdown("---")
+
+    def color_row(df):
+        def _apply(col):
+            if col.name == "Action":
+                return [f"background-color:{sig_color(v)}" for v in col]
+            return [""] * len(col)
+        return df.style.apply(_apply)
+
+    st.markdown("**PUT LEG — sell put (profit if spot stays above strike)**")
+    st.dataframe(color_row(put_df), use_container_width=True, hide_index=True)
+
+    st.markdown("**CALL LEG — sell call (profit if spot stays below strike)**")
+    st.dataframe(color_row(call_df), use_container_width=True, hide_index=True)
+
+    st.markdown("---")
+    st.caption(f"Extreme loss = 0.5% beyond outer strike on last trading day. "
+               f"Max acceptable loss < 5% of Rs {capital_base:,} = Rs {capital_base//20:,}")
+
+    with st.expander("Glossary - live signal"):
+        st.markdown("""
+**Prob N(d2)** — Black-Scholes probability the option expires worthless. Inputs: Spot, Strike, IV (annualised), r=6.5%, holiday-adjusted DTE. Example: 94% on a put means 94% chance spot stays above that strike at expiry.
+
+**Cushion ratio (Theta / |Vega|)** — How many IV percentage-points must spike in ONE day to wipe your daily Theta income. Example: Theta=+440, Vega=-220, ratio=2.0x means IV must rise 2 full points (e.g. 14% to 16%) in a single day to cancel out today's decay income. Green >= 2x, Amber 1-2x, Red < 1x.
+
+**Signal score** — Composite 0-100. Formula: N(d2) probability x 0.60 + IVP quality x 0.40. IVP quality = IVP x 1.25 capped at 100. Threshold set in sidebar (default 65).
+
+**Extreme loss 0.5%** — Worst-case loss if spot moves 0.5% beyond the outer strike on the last trading day before expiry. You enter at fag-end of theta decay so extreme moves beyond this are tail events. Use this to size: extreme loss should be below 5% of capital.
+
+**Holiday-adjusted DTE** — Apr 3 (Thu) to Apr 7 (Mon): Apr 5 (Sat) + Apr 6 (Sun) = 0 trading days. Effective DTE = 2. This compresses Theta (faster decay per day) and lifts N(d2) probability (strike is safer with less time).
+        """)
+
+# ── TAB 3 ─────────────────────────────────────────────────────────────────────
+with tab3:
+    top_bar()
+    st.markdown("---")
+
+    period_sel = st.radio("Period", ["1D", "1H", "5M"], horizontal=True)
+    src_note = {
+        "1D": "Source: NSE Bhavcopy EOD | ATM mid-price IV | Free, T+1 by 6 PM",
+        "1H": "Source: DhanHQ Historical API or Kite Instruments | Requires API key",
+        "5M": "Source: Same as 1H | High noise - cross-check with 1D IVP before acting",
+    }
+    st.caption(src_note[period_sel])
+
+    np.random.seed(42)
+    base_iv = 14.2
+    nifty_iv  = np.clip(base_iv + np.cumsum(np.random.randn(30) * 0.3), 10, 22).round(1)
+    sensex_iv = np.clip(base_iv - 0.4 + np.cumsum(np.random.randn(30) * 0.3), 10, 22).round(1)
+    periods = [f"P{i+1}" for i in range(30)]
+
+    iv_df = pd.DataFrame({
+        "Period": periods,
+        "NIFTY IV (%)":  nifty_iv,
+        "SENSEX IV (%)": sensex_iv,
+    })
+    iv_df["NIFTY IVP (%)"]  = [round(sum(nifty_iv[:i+1]  < nifty_iv[i])  / min(i+1,30) * 100) for i in range(30)]
+    iv_df["SENSEX IVP (%)"] = [round(sum(sensex_iv[:i+1] < sensex_iv[i]) / min(i+1,30) * 100) for i in range(30)]
+
+    st.markdown("**Implied Volatility - last 30 periods**")
+    st.line_chart(iv_df.set_index("Period")[["NIFTY IV (%)", "SENSEX IV (%)"]])
+
+    st.caption(f"IVP floor: {ivp_range[0]}% | IVP ceiling: {ivp_range[1]}% | "
+               f"Current NIFTY IVP: {ivp} | Current SENSEX IVP: {IVP['SENSEX']}")
+
+    st.markdown("**IVP rank by period**")
+    st.bar_chart(iv_df.set_index("Period")[["NIFTY IVP (%)", "SENSEX IVP (%)"]])
+
+    st.markdown("---")
+    st.dataframe(iv_df, use_container_width=True, hide_index=True)
+
+    with st.expander("Glossary - IV history"):
+        st.markdown("""
+**ATM IV%** — Implied Volatility extracted from At-The-Money option mid-price using Black-Scholes reverse. Represents the market's consensus forecast of future volatility. Higher = market fears larger moves.
+
+**IVP rank** — IV Percentile over last 30 periods. Formula: count(periods where IV < today's IV) / 30. 0% = IV at historic low. 100% = historic high. Trade zone: 20-80%.
+
+**1D period** — One trading day's closing ATM IV. Source: NSE Bhavcopy (free, T+1 available by 6 PM).
+
+**1H period** — One hourly IV snapshot. Source: DhanHQ Historical API or Kite Instruments. Requires API key.
+
+**5M period** — One 5-minute candle. Same source as 1H. Use only for final-hour entry timing. High noise.
+
+**Rising IV + low IVP** — Volatility expanding from base. Cautious - potential skip.
+
+**Falling IV + high IVP** — Volatility compressing from peak. Ideal selling environment.
+
+**Flat IV + mid IVP (30-60)** — Stable regime. Standard signal logic applies.
+        """)
