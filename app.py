@@ -131,10 +131,22 @@ with tab1:
     st.markdown("---")
 
     # Dynamic backtest P&L with REAL market premium data from Kite API
+    @st.cache_data(ttl=3600)
+    def fetch_historical_premiums(instrument_type, strike_offset_pct, expiry_date):
+        """Fetch historical option premiums for backtest.
+        NOTE: Phase 2 will cache these to Google Sheets/database to avoid repeated API calls.
+        For now, returns None to use formula-based fallback."""
+        # TODO Phase 2: Implement historical premium fetch from cached Google Sheets or database
+        # For now, return None to use formula fallback
+        return None
+
     def generate_backtest_pnl(lookback_m, strike_offset_pct, win_rate=0.70, trades_per_month=4, ivp_range=(0, 100)):
         """Calculate P&L using real market premium data.
         Real NIFTY ATM premium: Rs 1,267/contract × 65 lot = Rs 82,331 gross
-        Real loss model: 1% capital loss per losing trade = Rs 5,000"""
+        Real loss model: 1% capital loss per losing trade = Rs 5,000
+
+        PHASE 2 ROADMAP: Historical premiums will be fetched from cached database to enable
+        accurate backtesting without repeated API calls."""
 
         total_trades = lookback_m * trades_per_month
 
@@ -160,6 +172,7 @@ with tab1:
 
         # REAL MARKET DATA: NIFTY ATM weekly premium = Rs 1,267/contract
         # Premium DECREASES with wider offset (far OTM = lower premium)
+        # NOTE: These values would be fetched from historical cache in Phase 2
         base_premium_per_contract = 1267  # Kite API actual: 684.85 CE + 581.80 PE
         # Offset factor: closer to ATM = higher premium, further OTM = lower premium
         offset_factor = 1.0 - (abs(strike_offset_pct) - 0.025) / 0.045 * 0.35  # Correct scaling
@@ -268,18 +281,58 @@ with tab2:
     else:
         st.success(f"REGIME: ALLOW - IVP={ivp} in range. DTE={dte_adj} days (holiday-adjusted).")
 
+    @st.cache_data(ttl=3600)
+    def fetch_option_premiums(instrument_type, offsets, side, spot_price, expiry_date):
+        """Fetch actual option premiums from Kite API for given strikes."""
+        premiums = {}
+        exchange = "NFO" if instrument == "NIFTY 50" else "BFO"
+
+        # Format expiry as DDMMMYY (e.g., 07APR for April 7)
+        exp_str = expiry_date.strftime("%d%b").upper()
+
+        try:
+            for off in offsets:
+                strike = round(spot_price * (1 + off))
+                # Build symbol: e.g., NFO:NIFTY07APR23250CE or BFO:SENSEX07APR73250PE
+                instr_prefix = "NIFTY" if instrument == "NIFTY 50" else "SENSEX"
+                symbol = f"{exchange}:{instr_prefix}{exp_str}{strike}{'CE' if side == 'call' else 'PE'}"
+
+                # Fetch actual premium from Kite API
+                try:
+                    quote = mcp__kite__get_quotes([symbol])
+                    if symbol in quote and 'last_price' in quote[symbol]:
+                        premiums[off] = quote[symbol]['last_price']
+                    else:
+                        premiums[off] = None
+                except Exception as e:
+                    st.warning(f"Could not fetch {symbol}: {str(e)}")
+                    premiums[off] = None
+        except Exception as e:
+            st.warning(f"Error fetching option premiums: {str(e)}")
+
+        return premiums
+
     def make_leg(offsets, side):
         rows = []
+
+        # Fetch actual premiums from Kite API
+        premium_map = fetch_option_premiums(instrument, offsets, side, spot, expiry_dt)
+
         for off in offsets:
-            strike    = round(spot * (1 + off))
-            # Dynamic premium: INVERSE relationship with offset (closer to ATM = higher premium)
-            # Base: ATM premium ~Rs 1267/contract; decreases with distance from ATM
-            iv_factor = iv / 0.14  # Normalize to baseline 14% IV
-            # Premium decreases as offset increases: (1 - offset/max_offset)
-            offset_factor = 1.0 - (abs(off) - 0.025) / 0.02  # 0-1 range, higher for ATM
-            offset_factor = max(0.3, min(1.0, offset_factor))  # Clamp between 0.3-1.0
-            base_premium = 1267  # Real market: NIFTY ATM strangle premium
-            prem = max(5, int(base_premium * offset_factor * iv_factor / 65))  # Per contract, not per lot
+            strike = round(spot * (1 + off))
+
+            # Use ACTUAL Kite API premium if available, fallback to formula
+            prem = premium_map.get(off)
+            if prem is None:
+                # Fallback: formula-based if API unavailable
+                iv_factor = iv / 0.14
+                offset_factor = 1.0 - (abs(off) - 0.025) / 0.02
+                offset_factor = max(0.3, min(1.0, offset_factor))
+                base_premium = 1267
+                prem = max(5, int(base_premium * offset_factor * iv_factor / 65))
+            else:
+                prem = int(prem)  # Convert to Rs (already per contract)
+
             profit    = prem * lot_size
             # Capital requirement: Fixed at 2.5L per side (not offset-dependent)
             cap_req   = 250_000 if instrument == "NIFTY 50" else 125_000
