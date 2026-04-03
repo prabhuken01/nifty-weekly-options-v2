@@ -283,34 +283,16 @@ with tab2:
 
     @st.cache_data(ttl=3600)
     def fetch_option_premiums(instrument_type, offsets, side, spot_price, expiry_date):
-        """Fetch actual option premiums from Kite API for given strikes."""
-        premiums = {}
-        exchange = "NFO" if instrument == "NIFTY 50" else "BFO"
+        """Fetch actual option premiums from Kite API for given strikes.
 
-        # Format expiry as DDMMMYY (e.g., 07APR for April 7)
-        exp_str = expiry_date.strftime("%d%b").upper()
-
-        try:
-            for off in offsets:
-                strike = round(spot_price * (1 + off))
-                # Build symbol: e.g., NFO:NIFTY07APR23250CE or BFO:SENSEX07APR73250PE
-                instr_prefix = "NIFTY" if instrument == "NIFTY 50" else "SENSEX"
-                symbol = f"{exchange}:{instr_prefix}{exp_str}{strike}{'CE' if side == 'call' else 'PE'}"
-
-                # Fetch actual premium from Kite API
-                try:
-                    quote = mcp__kite__get_quotes([symbol])
-                    if symbol in quote and 'last_price' in quote[symbol]:
-                        premiums[off] = quote[symbol]['last_price']
-                    else:
-                        premiums[off] = None
-                except Exception as e:
-                    st.warning(f"Could not fetch {symbol}: {str(e)}")
-                    premiums[off] = None
-        except Exception as e:
-            st.warning(f"Error fetching option premiums: {str(e)}")
-
-        return premiums
+        NOTE: Requires Kite API authentication. Set KITE_API_KEY in environment.
+        For now, returns None to use formula fallback if API unavailable.
+        Phase 2 will implement full API integration with historical caching.
+        """
+        # TODO: Integrate with kiteconnect library or REST API
+        # For Phase 1, return None to fall back to formula-based estimation
+        # Phase 2 will properly fetch from cached Google Sheets/database
+        return {off: None for off in offsets}
 
     def make_leg(offsets, side):
         rows = []
