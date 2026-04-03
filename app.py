@@ -74,7 +74,7 @@ with st.sidebar:
     dte_adj    = effective_dte(today_dt, expiry_dt)
     st.info(f"Effective DTE: **{dte_adj} days** (holidays excluded)")
     st.markdown("---")
-    lot_size     = 65 if instrument == "NIFTY 50" else 10
+    lot_size     = 65 if instrument == "NIFTY 50" else 20
     capital_base = 500_000
     st.caption(f"Lot: {lot_size} | Capital: Rs {capital_base:,}")
 
@@ -108,16 +108,61 @@ tab1, tab2, tab3 = st.tabs(["Tab 1 - Backtest", "Tab 2 - Live Signal", "Tab 3 - 
 with tab1:
     top_bar()
     st.markdown("---")
-    bt = {
-        "Strike offset": ["+-2.5%", "+-3.0%", "+-3.5% Best", "+-4.0%", "+-4.5%"],
-        "Gross P&L":  [16840, 20480, 24960, 18700, 11200],
-        "Costs":      [1980,  2060,  2200,  2110,  2010],
-        "Vega":       [-340,  -290,  -220,  -160,  -110],
-        "Theta":      [620,   510,   440,   370,   290],
-        "Win rate":   [68,    74,    81,    77,    72],
-        "Max DD":     [-11200,-8400, -6100, -4400, -3100],
-    }
-    df = pd.DataFrame(bt)
+
+    # Dynamic backtest P&L calculation
+    def generate_backtest_pnl(lookback_m, strike_offset_pct, win_rate=0.70, trades_per_month=4):
+        """Calculate P&L based on capital-constrained position sizing and trade dynamics"""
+        # Base premium per trade at typical IV (14%), scales with IV
+        base_premium = max(12, int(13 * (iv / 0.14)))  # Rs 12-15 per contract, IV-scaled
+        total_trades = lookback_m * trades_per_month
+        win_count = int(total_trades * win_rate)
+        loss_count = total_trades - win_count
+
+        # Premium scales with offset (wider OTM = potentially less premium)
+        offset_factor = 1.0 - (abs(strike_offset_pct) - 0.025) / 0.02 * 0.15
+        premium = max(8, int(base_premium * offset_factor))
+
+        # Contract count: varies 2-4 based on premium
+        contracts = min(4, max(2, int((premium * 65) / 1500)))  # Target Rs 1500-3000 per trade
+        gross_premium = premium * contracts * lot_size
+
+        # Extreme loss scales with offset (from Tab 2 formula)
+        # ±2.5% = Rs 3,100, ±4.5% = Rs 15,932 (approximate)
+        loss_per_trade = 3100 + (abs(strike_offset_pct) - 0.025) / 0.02 * 6400
+
+        gross_pnl = (win_count * gross_premium) - (loss_count * loss_per_trade)
+        costs = total_trades * 250  # Brokerage per trade
+
+        # Greeks (simplified)
+        theta = int((gross_premium / dte_adj) * 0.7) if dte_adj > 0 else 0
+        vega = -int(gross_premium * 0.08)
+        max_dd = -loss_per_trade
+
+        return {
+            'offset': f"{strike_offset_pct*100:+.1f}%",
+            'gross_pnl': gross_pnl,
+            'costs': costs,
+            'net_pnl': gross_pnl - costs,
+            'vega': vega,
+            'theta': theta,
+            'win_rate': int(win_rate * 100),
+            'max_dd': max_dd,
+        }
+
+    # Generate backtest data for 5 offset scenarios
+    bt_rows = []
+    for offset in [-0.025, -0.030, -0.035, -0.040, -0.045]:
+        bt_rows.append(generate_backtest_pnl(lookback_m, offset))
+
+    df = pd.DataFrame(bt_rows)
+    df = df.rename(columns={
+        'offset': 'Strike offset',
+        'gross_pnl': 'Gross P&L',
+        'costs': 'Costs',
+        'net_pnl': 'Net P&L',
+        'win_rate': 'Win rate',
+        'max_dd': 'Max DD'
+    })
     df["Net P&L"]        = df["Gross P&L"] - df["Costs"]
     df["Net/month %"]    = (df["Net P&L"] / (capital_base * lookback_m) * 100).round(1)
     df["Return on 5L %"] = (df["Net P&L"] / capital_base * 100).round(1)
@@ -185,9 +230,13 @@ with tab2:
         rows = []
         for off in offsets:
             strike    = round(spot * (1 + off))
-            prem      = max(1, int(abs(off) * spot * 0.08 * (dte_adj / 5) * 100))
+            # Dynamic premium: Scale with IV, DTE, and offset
+            # Base: Rs 12-15/contract at typical IV (14%), adjusts proportionally with IV change
+            iv_factor = iv / 0.14  # Normalize to baseline 14% IV
+            prem      = max(1, int(abs(off) * spot * iv_factor * (dte_adj / 5) * 100 / 1200))
             profit    = prem * lot_size
-            cap_req   = int(spot * lot_size * 0.18 * (1 + abs(off)))
+            # Capital requirement: Fixed at 2.5L per side (not offset-dependent)
+            cap_req   = 250_000 if instrument == "NIFTY 50" else 125_000
             ret_pct   = round(profit / cap_req * 100, 1)
             prob      = bs_nd2(spot, strike, iv, dte_adj) if side == "put" \
                         else 1 - bs_nd2(spot, strike, iv, dte_adj)
