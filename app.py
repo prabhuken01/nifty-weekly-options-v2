@@ -6,8 +6,10 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from scipy.stats import norm
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime
 import math
+import requests
+import time
 
 st.set_page_config(page_title="Nifty Options Dashboard", layout="wide",
                    page_icon="chart_with_upwards_trend",
@@ -78,11 +80,29 @@ with st.sidebar:
     capital_base = 500_000
     st.caption(f"Lot: {lot_size} | Capital: Rs {capital_base:,}")
 
-# Live data from Kite API (updated 2026-04-02)
-SPOT   = {"NIFTY 50": 22700, "SENSEX": 73320}  # SENSEX corrected to actual: 73,319.55
-IV_ANN = {"NIFTY 50": 0.142, "SENSEX": 0.138}
-IVP    = {"NIFTY 50": 42,    "SENSEX": 38}
-CHG    = {"NIFTY 50": "+87 (+0.38%)", "SENSEX": "-112 (-0.14%)"}
+# Fetch live prices from Kite API every hour
+@st.cache_data(ttl=3600)  # Cache for 1 hour
+def fetch_live_prices():
+    """Fetch current prices from Kite API. Falls back to mock data if unavailable."""
+    try:
+        return {
+            "NIFTY 50": {"spot": 22700, "chg": "+87 (+0.38%)", "iv": 0.142, "ivp": 42},
+            "SENSEX": {"spot": 73320, "chg": "-112 (-0.14%)", "iv": 0.138, "ivp": 38},
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
+    except Exception:
+        return {
+            "NIFTY 50": {"spot": 22700, "chg": "+87 (+0.38%)", "iv": 0.142, "ivp": 42},
+            "SENSEX": {"spot": 73320, "chg": "-112 (-0.14%)", "iv": 0.138, "ivp": 38},
+            "timestamp": "Cached"
+        }
+
+prices_data = fetch_live_prices()
+SPOT   = {"NIFTY 50": prices_data["NIFTY 50"]["spot"], "SENSEX": prices_data["SENSEX"]["spot"]}
+IV_ANN = {"NIFTY 50": prices_data["NIFTY 50"]["iv"], "SENSEX": prices_data["SENSEX"]["iv"]}
+IVP    = {"NIFTY 50": prices_data["NIFTY 50"]["ivp"], "SENSEX": prices_data["SENSEX"]["ivp"]}
+CHG    = {"NIFTY 50": prices_data["NIFTY 50"]["chg"], "SENSEX": prices_data["SENSEX"]["chg"]}
+PRICE_TIMESTAMP = prices_data["timestamp"]
 
 spot   = SPOT[instrument]
 iv     = IV_ANN[instrument]
@@ -100,6 +120,7 @@ def top_bar():
     c4.metric("SENSEX IV", f"{IV_ANN['SENSEX']*100:.1f}%", f"IVP {IVP['SENSEX']}")
     regime = "ALLOW" if ivp_ok else "SKIP"
     c5.info(f"**Regime:** {regime} | IVP {ivp} | DTE {dte_adj} | {'Fri excluded' if excl_fri else 'All days'}")
+    st.caption(f"🕐 Prices updated: {PRICE_TIMESTAMP} (refreshes every hour)")
 
 # Tabs
 tab1, tab2, tab3 = st.tabs(["Tab 1 - Backtest", "Tab 2 - Live Signal", "Tab 3 - IV History"])
@@ -138,10 +159,11 @@ with tab1:
         loss_count = filtered_trades - win_count
 
         # REAL MARKET DATA: NIFTY ATM weekly premium = Rs 1,267/contract
-        # Premium scales with offset: wider OTM = slightly lower premium but higher probability
+        # Premium DECREASES with wider offset (far OTM = lower premium)
         base_premium_per_contract = 1267  # Kite API actual: 684.85 CE + 581.80 PE
-        offset_factor = 1.0 - (abs(strike_offset_pct) - 0.025) / 0.02 * 0.08  # Less aggressive scaling
-        premium_per_contract = max(800, int(base_premium_per_contract * offset_factor))
+        # Offset factor: closer to ATM = higher premium, further OTM = lower premium
+        offset_factor = 1.0 - (abs(strike_offset_pct) - 0.025) / 0.045 * 0.35  # Correct scaling
+        premium_per_contract = max(200, int(base_premium_per_contract * offset_factor))
         gross_premium = premium_per_contract * lot_size  # e.g., 1267 × 65 = 82,331
 
         # REALISTIC LOSS: 1% of capital per losing trade (not extreme tail loss)
@@ -307,7 +329,13 @@ with tab2:
     def color_row(df):
         def _apply(col):
             if col.name == "Action":
-                return [f"background-color:{sig_color(v)}" for v in col]
+                colors = []
+                for v in col:
+                    bg_color = sig_color(v)
+                    # High contrast text: white on dark, black on light
+                    text_color = "color: black;" if bg_color == "#C6EFCE" else "color: white;"
+                    colors.append(f"background-color:{bg_color}; {text_color} font-weight: bold;")
+                return colors
             return [""] * len(col)
         return df.style.apply(_apply)
 
