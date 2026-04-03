@@ -272,10 +272,14 @@ with tab2:
         rows = []
         for off in offsets:
             strike    = round(spot * (1 + off))
-            # Dynamic premium: Scale with IV, DTE, and offset
-            # Base: Rs 12-15/contract at typical IV (14%), adjusts proportionally with IV change
+            # Dynamic premium: INVERSE relationship with offset (closer to ATM = higher premium)
+            # Base: ATM premium ~Rs 1267/contract; decreases with distance from ATM
             iv_factor = iv / 0.14  # Normalize to baseline 14% IV
-            prem      = max(1, int(abs(off) * spot * iv_factor * (dte_adj / 5) * 100 / 1200))
+            # Premium decreases as offset increases: (1 - offset/max_offset)
+            offset_factor = 1.0 - (abs(off) - 0.025) / 0.02  # 0-1 range, higher for ATM
+            offset_factor = max(0.3, min(1.0, offset_factor))  # Clamp between 0.3-1.0
+            base_premium = 1267  # Real market: NIFTY ATM strangle premium
+            prem = max(5, int(base_premium * offset_factor * iv_factor / 65))  # Per contract, not per lot
             profit    = prem * lot_size
             # Capital requirement: Fixed at 2.5L per side (not offset-dependent)
             cap_req   = 250_000 if instrument == "NIFTY 50" else 125_000
