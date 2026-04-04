@@ -10,10 +10,32 @@ from datetime import date, timedelta, datetime
 import math
 import requests
 import time
+import os
 
 st.set_page_config(page_title="Nifty Options Dashboard", layout="wide",
                    page_icon="chart_with_upwards_trend",
                    initial_sidebar_state="expanded")
+
+# Mobile-responsive CSS
+st.markdown("""
+<style>
+/* ── Mobile: large, readable metrics ─────────────────────────────────── */
+@media (max-width: 768px) {
+    /* Bigger metric values */
+    div[data-testid="metric-container"] label { font-size: 13px !important; }
+    div[data-testid="metric-container"] > div { font-size: 20px !important; font-weight: 700 !important; }
+    /* Horizontal scroll for tables */
+    div[data-testid="stDataFrame"] > div { overflow-x: auto; }
+    div[data-testid="stDataFrame"] table { font-size: 11px !important; }
+    /* Tabs: allow wrapping */
+    div[data-testid="stTabs"] button { font-size: 13px !important; padding: 6px 10px !important; }
+    /* Sidebar toggle visible */
+    section[data-testid="stSidebar"] { min-width: 0 !important; }
+}
+/* Desktop: keep existing look */
+div[data-testid="metric-container"] > div { font-weight: 600; }
+</style>
+""", unsafe_allow_html=True)
 
 # NSE holidays 2026 - update yearly
 NSE_HOLIDAYS_2026 = {
@@ -38,6 +60,19 @@ def bs_nd2(spot, strike, iv_ann, dte_days, r=0.065):
     T = dte_days / 365
     d2 = (math.log(spot / strike) + (r - 0.5 * iv_ann**2) * T) / (iv_ann * math.sqrt(T))
     return float(norm.cdf(d2))
+
+def bs_option_premium(spot, strike, iv_ann, dte_days, option_type="put", r=0.065):
+    """Black-Scholes premium in index points. Returns realistic option price."""
+    T = max(dte_days, 0.5) / 365  # minimum half-day to avoid zero-T artifacts
+    if iv_ann <= 0:
+        return max(0.05, strike - spot) if option_type == "put" else max(0.05, spot - strike)
+    d1 = (math.log(spot / strike) + (r + 0.5 * iv_ann**2) * T) / (iv_ann * math.sqrt(T))
+    d2 = d1 - iv_ann * math.sqrt(T)
+    if option_type == "put":
+        price = strike * math.exp(-r * T) * norm.cdf(-d2) - spot * norm.cdf(-d1)
+    else:
+        price = spot * norm.cdf(d1) - strike * math.exp(-r * T) * norm.cdf(d2)
+    return max(0.05, round(price, 2))
 
 def ivp_quality(ivp_pct):
     return min(100, ivp_pct * 1.25)
@@ -83,19 +118,54 @@ with st.sidebar:
 # Fetch live prices from Kite API every hour
 @st.cache_data(ttl=3600)  # Cache for 1 hour
 def fetch_live_prices():
-    """Fetch current prices from Kite API. Falls back to mock data if unavailable."""
-    try:
-        return {
-            "NIFTY 50": {"spot": 22700, "chg": "+87 (+0.38%)", "iv": 0.142, "ivp": 42},
-            "SENSEX": {"spot": 73320, "chg": "-112 (-0.14%)", "iv": 0.138, "ivp": 38},
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        }
-    except Exception:
-        return {
-            "NIFTY 50": {"spot": 22700, "chg": "+87 (+0.38%)", "iv": 0.142, "ivp": 42},
-            "SENSEX": {"spot": 73320, "chg": "-112 (-0.14%)", "iv": 0.138, "ivp": 38},
-            "timestamp": "Cached"
-        }
+    """Fetch current spot + IV from Kite API.
+    Set KITE_API_KEY and KITE_ACCESS_TOKEN env vars to enable live data.
+    Falls back to mock data when credentials are absent."""
+    api_key = os.environ.get("KITE_API_KEY", "")
+    access_token = os.environ.get("KITE_ACCESS_TOKEN", "")
+
+    if api_key and access_token:
+        try:
+            from kiteconnect import KiteConnect
+            kite = KiteConnect(api_key=api_key)
+            kite.set_access_token(access_token)
+
+            quotes = kite.quote(["NSE:NIFTY 50", "BSE:SENSEX"])
+            nq = quotes.get("NSE:NIFTY 50", {})
+            sq = quotes.get("BSE:SENSEX", {})
+
+            n_spot = nq.get("last_price", 22700)
+            s_spot = sq.get("last_price", 73320)
+            n_chg  = nq.get("change", 0)
+            n_pct  = nq.get("change_percent", 0)
+            s_chg  = sq.get("change", 0)
+            s_pct  = sq.get("change_percent", 0)
+
+            # IV: use India VIX / 100 if available; else keep last known
+            vix_q  = kite.quote(["NSE:INDIA VIX"])
+            n_iv   = vix_q.get("NSE:INDIA VIX", {}).get("last_price", 14.2) / 100
+            s_iv   = n_iv * 0.97  # SENSEX IV tracks NIFTY IV closely
+
+            return {
+                "NIFTY 50": {"spot": n_spot,
+                             "chg": f"{n_chg:+.0f} ({n_pct:+.2f}%)",
+                             "iv": n_iv, "ivp": 42},
+                "SENSEX":   {"spot": s_spot,
+                             "chg": f"{s_chg:+.0f} ({s_pct:+.2f}%)",
+                             "iv": s_iv, "ivp": 38},
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "source": "Kite",
+            }
+        except Exception as e:
+            st.sidebar.warning(f"Kite API: {e}. Using mock data.")
+
+    # ── Mock / fallback ────────────────────────────────────────────────────
+    return {
+        "NIFTY 50": {"spot": 22700, "chg": "+87 (+0.38%)", "iv": 0.142, "ivp": 42},
+        "SENSEX":   {"spot": 73320, "chg": "-112 (-0.14%)", "iv": 0.138, "ivp": 38},
+        "timestamp": "Mock data — set KITE_API_KEY + KITE_ACCESS_TOKEN for live prices",
+        "source": "Mock",
+    }
 
 prices_data = fetch_live_prices()
 SPOT   = {"NIFTY 50": prices_data["NIFTY 50"]["spot"], "SENSEX": prices_data["SENSEX"]["spot"]}
@@ -283,59 +353,96 @@ with tab2:
 
     @st.cache_data(ttl=3600)
     def fetch_option_premiums(instrument_type, offsets, side, spot_price, expiry_date):
-        """Fetch actual option premiums from Kite API for given strikes.
+        """Fetch actual LTP for each strike from Kite API.
+        Returns {offset: price_in_points} or {offset: None} on failure.
+        Falls back to Black-Scholes in make_leg() when None is returned."""
+        api_key = os.environ.get("KITE_API_KEY", "")
+        access_token = os.environ.get("KITE_ACCESS_TOKEN", "")
 
-        NOTE: Requires Kite API authentication. Set KITE_API_KEY in environment.
-        For now, returns None to use formula fallback if API unavailable.
-        Phase 2 will implement full API integration with historical caching.
-        """
-        # TODO: Integrate with kiteconnect library or REST API
-        # For Phase 1, return None to fall back to formula-based estimation
-        # Phase 2 will properly fetch from cached Google Sheets/database
-        return {off: None for off in offsets}
+        if not (api_key and access_token):
+            return {off: None for off in offsets}
+
+        try:
+            from kiteconnect import KiteConnect
+            kite = KiteConnect(api_key=api_key)
+            kite.set_access_token(access_token)
+
+            # Fetch NFO instrument list (cached 24 h) to find correct tradingsymbol
+            @st.cache_data(ttl=86400)
+            def _nfo_instruments():
+                insts = kite.instruments("NFO")
+                df = pd.DataFrame(insts)
+                return df[df["name"] == ("NIFTY" if instrument_type == "NIFTY 50" else "SENSEX")]
+
+            insts_df = _nfo_instruments()
+            opt_type = "PE" if side == "put" else "CE"
+            result = {}
+
+            for off in offsets:
+                strike = int(round(spot_price * (1 + off) / 50) * 50)
+                mask = (
+                    (insts_df["strike"] == strike) &
+                    (insts_df["expiry"].apply(lambda d: d.date() if hasattr(d, "date") else d) == expiry_date) &
+                    (insts_df["instrument_type"] == opt_type)
+                )
+                matches = insts_df[mask]
+                if matches.empty:
+                    result[off] = None
+                    continue
+                symbol = f"NFO:{matches.iloc[0]['tradingsymbol']}"
+                try:
+                    q = kite.quote([symbol])
+                    result[off] = q[symbol]["last_price"]
+                except Exception:
+                    result[off] = None
+            return result
+
+        except Exception as e:
+            st.sidebar.warning(f"Option fetch error: {e}")
+            return {off: None for off in offsets}
 
     def make_leg(offsets, side):
         rows = []
 
-        # Fetch actual premiums from Kite API
+        # Fetch actual premiums from Kite API (returns None per offset when unavailable)
         premium_map = fetch_option_premiums(instrument, offsets, side, spot, expiry_dt)
 
-        for off in offsets:
-            strike = round(spot * (1 + off))
+        # Capital per leg and number of lots that capital supports
+        cap_req      = 250_000 if instrument == "NIFTY 50" else 125_000  # margin per leg
+        per_lot_margin = 125_000 if instrument == "NIFTY 50" else 62_500   # approx margin/lot
+        num_lots     = max(1, cap_req // per_lot_margin)  # 2 for NIFTY, 2 for SENSEX
 
-            # Use ACTUAL Kite API premium if available, fallback to formula
+        for off in offsets:
+            # Round strike to nearest 50 (NIFTY strike ladder)
+            strike = int(round(spot * (1 + off) / 50) * 50)
+
+            # Live Kite price takes priority; Black-Scholes is the fallback
             prem = premium_map.get(off)
             if prem is None:
-                # Fallback: formula-based if API unavailable
-                iv_factor = iv / 0.14
-                offset_factor = 1.0 - (abs(off) - 0.025) / 0.02
-                offset_factor = max(0.3, min(1.0, offset_factor))
-                base_premium = 1267
-                prem = max(5, int(base_premium * offset_factor * iv_factor / 65))
-            else:
-                prem = int(prem)  # Convert to Rs (already per contract)
+                prem = bs_option_premium(spot, strike, iv, dte_adj,
+                                         option_type=side)  # points per unit
+            prem = round(float(prem), 2)
 
-            profit    = prem * lot_size
-            # Capital requirement: Fixed at 2.5L per side (not offset-dependent)
-            cap_req   = 250_000 if instrument == "NIFTY 50" else 125_000
-            ret_pct   = round(profit / cap_req * 100, 1)
+            # Profit = premium collected × lot size × number of lots
+            profit    = round(prem * lot_size * num_lots)
+            ret_pct   = round(profit / cap_req * 100, 2)  # 2 decimal places
             prob      = bs_nd2(spot, strike, iv, dte_adj) if side == "put" \
                         else 1 - bs_nd2(spot, strike, iv, dte_adj)
-            theta     = round(prem * lot_size / dte_adj)
-            vega      = round(-prem * lot_size * 0.15)
+            theta     = round(prem * lot_size * num_lots / dte_adj)
+            vega      = round(-prem * lot_size * num_lots * 0.15)
             cushion   = round(theta / abs(vega), 1) if vega != 0 else 0
             score     = comp_score(prob, ivp)
             action    = sig_label(score, sig_thresh)
             ext_spot  = strike * (0.995 if side == "put" else 1.005)
-            ext_loss  = round((strike - ext_spot) * lot_size) if side == "put" \
-                        else round((ext_spot - strike) * lot_size)
+            ext_loss  = round((strike - ext_spot) * lot_size * num_lots) if side == "put" \
+                        else round((ext_spot - strike) * lot_size * num_lots)
             rows.append({
                 "Offset": f"{off*100:+.1f}%",
                 "Strike": strike,
                 "Premium (Rs)": prem,
-                "Profit/lot (Rs)": profit,
+                f"Profit/{num_lots}lot (Rs)": profit,
                 "Capital (Rs)": cap_req,
-                "Return/lot (%)": ret_pct,
+                "Return (%)": ret_pct,
                 "Prob N(d2) (%)": round(prob * 100),
                 "Theta (Rs/day)": theta,
                 "Vega (Rs/1%IV)": vega,
@@ -378,11 +485,25 @@ with tab2:
             return [""] * len(col)
         return df.style.apply(_apply)
 
+    # Build column_config for both legs (handles dynamic column name for num_lots)
+    _profit_col = [c for c in put_df.columns if c.startswith("Profit/")][0]
+    _col_cfg = {
+        "Premium (Rs)":   st.column_config.NumberColumn(format="%.2f"),
+        _profit_col:      st.column_config.NumberColumn(format="%d"),
+        "Capital (Rs)":   st.column_config.NumberColumn(format="%d"),
+        "Return (%)":     st.column_config.NumberColumn(format="%.2f"),
+        "Theta (Rs/day)": st.column_config.NumberColumn(format="%d"),
+        "Vega (Rs/1%IV)": st.column_config.NumberColumn(format="%d"),
+        "Extreme loss (Rs)": st.column_config.NumberColumn(format="%d"),
+    }
+
     st.markdown("**PUT LEG — sell put (profit if spot stays above strike)**")
-    st.dataframe(color_row(put_df), use_container_width=True, hide_index=True)
+    st.dataframe(color_row(put_df), use_container_width=True, hide_index=True,
+                 column_config=_col_cfg)
 
     st.markdown("**CALL LEG — sell call (profit if spot stays below strike)**")
-    st.dataframe(color_row(call_df), use_container_width=True, hide_index=True)
+    st.dataframe(color_row(call_df), use_container_width=True, hide_index=True,
+                 column_config=_col_cfg)
 
     st.markdown("---")
     st.caption(f"Extreme loss = 0.5% beyond outer strike on last trading day. "
