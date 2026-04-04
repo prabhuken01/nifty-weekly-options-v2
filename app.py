@@ -115,55 +115,127 @@ with st.sidebar:
     capital_base = 500_000
     st.caption(f"Lot: {lot_size} | Capital: Rs {capital_base:,}")
 
-# Fetch live prices from Kite API every hour
-@st.cache_data(ttl=3600)  # Cache for 1 hour
-def fetch_live_prices():
-    """Fetch current spot + IV from Kite API.
-    Set KITE_API_KEY and KITE_ACCESS_TOKEN env vars to enable live data.
-    Falls back to mock data when credentials are absent."""
-    api_key = os.environ.get("KITE_API_KEY", "")
-    access_token = os.environ.get("KITE_ACCESS_TOKEN", "")
+# ── NSE public API helpers (no auth required, 5-min cache) ────────────────────
+_NSE_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "*/*",
+    "Accept-Language": "en-US,en;q=0.5",
+    "Referer": "https://www.nseindia.com/",
+    "Connection": "keep-alive",
+}
 
+@st.cache_data(ttl=300)
+def _nse_get(path: str):
+    """GET from NSE public API with proper session/cookie setup."""
+    try:
+        sess = requests.Session()
+        sess.get("https://www.nseindia.com", headers=_NSE_HEADERS, timeout=8)
+        resp = sess.get(f"https://www.nseindia.com{path}",
+                        headers=_NSE_HEADERS, timeout=8)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception:
+        return None
+
+@st.cache_data(ttl=300)
+def fetch_nse_spot_iv():
+    """Return {nifty_spot, sensex_spot, nifty_iv, sensex_iv, nifty_chg, sensex_chg}
+    from NSE allIndices endpoint. Returns None on failure."""
+    data = _nse_get("/api/allIndices")
+    if not data:
+        return None
+    idx_map = {d["index"]: d for d in data.get("data", [])}
+    nifty  = idx_map.get("NIFTY 50", {})
+    sensex = idx_map.get("SENSEX", {})
+    vix    = idx_map.get("INDIA VIX", {})
+    if not nifty:
+        return None
+    n_spot = nifty.get("last", 0)
+    n_pct  = nifty.get("percentChange", 0)
+    n_chg  = nifty.get("change", 0)
+    s_spot = sensex.get("last", 0)
+    s_pct  = sensex.get("percentChange", 0)
+    s_chg  = sensex.get("change", 0)
+    vix_val = vix.get("last", 14.2)
+    n_iv   = vix_val / 100          # VIX is annualised %, convert to decimal
+    s_iv   = n_iv * 0.97
+    return {
+        "nifty_spot": n_spot, "sensex_spot": s_spot,
+        "nifty_iv": n_iv,     "sensex_iv": s_iv,
+        "nifty_chg":  f"{n_chg:+.0f} ({n_pct:+.2f}%)",
+        "sensex_chg": f"{s_chg:+.0f} ({s_pct:+.2f}%)",
+        "vix": vix_val,
+    }
+
+@st.cache_data(ttl=300)
+def fetch_nse_option_chain(nse_symbol: str):
+    """Fetch full NIFTY/BANKNIFTY option chain from NSE.
+    Returns raw JSON or None on failure."""
+    return _nse_get(f"/api/option-chain-indices?symbol={nse_symbol}")
+
+def nse_option_ltp(chain_json, expiry_date: date, strike: int, opt_type: str):
+    """Extract last-traded-price for a specific strike/expiry/type from NSE chain JSON.
+    opt_type: 'PE' or 'CE'. Returns None if not found."""
+    if not chain_json:
+        return None
+    # NSE expiry date format: "07-Apr-2026"
+    expiry_str = expiry_date.strftime("%-d-%b-%Y")
+    for row in chain_json.get("records", {}).get("data", []):
+        if row.get("strikePrice") == strike and row.get("expiryDate") == expiry_str:
+            return row.get(opt_type, {}).get("lastPrice")
+    return None
+
+# ── Fetch live prices: NSE → Kite → mock (priority order) ────────────────────
+@st.cache_data(ttl=300)   # 5-minute refresh (was 1 hour)
+def fetch_live_prices():
+    """Fetch spot + IV.  Priority: NSE public API → Kite Connect → mock.
+    Set KITE_API_KEY + KITE_ACCESS_TOKEN env vars to enable Kite fallback."""
+
+    # ── 1. Try NSE public API (no credentials needed) ─────────────────────
+    nse = fetch_nse_spot_iv()
+    if nse and nse["nifty_spot"] > 0:
+        return {
+            "NIFTY 50": {"spot": nse["nifty_spot"], "chg": nse["nifty_chg"],
+                         "iv": nse["nifty_iv"],    "ivp": 42},
+            "SENSEX":   {"spot": nse["sensex_spot"], "chg": nse["sensex_chg"],
+                         "iv": nse["sensex_iv"],    "ivp": 38},
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "source": "NSE",
+        }
+
+    # ── 2. Try Kite Connect (requires env vars) ────────────────────────────
+    api_key      = os.environ.get("KITE_API_KEY", "")
+    access_token = os.environ.get("KITE_ACCESS_TOKEN", "")
     if api_key and access_token:
         try:
             from kiteconnect import KiteConnect
             kite = KiteConnect(api_key=api_key)
             kite.set_access_token(access_token)
-
             quotes = kite.quote(["NSE:NIFTY 50", "BSE:SENSEX"])
             nq = quotes.get("NSE:NIFTY 50", {})
             sq = quotes.get("BSE:SENSEX", {})
-
-            n_spot = nq.get("last_price", 22700)
-            s_spot = sq.get("last_price", 73320)
-            n_chg  = nq.get("change", 0)
-            n_pct  = nq.get("change_percent", 0)
-            s_chg  = sq.get("change", 0)
-            s_pct  = sq.get("change_percent", 0)
-
-            # IV: use India VIX / 100 if available; else keep last known
-            vix_q  = kite.quote(["NSE:INDIA VIX"])
-            n_iv   = vix_q.get("NSE:INDIA VIX", {}).get("last_price", 14.2) / 100
-            s_iv   = n_iv * 0.97  # SENSEX IV tracks NIFTY IV closely
-
+            vix_q = kite.quote(["NSE:INDIA VIX"])
+            n_iv  = vix_q.get("NSE:INDIA VIX", {}).get("last_price", 14.2) / 100
             return {
-                "NIFTY 50": {"spot": n_spot,
-                             "chg": f"{n_chg:+.0f} ({n_pct:+.2f}%)",
+                "NIFTY 50": {"spot": nq.get("last_price", 0),
+                             "chg": f"{nq.get('change',0):+.0f} ({nq.get('change_percent',0):+.2f}%)",
                              "iv": n_iv, "ivp": 42},
-                "SENSEX":   {"spot": s_spot,
-                             "chg": f"{s_chg:+.0f} ({s_pct:+.2f}%)",
-                             "iv": s_iv, "ivp": 38},
+                "SENSEX":   {"spot": sq.get("last_price", 0),
+                             "chg": f"{sq.get('change',0):+.0f} ({sq.get('change_percent',0):+.2f}%)",
+                             "iv": n_iv * 0.97, "ivp": 38},
                 "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "source": "Kite",
             }
         except Exception as e:
-            st.sidebar.warning(f"Kite API: {e}. Using mock data.")
+            st.sidebar.warning(f"Kite: {e}")
 
-    # ── Mock / fallback ────────────────────────────────────────────────────
+    # ── 3. Mock fallback ───────────────────────────────────────────────────
     return {
         "NIFTY 50": {"spot": 22700, "chg": "+87 (+0.38%)", "iv": 0.142, "ivp": 42},
         "SENSEX":   {"spot": 73320, "chg": "-112 (-0.14%)", "iv": 0.138, "ivp": 38},
-        "timestamp": "Mock data — set KITE_API_KEY + KITE_ACCESS_TOKEN for live prices",
+        "timestamp": "⚠️ Mock data (NSE API unreachable) — live prices unavailable",
         "source": "Mock",
     }
 
@@ -190,7 +262,9 @@ def top_bar():
     c4.metric("SENSEX IV", f"{IV_ANN['SENSEX']*100:.1f}%", f"IVP {IVP['SENSEX']}")
     regime = "ALLOW" if ivp_ok else "SKIP"
     c5.info(f"**Regime:** {regime} | IVP {ivp} | DTE {dte_adj} | {'Fri excluded' if excl_fri else 'All days'}")
-    st.caption(f"🕐 Prices updated: {PRICE_TIMESTAMP} (refreshes every hour)")
+    src = prices_data.get("source", "Mock")
+    src_badge = {"NSE": "🟢 NSE live", "Kite": "🟢 Kite live", "Mock": "🟡 Mock data"}[src]
+    st.caption(f"{src_badge} | Updated: {PRICE_TIMESTAMP} | Options refresh every 5 min")
 
 # Tabs
 tab1, tab2, tab3 = st.tabs(["Tab 1 - Backtest", "Tab 2 - Live Signal", "Tab 3 - IV History"])
@@ -351,55 +425,61 @@ with tab2:
     else:
         st.success(f"REGIME: ALLOW - IVP={ivp} in range. DTE={dte_adj} days (holiday-adjusted).")
 
-    @st.cache_data(ttl=3600)
+    @st.cache_data(ttl=300)
     def fetch_option_premiums(instrument_type, offsets, side, spot_price, expiry_date):
-        """Fetch actual LTP for each strike from Kite API.
-        Returns {offset: price_in_points} or {offset: None} on failure.
-        Falls back to Black-Scholes in make_leg() when None is returned."""
-        api_key = os.environ.get("KITE_API_KEY", "")
-        access_token = os.environ.get("KITE_ACCESS_TOKEN", "")
+        """Fetch LTP for each strike.  Priority: NSE → Kite → None (BS used in make_leg).
+        Returns {offset: ltp_in_points_or_None}."""
+        opt_type  = "PE" if side == "put" else "CE"
+        nse_sym   = "NIFTY" if instrument_type == "NIFTY 50" else "SENSEX"
+        result    = {off: None for off in offsets}
 
-        if not (api_key and access_token):
-            return {off: None for off in offsets}
-
-        try:
-            from kiteconnect import KiteConnect
-            kite = KiteConnect(api_key=api_key)
-            kite.set_access_token(access_token)
-
-            # Fetch NFO instrument list (cached 24 h) to find correct tradingsymbol
-            @st.cache_data(ttl=86400)
-            def _nfo_instruments():
-                insts = kite.instruments("NFO")
-                df = pd.DataFrame(insts)
-                return df[df["name"] == ("NIFTY" if instrument_type == "NIFTY 50" else "SENSEX")]
-
-            insts_df = _nfo_instruments()
-            opt_type = "PE" if side == "put" else "CE"
-            result = {}
-
+        # ── 1. NSE public option chain ─────────────────────────────────────
+        chain = fetch_nse_option_chain(nse_sym)
+        if chain:
             for off in offsets:
                 strike = int(round(spot_price * (1 + off) / 50) * 50)
-                mask = (
-                    (insts_df["strike"] == strike) &
-                    (insts_df["expiry"].apply(lambda d: d.date() if hasattr(d, "date") else d) == expiry_date) &
-                    (insts_df["instrument_type"] == opt_type)
-                )
-                matches = insts_df[mask]
-                if matches.empty:
-                    result[off] = None
-                    continue
-                symbol = f"NFO:{matches.iloc[0]['tradingsymbol']}"
-                try:
-                    q = kite.quote([symbol])
-                    result[off] = q[symbol]["last_price"]
-                except Exception:
-                    result[off] = None
-            return result
+                ltp = nse_option_ltp(chain, expiry_date, strike, opt_type)
+                if ltp is not None and ltp > 0:
+                    result[off] = ltp
+            # If we got at least one real price, return (partials are fine; BS fills gaps)
+            if any(v is not None for v in result.values()):
+                return result
 
-        except Exception as e:
-            st.sidebar.warning(f"Option fetch error: {e}")
-            return {off: None for off in offsets}
+        # ── 2. Kite Connect fallback ───────────────────────────────────────
+        api_key      = os.environ.get("KITE_API_KEY", "")
+        access_token = os.environ.get("KITE_ACCESS_TOKEN", "")
+        if api_key and access_token:
+            try:
+                from kiteconnect import KiteConnect
+                kite = KiteConnect(api_key=api_key)
+                kite.set_access_token(access_token)
+
+                @st.cache_data(ttl=86400)
+                def _nfo_insts():
+                    df = pd.DataFrame(kite.instruments("NFO"))
+                    return df[df["name"] == nse_sym]
+
+                insts_df = _nfo_insts()
+                for off in offsets:
+                    strike = int(round(spot_price * (1 + off) / 50) * 50)
+                    mask = (
+                        (insts_df["strike"] == strike) &
+                        (insts_df["expiry"].apply(
+                            lambda d: d.date() if hasattr(d, "date") else d) == expiry_date) &
+                        (insts_df["instrument_type"] == opt_type)
+                    )
+                    matches = insts_df[mask]
+                    if not matches.empty:
+                        sym = f"NFO:{matches.iloc[0]['tradingsymbol']}"
+                        try:
+                            result[off] = kite.quote([sym])[sym]["last_price"]
+                        except Exception:
+                            pass
+            except Exception as e:
+                st.sidebar.warning(f"Kite option fetch: {e}")
+
+        # ── 3. Return whatever we have (None → BS in make_leg) ─────────────
+        return result
 
     def make_leg(offsets, side):
         rows = []
