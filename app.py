@@ -91,71 +91,101 @@ with st.sidebar:
     dte_adj    = effective_dte(today_dt, expiry_dt)
     st.info(f"Effective DTE: **{dte_adj} days** (holidays excluded)")
     st.markdown("---")
-    lot_size     = 65 if instrument == "NIFTY 50" else 20
-    capital_base = 500_000
-    st.caption(f"Lot: {lot_size} | Capital: Rs {capital_base:,}")
+    lot_size = 65 if instrument == "NIFTY 50" else 20
+    st.markdown("---")
+    st.markdown("**💰 Capital (from Dhan)**")
+    _f = st.session_state.get("_funds_display", None)
+    if _f:
+        st.metric("Available", f"₹{_f['available']:,.0f}")
+        st.metric("Used Margin", f"₹{_f['used']:,.0f}")
+        st.metric("Total Limit", f"₹{_f['total']:,.0f}")
+    else:
+        capital_base = st.number_input("Capital (Rs)", value=500_000, step=50_000)
+        st.caption("Enter token in Tab 2 to auto-fill from Dhan")
 
-# Fetch live prices from Kite API every hour
-@st.cache_data(ttl=3600)  # Cache for 1 hour
-def fetch_live_prices():
-    """Fetch current prices. Uses Live-fetching module if available, else mock data."""
+DHAN_CLIENT_ID = "1109450231"
+
+# ── Token: load from session, pre-fill from query_params if passed ──
+_qp_tok = st.query_params.get("tok", "")
+if _qp_tok and not st.session_state.get("dhan_tok"):
+    st.session_state["dhan_tok"] = _qp_tok
+
+def _dhan_headers(tok):
+    return {"Content-Type": "application/json",
+            "client-id": DHAN_CLIENT_ID, "access-token": tok}
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_dhan_ltp(tok):
+    """Fetch NIFTY50 and SENSEX LTP from Dhan market quote API."""
     try:
-        if HAS_LIVE_FETCHER:
-            fetcher = NIFTYOptionChainFetcher()
-            spot = fetcher.fetch_yesterday_close()
-            if spot:
-                # Calculate mock IV/IVP based on current market conditions
-                return {
-                    "NIFTY 50": {"spot": spot, "chg": "+0 (0.00%)", "iv": 0.142, "ivp": 42},
-                    "SENSEX": {"spot": int(spot * 3.23), "chg": "+0 (0.00%)", "iv": 0.138, "ivp": 38},
-                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "source": "Live (1-hour refresh)"
-                }
-        # Fallback to mock
-        return {
-            "NIFTY 50": {"spot": 22700, "chg": "+87 (+0.38%)", "iv": 0.142, "ivp": 42},
-            "SENSEX": {"spot": 73320, "chg": "-112 (-0.14%)", "iv": 0.138, "ivp": 38},
-            "timestamp": "Mock (nsepython unavailable)",
-            "source": "Mock"
-        }
-    except Exception as e:
-        return {
-            "NIFTY 50": {"spot": 22700, "chg": "+87 (+0.38%)", "iv": 0.142, "ivp": 42},
-            "SENSEX": {"spot": 73320, "chg": "-112 (-0.14%)", "iv": 0.138, "ivp": 38},
-            "timestamp": "Mock (error)",
-            "source": "Mock (Error: check nsepython)"
-        }
+        r = requests.post("https://api.dhan.co/v2/marketfeed/ltp",
+                          json={"NSE_EQ": [], "IDX_I": [13, 51]},
+                          headers=_dhan_headers(tok), timeout=8)
+        d = r.json()
+        idx = d.get("data", {}).get("IDX_I", {})
+        n_ltp = idx.get("13", {}).get("last_price", 0)
+        s_ltp = idx.get("51", {}).get("last_price", 0)
+        if n_ltp and s_ltp:
+            return {"nifty": float(n_ltp), "sensex": float(s_ltp),
+                    "source": "Dhan LTP", "ts": datetime.now().strftime("%H:%M:%S")}
+    except Exception:
+        pass
+    return None
 
-prices_data = fetch_live_prices()
-SPOT   = {"NIFTY 50": prices_data["NIFTY 50"]["spot"], "SENSEX": prices_data["SENSEX"]["spot"]}
-IV_ANN = {"NIFTY 50": prices_data["NIFTY 50"]["iv"], "SENSEX": prices_data["SENSEX"]["iv"]}
-IVP    = {"NIFTY 50": prices_data["NIFTY 50"]["ivp"], "SENSEX": prices_data["SENSEX"]["ivp"]}
-CHG    = {"NIFTY 50": prices_data["NIFTY 50"]["chg"], "SENSEX": prices_data["SENSEX"]["chg"]}
-PRICE_TIMESTAMP = prices_data["timestamp"]
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_dhan_funds(tok):
+    """Fetch available capital from Dhan funds API."""
+    try:
+        r = requests.get("https://api.dhan.co/v2/fundlimit",
+                         headers=_dhan_headers(tok), timeout=8)
+        d = r.json()
+        return {
+            "available": d.get("availabelBalance", 0),
+            "used":      d.get("utilizedAmount", 0),
+            "total":     d.get("sodLimit", 0),
+        }
+    except Exception:
+        return None
+
+# ── Fetch live data using token from session ──
+_tok_now = st.session_state.get("dhan_tok", "")
+_ltp     = fetch_dhan_ltp(_tok_now) if _tok_now else None
+_funds   = fetch_dhan_funds(_tok_now) if _tok_now else None
+
+SPOT = {
+    "NIFTY 50": _ltp["nifty"]  if _ltp else 22700,
+    "SENSEX":   _ltp["sensex"] if _ltp else 73320,
+}
+IV_ANN = {"NIFTY 50": 0.142, "SENSEX": 0.138}
+IVP    = {"NIFTY 50": 42,    "SENSEX": 38}
+CHG    = {"NIFTY 50": "", "SENSEX": ""}
+PRICE_TIMESTAMP = _ltp["ts"] if _ltp else "token not set"
+prices_data = {"source": _ltp["source"] if _ltp else "Mock (enter token)"}
 
 spot   = SPOT[instrument]
 iv     = IV_ANN[instrument]
 ivp    = IVP[instrument]
 ivp_ok = ivp_range[0] <= ivp <= ivp_range[1]
 
+# ── Store funds for sidebar display ──
+if _funds:
+    st.session_state["_funds_display"] = _funds
+capital_base = int(_funds["total"]) if _funds and _funds["total"] > 0 else 500_000
+
 PUT_OFFSETS  = [-0.045, -0.040, -0.035, -0.030, -0.025]
 CALL_OFFSETS = [+0.025, +0.030, +0.035, +0.040, +0.045]
 
 def top_bar():
-    # Use Dhan spot if fetched, else mock
-    nifty_spot  = st.session_state.get("dhan_spot", SPOT["NIFTY 50"]) if instrument == "NIFTY 50" else SPOT["NIFTY 50"]
-    sensex_spot = SPOT["SENSEX"]
-    # Row 1: NIFTY + SENSEX spot & IV
+    # Always use SPOT dict which is now Dhan-sourced when token present
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("NIFTY 50",  f"₹{nifty_spot:,.0f}",  CHG["NIFTY 50"])
+    c1.metric("NIFTY 50",  f"₹{SPOT['NIFTY 50']:,.0f}")
     c2.metric("NIFTY IV",  f"{IV_ANN['NIFTY 50']*100:.1f}%", f"IVP {IVP['NIFTY 50']}")
-    c3.metric("SENSEX",    f"₹{sensex_spot:,.0f}", CHG["SENSEX"])
+    c3.metric("SENSEX",    f"₹{SPOT['SENSEX']:,.0f}")
     c4.metric("SENSEX IV", f"{IV_ANN['SENSEX']*100:.1f}%",   f"IVP {IVP['SENSEX']}")
-    # Row 2: regime info
     regime = "ALLOW" if ivp_ok else "SKIP"
     st.info(f"**Regime:** {regime} | IVP {ivp} | DTE {dte_adj} | {'Fri excluded' if excl_fri else 'All days'}")
-    source = prices_data.get("source", "Unknown")
-    st.caption(f"🕐 Prices: {source} | {PRICE_TIMESTAMP} | ♻️ Hourly refresh")
+    src = prices_data.get("source", "Mock")
+    st.caption(f"🕐 {src} | {PRICE_TIMESTAMP} | auto-refresh 1 min")
 
 # Tabs
 tab1, tab2, tab3 = st.tabs(["Tab 1 - Backtest", "Tab 2 - Live Signal", "Tab 3 - IV History"])
