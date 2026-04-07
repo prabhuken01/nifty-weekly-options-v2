@@ -316,29 +316,25 @@ with tab2:
     st.markdown("---")
 
     # ── Dhan API credentials ──────────────────────────────────────────────────
-    with st.expander("🔑 Dhan API Credentials (required for live premiums)",
-                     expanded=not st.session_state.get("dhan_loaded")):
-        dc1, dc2 = st.columns(2)
-        with dc1:
-            dhan_client_id = st.text_input("Dhan Client ID", key="dhan_cid",
-                                           placeholder="Your Dhan Client ID")
-        with dc2:
-            dhan_token = st.text_input("Dhan Access Token", type="password", key="dhan_tok",
-                                       placeholder="Paste access token from api.dhan.co")
-
+    DHAN_CLIENT_ID  = "1109450231"
     NIFTY_SCRIP_ID  = 13
     SENSEX_SCRIP_ID = 51
-    IDX_SEG = "IDX_I"
+    IDX_SEG         = "IDX_I"
 
-    def fetch_dhan_expiry_list(scrip_id, cid, tok):
+    with st.expander("🔑 Dhan Access Token", expanded=not st.session_state.get("dhan_loaded")):
+        dhan_token = st.text_input("Paste Dhan Access Token (from api.dhan.co)",
+                                   type="password", key="dhan_tok",
+                                   placeholder="eyJ0eXAiOiJKV1QiLCJhbGci...")
+        st.caption(f"Client ID: `{DHAN_CLIENT_ID}` (hardcoded)")
+
+    def fetch_dhan_expiry_list(scrip_id, tok):
         url = "https://api.dhan.co/v2/optionchain/expirylist"
         try:
             r = requests.post(url,
                               json={"UnderlyingScrip": scrip_id, "UnderlyingSeg": IDX_SEG},
                               headers={"Content-Type": "application/json",
-                                       "client-id": cid, "access-token": tok},
+                                       "client-id": DHAN_CLIENT_ID, "access-token": tok},
                               timeout=10)
-            st.caption(f"Expiry list HTTP status: `{r.status_code}`")
             d = r.json()
             if d.get("status") == "success":
                 return d.get("data", [])
@@ -348,7 +344,7 @@ with tab2:
             st.error(f"Expiry request failed: `{e}`")
         return []
 
-    def fetch_dhan_chain(scrip_id, expiry_str, cid, tok):
+    def fetch_dhan_chain(scrip_id, expiry_str, tok):
         url = "https://api.dhan.co/v2/optionchain"
         try:
             r = requests.post(url,
@@ -356,9 +352,8 @@ with tab2:
                                     "UnderlyingSeg": IDX_SEG,
                                     "Expiry": expiry_str},
                               headers={"Content-Type": "application/json",
-                                       "client-id": cid, "access-token": tok},
+                                       "client-id": DHAN_CLIENT_ID, "access-token": tok},
                               timeout=10)
-            st.caption(f"Option chain HTTP status: `{r.status_code}`")
             d = r.json()
             if d.get("status") == "success":
                 return d.get("data", {})
@@ -380,14 +375,13 @@ with tab2:
 
     # ── Expiry selector ───────────────────────────────────────────────────────
     scrip_id = NIFTY_SCRIP_ID if instrument == "NIFTY 50" else SENSEX_SCRIP_ID
-    cid  = st.session_state.get("dhan_cid", "")
-    tok  = st.session_state.get("dhan_tok", "")
-    has_creds = bool(cid and tok)
+    tok       = st.session_state.get("dhan_tok", "")
+    has_creds = bool(tok)
 
     ec1, ec2, ec3 = st.columns([2, 2, 1])
     with ec1:
         if has_creds:
-            expiry_list = fetch_dhan_expiry_list(scrip_id, cid, tok)
+            expiry_list = fetch_dhan_expiry_list(scrip_id, tok)
             if expiry_list:
                 selected_expiry_str = st.selectbox("Expiry (from Dhan)", expiry_list, key="tab2_expiry")
             else:
@@ -403,7 +397,7 @@ with tab2:
 
     if fetch_chain_btn and has_creds:
         with st.spinner("Fetching option chain from Dhan..."):
-            chain = fetch_dhan_chain(scrip_id, selected_expiry_str, cid, tok)
+            chain = fetch_dhan_chain(scrip_id, selected_expiry_str, tok)
         if chain:
             st.session_state["dhan_chain"]      = chain
             st.session_state["dhan_expiry"]     = selected_expiry_str
