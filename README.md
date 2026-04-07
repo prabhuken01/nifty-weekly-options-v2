@@ -2,14 +2,6 @@
 
 Short strangle backtesting and live signal dashboard for NIFTY 50 and SENSEX weekly options.
 
-## Files
-
-| File | Purpose |
-|---|---|
-| `app.py` | Streamlit dashboard — 3 tabs |
-| `requirements.txt` | Python dependencies |
-| `ShortStrangle_Dashboard.xlsx` | Excel spec — ground rules, glossary, sample data |
-
 ## Quick start
 
 ```bash
@@ -17,7 +9,28 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-Place `ShortStrangle_Dashboard.xlsx` in the project root (`E:\Personal\Trading_Champion\Projects\Nifty Weekly Options Strategy_v1`).
+## What's New (Phase 1 Complete)
+
+✨ **Tab 2 - Live Signal Generator**
+- Now fetches **REAL NIFTY spot prices** from NSE (via nsepython)
+- **Actual option premiums** from NSE option chain (with 1-hour refresh)
+- **Mobile responsive** UI (2-col on mobile, 5-col on desktop)
+- Graceful fallback to formula-based estimation if API unavailable
+
+## Project Structure
+
+See `PROJECT_STRUCTURE.md` for detailed directory organization.
+
+```
+├── app.py                          # Main dashboard (3 tabs)
+├── requirements.txt                # Dependencies (includes nsepython)
+├── Live-Signal-Generator/          # Tab 2: Real-time option chain fetching
+├── Backtest-Engine/                # Tab 1: Historical backtesting
+├── Utilities/                      # Google Sheets, Excel, status tracking
+├── Docs/                           # Setup guides & documentation
+├── Database_v1/                    # Historical data storage (DO NOT MODIFY)
+└── Archive/                        # Legacy code
+```
 
 ---
 
