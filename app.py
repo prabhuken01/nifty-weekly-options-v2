@@ -105,10 +105,15 @@ with st.sidebar:
 
 DHAN_CLIENT_ID = "1109450231"
 
-# ── Token: load from session, pre-fill from query_params if passed ──
-_qp_tok = st.query_params.get("tok", "")
-if _qp_tok and not st.session_state.get("dhan_tok"):
-    st.session_state["dhan_tok"] = _qp_tok
+# ── Token: load priority: session → Streamlit secrets → empty ──
+# This means: once set in Streamlit Cloud secrets, works on ALL devices automatically
+if not st.session_state.get("dhan_tok"):
+    try:
+        _secret_tok = st.secrets["dhan"]["access_token"]
+        if _secret_tok:
+            st.session_state["dhan_tok"] = _secret_tok
+    except Exception:
+        pass
 
 def _dhan_headers(tok):
     return {"Content-Type": "application/json",
@@ -348,10 +353,14 @@ with tab2:
     IDX_SEG         = "IDX_I"
 
     with st.expander("🔑 Dhan Access Token", expanded=not st.session_state.get("dhan_loaded")):
-        dhan_token = st.text_input("Paste Dhan Access Token (from api.dhan.co)",
+        _has_secret = bool(st.session_state.get("dhan_tok"))
+        dhan_token = st.text_input("Dhan Access Token",
                                    type="password", key="dhan_tok",
-                                   placeholder="eyJ0eXAiOiJKV1QiLCJhbGci...")
-        st.caption(f"Client ID: `{DHAN_CLIENT_ID}` (hardcoded)")
+                                   placeholder="eyJ0eXAiOiJKV1QiLCJhbGci..." if not _has_secret else "")
+        if _has_secret:
+            st.success("✅ Token loaded (from secrets or previous entry). All devices share this.")
+        st.caption(f"Client ID: `{DHAN_CLIENT_ID}` (hardcoded) | "
+                   "Update daily token at: **share.streamlit.io → App → Settings → Secrets**")
 
     def fetch_dhan_expiry_list(scrip_id, tok):
         url = "https://api.dhan.co/v2/optionchain/expirylist"
