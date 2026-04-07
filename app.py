@@ -142,22 +142,18 @@ PUT_OFFSETS  = [-0.045, -0.040, -0.035, -0.030, -0.025]
 CALL_OFFSETS = [+0.025, +0.030, +0.035, +0.040, +0.045]
 
 def top_bar():
-    # Mobile-responsive: use fewer columns on smaller screens
-    try:
-        # Try 5-column layout (desktop)
-        c1, c2, c3, c4, c5 = st.columns([2, 2, 2, 2, 3])
-    except:
-        # Fallback to 2-column on mobile
-        c1, c2 = st.columns(2)
-        c3, c4 = st.columns(2)
-        c5 = st.container()
-
-    c1.metric("NIFTY 50", f"Rs {SPOT['NIFTY 50']:,}", CHG["NIFTY 50"])
-    c2.metric("NIFTY IV", f"{IV_ANN['NIFTY 50']*100:.1f}%", f"IVP {IVP['NIFTY 50']}")
-    c3.metric("SENSEX",   f"Rs {SPOT['SENSEX']:,}", CHG["SENSEX"])
-    c4.metric("SENSEX IV", f"{IV_ANN['SENSEX']*100:.1f}%", f"IVP {IVP['SENSEX']}")
+    # Use Dhan spot if fetched, else mock
+    nifty_spot  = st.session_state.get("dhan_spot", SPOT["NIFTY 50"]) if instrument == "NIFTY 50" else SPOT["NIFTY 50"]
+    sensex_spot = SPOT["SENSEX"]
+    # Row 1: NIFTY + SENSEX spot & IV
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("NIFTY 50",  f"₹{nifty_spot:,.0f}",  CHG["NIFTY 50"])
+    c2.metric("NIFTY IV",  f"{IV_ANN['NIFTY 50']*100:.1f}%", f"IVP {IVP['NIFTY 50']}")
+    c3.metric("SENSEX",    f"₹{sensex_spot:,.0f}", CHG["SENSEX"])
+    c4.metric("SENSEX IV", f"{IV_ANN['SENSEX']*100:.1f}%",   f"IVP {IVP['SENSEX']}")
+    # Row 2: regime info
     regime = "ALLOW" if ivp_ok else "SKIP"
-    c5.info(f"**Regime:** {regime} | IVP {ivp} | DTE {dte_adj} | {'Fri excluded' if excl_fri else 'All days'}")
+    st.info(f"**Regime:** {regime} | IVP {ivp} | DTE {dte_adj} | {'Fri excluded' if excl_fri else 'All days'}")
     source = prices_data.get("source", "Unknown")
     st.caption(f"🕐 Prices: {source} | {PRICE_TIMESTAMP} | ♻️ Hourly refresh")
 
@@ -539,56 +535,121 @@ with tab2:
 with tab3:
     top_bar()
     st.markdown("---")
+    st.subheader("📊 IV & Option Chain Data — Expiry Wise")
+    st.caption("Source: Dhan API (live) | No charts — table format only")
 
-    period_sel = st.radio("Period", ["1D", "1H", "5M"], horizontal=True)
-    src_note = {
-        "1D": "Source: NSE Bhavcopy EOD | ATM mid-price IV | Free, T+1 by 6 PM",
-        "1H": "Source: DhanHQ Historical API or Kite Instruments | Requires API key",
-        "5M": "Source: Same as 1H | High noise - cross-check with 1D IVP before acting",
-    }
-    st.caption(src_note[period_sel])
+    tok3 = st.session_state.get("dhan_tok", "")
+    DHAN_CLIENT_ID_T3 = "1109450231"
+    IDX_SEG_T3 = "IDX_I"
 
-    np.random.seed(42)
-    base_iv = 14.2
-    nifty_iv  = np.clip(base_iv + np.cumsum(np.random.randn(30) * 0.3), 10, 22).round(1)
-    sensex_iv = np.clip(base_iv - 0.4 + np.cumsum(np.random.randn(30) * 0.3), 10, 22).round(1)
-    periods = [f"P{i+1}" for i in range(30)]
+    def dhan_post(url, payload, tok):
+        try:
+            r = requests.post(url,
+                              json=payload,
+                              headers={"Content-Type": "application/json",
+                                       "client-id": DHAN_CLIENT_ID_T3,
+                                       "access-token": tok},
+                              timeout=10)
+            d = r.json()
+            return d if d.get("status") == "success" else None
+        except Exception:
+            return None
 
-    iv_df = pd.DataFrame({
-        "Period": periods,
-        "NIFTY IV (%)":  nifty_iv,
-        "SENSEX IV (%)": sensex_iv,
-    })
-    iv_df["NIFTY IVP (%)"]  = [round(sum(nifty_iv[:i+1]  < nifty_iv[i])  / min(i+1,30) * 100) for i in range(30)]
-    iv_df["SENSEX IVP (%)"] = [round(sum(sensex_iv[:i+1] < sensex_iv[i]) / min(i+1,30) * 100) for i in range(30)]
+    def fetch_chain_tab3(scrip_id, expiry, tok):
+        d = dhan_post("https://api.dhan.co/v2/optionchain",
+                      {"UnderlyingScrip": scrip_id, "UnderlyingSeg": IDX_SEG_T3, "Expiry": expiry}, tok)
+        return d.get("data", {}) if d else {}
 
-    st.markdown("**Implied Volatility - last 30 periods**")
-    st.line_chart(iv_df.set_index("Period")[["NIFTY IV (%)", "SENSEX IV (%)"]])
+    def fetch_expiries_tab3(scrip_id, tok):
+        d = dhan_post("https://api.dhan.co/v2/optionchain/expirylist",
+                      {"UnderlyingScrip": scrip_id, "UnderlyingSeg": IDX_SEG_T3}, tok)
+        return d.get("data", []) if d else []
 
-    st.caption(f"IVP floor: {ivp_range[0]}% | IVP ceiling: {ivp_range[1]}% | "
-               f"Current NIFTY IVP: {ivp} | Current SENSEX IVP: {IVP['SENSEX']}")
+    def chain_to_df(chain, spot, band=4.5):
+        oc = chain.get("oc", {})
+        spot = chain.get("last_price", spot)
+        rows = []
+        for k, v in oc.items():
+            strike = float(k)
+            if not (spot*(1-band/100) <= strike <= spot*(1+band/100)):
+                continue
+            ce = v.get("ce", {}); pe = v.get("pe", {})
+            rows.append({
+                "Strike":    int(strike),
+                "CE LTP":    round(ce.get("last_price", 0), 1),
+                "CE OI":     ce.get("oi", 0),
+                "CE IV%":    round(ce.get("implied_volatility", 0), 2),
+                "CE Delta":  round(ce.get("greeks", {}).get("delta", 0), 3),
+                "CE Vol":    ce.get("volume", 0),
+                "PE LTP":    round(pe.get("last_price", 0), 1),
+                "PE OI":     pe.get("oi", 0),
+                "PE IV%":    round(pe.get("implied_volatility", 0), 2),
+                "PE Delta":  round(pe.get("greeks", {}).get("delta", 0), 3),
+                "PE Vol":    pe.get("volume", 0),
+            })
+        return pd.DataFrame(rows).sort_values("Strike").reset_index(drop=True), spot
 
-    st.markdown("**IVP rank by period**")
-    st.bar_chart(iv_df.set_index("Period")[["NIFTY IVP (%)", "SENSEX IVP (%)"]])
+    if not tok3:
+        st.info("👆 Paste your Dhan Access Token in Tab 2 first, then come back here.")
+    else:
+        t3c1, t3c2 = st.columns(2)
 
-    st.markdown("---")
-    st.dataframe(iv_df, use_container_width=True, hide_index=True)
+        # ── NIFTY section ──
+        with t3c1:
+            st.markdown("#### NIFTY 50")
+            nifty_expiries = fetch_expiries_tab3(13, tok3)
+            if nifty_expiries:
+                sel_n = st.selectbox("Nifty Expiry", nifty_expiries, key="t3_nifty_exp")
+                if st.button("Load Nifty Chain", key="t3_nifty_btn"):
+                    ch = fetch_chain_tab3(13, sel_n, tok3)
+                    if ch:
+                        st.session_state["t3_nifty_chain"] = ch
+                        st.session_state["t3_nifty_exp_used"] = sel_n
+                if "t3_nifty_chain" in st.session_state:
+                    df_n, spot_n = chain_to_df(st.session_state["t3_nifty_chain"], SPOT["NIFTY 50"])
+                    atm_n = df_n.iloc[(df_n["Strike"] - spot_n).abs().argsort()[:1]]["Strike"].values[0]
+                    st.caption(f"Spot: ₹{spot_n:,.1f} | ATM: ₹{atm_n:,} | Expiry: {st.session_state.get('t3_nifty_exp_used','')}")
+                    def hl_atm_n(row):
+                        return ["background-color:#2d2d4e;font-weight:bold"]*len(row) if row["Strike"]==atm_n else [""]*len(row)
+                    st.dataframe(
+                        df_n.style.apply(hl_atm_n, axis=1).format({
+                            "CE LTP":"{:.1f}","PE LTP":"{:.1f}",
+                            "CE IV%":"{:.2f}","PE IV%":"{:.2f}",
+                            "CE Delta":"{:.3f}","PE Delta":"{:.3f}",
+                            "CE OI":"{:,.0f}","PE OI":"{:,.0f}",
+                            "CE Vol":"{:,.0f}","PE Vol":"{:,.0f}",
+                        }),
+                        use_container_width=True, hide_index=True, height=450
+                    )
+            else:
+                st.warning("Could not load Nifty expiries.")
 
-    with st.expander("Glossary - IV history"):
-        st.markdown("""
-**ATM IV%** — Implied Volatility extracted from At-The-Money option mid-price using Black-Scholes reverse. Represents the market's consensus forecast of future volatility. Higher = market fears larger moves.
-
-**IVP rank** — IV Percentile over last 30 periods. Formula: count(periods where IV < today's IV) / 30. 0% = IV at historic low. 100% = historic high. Trade zone: 20-80%.
-
-**1D period** — One trading day's closing ATM IV. Source: NSE Bhavcopy (free, T+1 available by 6 PM).
-
-**1H period** — One hourly IV snapshot. Source: DhanHQ Historical API or Kite Instruments. Requires API key.
-
-**5M period** — One 5-minute candle. Same source as 1H. Use only for final-hour entry timing. High noise.
-
-**Rising IV + low IVP** — Volatility expanding from base. Cautious - potential skip.
-
-**Falling IV + high IVP** — Volatility compressing from peak. Ideal selling environment.
-
-**Flat IV + mid IVP (30-60)** — Stable regime. Standard signal logic applies.
-        """)
+        # ── SENSEX section ──
+        with t3c2:
+            st.markdown("#### SENSEX")
+            sensex_expiries = fetch_expiries_tab3(51, tok3)
+            if sensex_expiries:
+                sel_s = st.selectbox("Sensex Expiry", sensex_expiries, key="t3_sensex_exp")
+                if st.button("Load Sensex Chain", key="t3_sensex_btn"):
+                    ch = fetch_chain_tab3(51, sel_s, tok3)
+                    if ch:
+                        st.session_state["t3_sensex_chain"] = ch
+                        st.session_state["t3_sensex_exp_used"] = sel_s
+                if "t3_sensex_chain" in st.session_state:
+                    df_s, spot_s = chain_to_df(st.session_state["t3_sensex_chain"], SPOT["SENSEX"])
+                    atm_s = df_s.iloc[(df_s["Strike"] - spot_s).abs().argsort()[:1]]["Strike"].values[0]
+                    st.caption(f"Spot: ₹{spot_s:,.1f} | ATM: ₹{atm_s:,} | Expiry: {st.session_state.get('t3_sensex_exp_used','')}")
+                    def hl_atm_s(row):
+                        return ["background-color:#2d2d4e;font-weight:bold"]*len(row) if row["Strike"]==atm_s else [""]*len(row)
+                    st.dataframe(
+                        df_s.style.apply(hl_atm_s, axis=1).format({
+                            "CE LTP":"{:.1f}","PE LTP":"{:.1f}",
+                            "CE IV%":"{:.2f}","PE IV%":"{:.2f}",
+                            "CE Delta":"{:.3f}","PE Delta":"{:.3f}",
+                            "CE OI":"{:,.0f}","PE OI":"{:,.0f}",
+                            "CE Vol":"{:,.0f}","PE Vol":"{:,.0f}",
+                        }),
+                        use_container_width=True, hide_index=True, height=450
+                    )
+            else:
+                st.warning("Could not load Sensex expiries.")
