@@ -330,7 +330,6 @@ with tab2:
     SENSEX_SCRIP_ID = 51
     IDX_SEG = "IDX_I"
 
-    @st.cache_data(ttl=180, show_spinner=False)
     def fetch_dhan_expiry_list(scrip_id, cid, tok):
         url = "https://api.dhan.co/v2/optionchain/expirylist"
         try:
@@ -339,14 +338,16 @@ with tab2:
                               headers={"Content-Type": "application/json",
                                        "client-id": cid, "access-token": tok},
                               timeout=10)
+            st.caption(f"Expiry list HTTP status: `{r.status_code}`")
             d = r.json()
             if d.get("status") == "success":
                 return d.get("data", [])
-        except Exception:
-            pass
+            else:
+                st.error(f"Dhan expiry error: `{d}`")
+        except Exception as e:
+            st.error(f"Expiry request failed: `{e}`")
         return []
 
-    @st.cache_data(ttl=180, show_spinner=False)
     def fetch_dhan_chain(scrip_id, expiry_str, cid, tok):
         url = "https://api.dhan.co/v2/optionchain"
         try:
@@ -357,11 +358,14 @@ with tab2:
                               headers={"Content-Type": "application/json",
                                        "client-id": cid, "access-token": tok},
                               timeout=10)
+            st.caption(f"Option chain HTTP status: `{r.status_code}`")
             d = r.json()
             if d.get("status") == "success":
                 return d.get("data", {})
+            else:
+                st.error(f"Dhan chain error: `{d}`")
         except Exception as e:
-            st.error(f"Dhan API error: {e}")
+            st.error(f"Chain request failed: `{e}`")
         return {}
 
     def get_premium_from_chain(chain_data, strike_price, side):
