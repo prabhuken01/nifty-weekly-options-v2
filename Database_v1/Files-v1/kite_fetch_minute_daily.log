@@ -1,0 +1,102 @@
+2026-04-05 22:34:56,926 - INFO - 
+2026-04-05 22:34:56,926 - INFO - ================================================================================
+2026-04-05 22:34:56,927 - INFO - DAILY MINUTE DATA FETCH (Run at 4 PM IST)
+2026-04-05 22:34:56,927 - INFO - ================================================================================
+2026-04-05 22:34:56,927 - INFO - 
+2026-04-05 22:34:56,927 - INFO - This script should run DAILY after market close (4 PM IST)
+2026-04-05 22:34:56,927 - INFO - 
+2026-04-05 22:34:56,927 - INFO - PURPOSE:
+2026-04-05 22:34:56,927 - INFO -   - Fetch 1-minute candles for current & next week weeklies
+2026-04-05 22:34:56,927 - INFO -   - Calculate Greeks every minute
+2026-04-05 22:34:56,928 - INFO -   - Store in option_bars_minute for live trading
+2026-04-05 22:34:56,928 - INFO - 
+2026-04-05 22:34:56,928 - INFO - SETUP CRON JOB (Linux/Mac):
+2026-04-05 22:34:56,928 - INFO -   1. Open crontab: crontab -e
+2026-04-05 22:34:56,928 - INFO -   2. Add this line:
+2026-04-05 22:34:56,928 - INFO -      0 16 * * 1-5 python /path/to/kite_fetch_nifty_minute_daily.py
+2026-04-05 22:34:56,928 - INFO -   3. Save and close
+2026-04-05 22:34:56,928 - INFO - 
+2026-04-05 22:34:56,929 - INFO - SETUP TASK SCHEDULER (Windows):
+2026-04-05 22:34:56,929 - INFO -   1. Open Task Scheduler
+2026-04-05 22:34:56,929 - INFO -   2. Create new task
+2026-04-05 22:34:56,929 - INFO -   3. Trigger: Daily at 16:00 (4 PM)
+2026-04-05 22:34:56,929 - INFO -   4. Action: Run python script
+2026-04-05 22:34:56,929 - INFO - 
+2026-04-05 22:34:56,929 - INFO - ================================================================================
+2026-04-05 22:34:56,929 - INFO - 
+2026-04-05 22:34:56,929 - INFO - ================================================================================
+2026-04-05 22:34:56,929 - INFO - KITE API - DAILY MINUTE DATA (CURRENT + NEXT WEEK WEEKLIES)
+2026-04-05 22:34:56,929 - INFO - ================================================================================
+2026-04-05 22:34:56,930 - INFO - [INFO] Run time: 2026-04-05 22:34:56.929257
+2026-04-05 22:34:57,025 - INFO - [OK] Connected to database
+2026-04-05 22:34:57,025 - INFO - [INFO] Fetching minute data for 8 contracts:
+2026-04-05 22:34:57,025 - INFO - [INFO]   - Current week (expires 2026-04-13)
+2026-04-05 22:34:57,025 - INFO - [INFO]   - Next week (expires 2026-04-21)
+2026-04-05 22:34:57,025 - INFO - [INFO] Date: 2026-04-05
+2026-04-05 22:34:57,025 - INFO - 
+2026-04-05 22:34:57,025 - INFO - [NEXT STEPS]
+2026-04-05 22:34:57,025 - INFO - 1. Kite API will fetch 1-minute candles for each contract
+2026-04-05 22:34:57,025 - INFO - 2. Greeks will be calculated every minute
+2026-04-05 22:34:57,025 - INFO - 3. Data will be inserted into option_bars_minute
+2026-04-05 22:34:57,025 - INFO - 
+2026-04-05 22:34:57,025 - INFO - [SCHEDULE REMINDER]
+2026-04-05 22:34:57,026 - INFO -   Run this script DAILY at 4:00 PM IST (after market close)
+2026-04-05 22:34:57,026 - INFO -   For example, add to crontab:
+2026-04-05 22:34:57,026 - INFO -     0 16 * * 1-5 python /path/to/kite_fetch_nifty_minute_daily.py
+2026-04-05 22:34:57,026 - INFO - 
+2026-04-05 22:34:57,026 - INFO - [STATUS] Ready to fetch minute data
+2026-04-05 22:34:57,026 - INFO - [STATUS] Data will be used for live trading and Greeks monitoring
+2026-04-05 22:34:57,031 - ERROR - [ERROR] there is no unique or exclusion constraint matching the ON CONFLICT specification
+
+2026-04-05 22:34:57,032 - ERROR - [FAIL] Script execution failed
+2026-04-05 22:35:05,042 - INFO - 
+2026-04-05 22:35:05,043 - INFO - ================================================================================
+2026-04-05 22:35:05,043 - INFO - DAILY MINUTE DATA FETCH (Run at 4 PM IST)
+2026-04-05 22:35:05,043 - INFO - ================================================================================
+2026-04-05 22:35:05,043 - INFO - 
+2026-04-05 22:35:05,043 - INFO - This script should run DAILY after market close (4 PM IST)
+2026-04-05 22:35:05,043 - INFO - 
+2026-04-05 22:35:05,043 - INFO - PURPOSE:
+2026-04-05 22:35:05,043 - INFO -   - Fetch 1-minute candles for current & next week weeklies
+2026-04-05 22:35:05,043 - INFO -   - Calculate Greeks every minute
+2026-04-05 22:35:05,043 - INFO -   - Store in option_bars_minute for live trading
+2026-04-05 22:35:05,043 - INFO - 
+2026-04-05 22:35:05,043 - INFO - SETUP CRON JOB (Linux/Mac):
+2026-04-05 22:35:05,043 - INFO -   1. Open crontab: crontab -e
+2026-04-05 22:35:05,044 - INFO -   2. Add this line:
+2026-04-05 22:35:05,044 - INFO -      0 16 * * 1-5 python /path/to/kite_fetch_nifty_minute_daily.py
+2026-04-05 22:35:05,044 - INFO -   3. Save and close
+2026-04-05 22:35:05,044 - INFO - 
+2026-04-05 22:35:05,044 - INFO - SETUP TASK SCHEDULER (Windows):
+2026-04-05 22:35:05,044 - INFO -   1. Open Task Scheduler
+2026-04-05 22:35:05,044 - INFO -   2. Create new task
+2026-04-05 22:35:05,044 - INFO -   3. Trigger: Daily at 16:00 (4 PM)
+2026-04-05 22:35:05,044 - INFO -   4. Action: Run python script
+2026-04-05 22:35:05,044 - INFO - 
+2026-04-05 22:35:05,044 - INFO - ================================================================================
+2026-04-05 22:35:05,044 - INFO - 
+2026-04-05 22:35:05,044 - INFO - ================================================================================
+2026-04-05 22:35:05,044 - INFO - KITE API - DAILY MINUTE DATA (CURRENT + NEXT WEEK WEEKLIES)
+2026-04-05 22:35:05,044 - INFO - ================================================================================
+2026-04-05 22:35:05,044 - INFO - [INFO] Run time: 2026-04-05 22:35:05.044741
+2026-04-05 22:35:05,147 - INFO - [OK] Connected to database
+2026-04-05 22:35:05,147 - INFO - [INFO] Fetching minute data for 8 contracts:
+2026-04-05 22:35:05,147 - INFO - [INFO]   - Current week (expires 2026-04-13)
+2026-04-05 22:35:05,147 - INFO - [INFO]   - Next week (expires 2026-04-21)
+2026-04-05 22:35:05,147 - INFO - [INFO] Date: 2026-04-05
+2026-04-05 22:35:05,147 - INFO - 
+2026-04-05 22:35:05,147 - INFO - [NEXT STEPS]
+2026-04-05 22:35:05,148 - INFO - 1. Kite API will fetch 1-minute candles for each contract
+2026-04-05 22:35:05,148 - INFO - 2. Greeks will be calculated every minute
+2026-04-05 22:35:05,148 - INFO - 3. Data will be inserted into option_bars_minute
+2026-04-05 22:35:05,148 - INFO - 
+2026-04-05 22:35:05,148 - INFO - [SCHEDULE REMINDER]
+2026-04-05 22:35:05,148 - INFO -   Run this script DAILY at 4:00 PM IST (after market close)
+2026-04-05 22:35:05,148 - INFO -   For example, add to crontab:
+2026-04-05 22:35:05,148 - INFO -     0 16 * * 1-5 python /path/to/kite_fetch_nifty_minute_daily.py
+2026-04-05 22:35:05,148 - INFO - 
+2026-04-05 22:35:05,148 - INFO - [STATUS] Ready to fetch minute data
+2026-04-05 22:35:05,148 - INFO - [STATUS] Data will be used for live trading and Greeks monitoring
+2026-04-05 22:35:05,156 - INFO - [OK] Metadata updated
+2026-04-05 22:35:05,156 - INFO - [OK] Script executed successfully
+2026-04-05 22:35:05,156 - INFO - [OK] Minute data ready for trading

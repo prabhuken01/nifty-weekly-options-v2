@@ -1,0 +1,16 @@
+2026-04-05 22:50:46,782 - INFO - ================================================================================
+2026-04-05 22:50:46,783 - INFO - UNIFIED DATA FETCHER - Nifty Options Historical Data
+2026-04-05 22:50:46,783 - INFO - ================================================================================
+2026-04-05 22:50:46,783 - INFO - [INFO] Date range: 2025-10-07 to 2026-04-04
+2026-04-05 22:50:49,399 - INFO - 
+[SOURCES DETECTED]
+2026-04-05 22:50:49,399 - INFO -   kite: available
+2026-04-05 22:50:49,400 - INFO -   breeze: NOT AVAILABLE
+2026-04-05 22:50:49,400 - INFO -   kaggle: NOT AVAILABLE
+2026-04-05 22:50:49,400 - INFO - 
+[FALLBACK] Using test data
+2026-04-05 22:50:49,400 - INFO - [ACTION] To enable Breeze or Kaggle:
+2026-04-05 22:50:49,400 - INFO -   1. Breeze: Get ICICI credentials -> icici_credentials.json
+2026-04-05 22:50:49,400 - INFO -   2. Kaggle: Download from https://www.kaggle.com/settings/account
+2026-04-05 22:50:49,400 - INFO -            Place at: ~/.kaggle/kaggle.json
+2026-04-05 22:50:49,400 - INFO - [WARN] Using fallback data instead

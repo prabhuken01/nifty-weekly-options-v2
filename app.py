@@ -21,6 +21,12 @@ for module_dir in ['Live-Signal-Generator', 'Live-fetching']:
         break
 
 try:
+    from shoonya_fetcher import ShoomyaLiveDataFetcher
+    HAS_SHOONYA = True
+except ImportError:
+    HAS_SHOONYA = False
+
+try:
     from fetch_nifty_option_chain import NIFTYOptionChainFetcher
     HAS_LIVE_FETCHER = True
 except ImportError:
@@ -95,35 +101,75 @@ with st.sidebar:
     capital_base = 500_000
     st.caption(f"Lot: {lot_size} | Capital: Rs {capital_base:,}")
 
-# Fetch live prices from Kite API every hour
+# Fetch live prices from Shoonya API every hour
 @st.cache_data(ttl=3600)  # Cache for 1 hour
 def fetch_live_prices():
-    """Fetch current prices. Uses Live-fetching module if available, else mock data."""
+    """
+    Fetch current live prices with priority:
+    1. Shoonya API (real-time, requires credentials)
+    2. NSE yesterday close (fallback)
+    3. Mock data (fallback)
+    """
     try:
+        # Priority 1: Try Shoonya API
+        if HAS_SHOONYA:
+            try:
+                fetcher = ShoomyaLiveDataFetcher()
+                if fetcher.authenticated:
+                    nifty_data = fetcher.fetch_live_spot("NIFTY", "NSE")
+                    if nifty_data:
+                        sensex_data = fetcher.fetch_live_spot("SENSEX", "BSE")
+                        sensex_spot = sensex_data["spot"] if sensex_data else int(nifty_data["spot"] * 3.23)
+                        sensex_chg = sensex_data["change_pct"] if sensex_data else "+0 (0.00%)"
+
+                        return {
+                            "NIFTY 50": {
+                                "spot": nifty_data["spot"],
+                                "chg": f"{nifty_data['change']} ({nifty_data['change_pct']})",
+                                "iv": nifty_data["iv"],
+                                "ivp": 42  # Would need historical calculation
+                            },
+                            "SENSEX": {
+                                "spot": sensex_spot,
+                                "chg": sensex_chg,
+                                "iv": 0.138,
+                                "ivp": 38
+                            },
+                            "timestamp": nifty_data["timestamp"],
+                            "source": "✨ Shoonya API (Real-time)"
+                        }
+            except Exception as e:
+                st.warning(f"Shoonya API error: {e}. Falling back to mock data.")
+
+        # Priority 2: Try NSE yesterday close
         if HAS_LIVE_FETCHER:
-            fetcher = NIFTYOptionChainFetcher()
-            spot = fetcher.fetch_yesterday_close()
-            if spot:
-                # Calculate mock IV/IVP based on current market conditions
-                return {
-                    "NIFTY 50": {"spot": spot, "chg": "+0 (0.00%)", "iv": 0.142, "ivp": 42},
-                    "SENSEX": {"spot": int(spot * 3.23), "chg": "+0 (0.00%)", "iv": 0.138, "ivp": 38},
-                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "source": "Live (1-hour refresh)"
-                }
-        # Fallback to mock
+            try:
+                fetcher = NIFTYOptionChainFetcher()
+                spot = fetcher.fetch_yesterday_close()
+                if spot:
+                    return {
+                        "NIFTY 50": {"spot": spot, "chg": "N/A (yesterday close)", "iv": 0.142, "ivp": 42},
+                        "SENSEX": {"spot": int(spot * 3.23), "chg": "N/A (yesterday close)", "iv": 0.138, "ivp": 38},
+                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "source": "NSE (Yesterday close - outdated)"
+                    }
+            except Exception:
+                pass
+
+        # Fallback 3: Mock data
         return {
             "NIFTY 50": {"spot": 22700, "chg": "+87 (+0.38%)", "iv": 0.142, "ivp": 42},
             "SENSEX": {"spot": 73320, "chg": "-112 (-0.14%)", "iv": 0.138, "ivp": 38},
-            "timestamp": "Mock (nsepython unavailable)",
-            "source": "Mock"
+            "timestamp": "Mock data",
+            "source": "📌 Mock (Setup Shoonya API for real data)"
         }
+
     except Exception as e:
         return {
             "NIFTY 50": {"spot": 22700, "chg": "+87 (+0.38%)", "iv": 0.142, "ivp": 42},
             "SENSEX": {"spot": 73320, "chg": "-112 (-0.14%)", "iv": 0.138, "ivp": 38},
-            "timestamp": "Mock (error)",
-            "source": "Mock (Error: check nsepython)"
+            "timestamp": "Error",
+            "source": f"📌 Mock (Error: {str(e)[:30]})"
         }
 
 prices_data = fetch_live_prices()
@@ -322,34 +368,58 @@ with tab2:
 
     @st.cache_data(ttl=3600)
     def fetch_option_premiums(instrument_type, offsets, side, spot_price, expiry_date):
-        """Fetch actual option premiums using Live-fetching module with 1-hour refresh.
+        """Fetch actual option premiums with priority:
+        1. Shoonya API (real-time)
+        2. NSE option chain (fallback)
+        3. Formula-based (final fallback)
 
-        Uses NSE option chain data via nsepython. Falls back to formula if unavailable.
         TTL=3600 ensures hourly refresh without excessive API calls.
         """
         premiums = {off: None for off in offsets}
 
         try:
-            if HAS_LIVE_FETCHER:
-                fetcher = NIFTYOptionChainFetcher(spot_price=spot_price)
-                fetcher.fetch_yesterday_close()
-                fetcher.calculate_bands(price_range_percent=4.5)
-                fetcher.fetch_option_chain()
-                fetcher.filter_by_band()
+            # Priority 1: Try Shoonya API
+            if HAS_SHOONYA:
+                try:
+                    fetcher = ShoomyaLiveDataFetcher()
+                    if fetcher.authenticated:
+                        option_chain = fetcher.fetch_option_chain(instrument, expiry_date=expiry_date)
+                        if option_chain:
+                            for off in offsets:
+                                strike = round(spot_price * (1 + off))
+                                for row in option_chain:
+                                    if row['strike'] == strike:
+                                        prem = row['ce_ltp'] if side == "call" else row['pe_ltp']
+                                        premiums[off] = prem
+                                        break
+                            return premiums
+                except Exception:
+                    pass
 
-                # Extract premium data for each offset
-                for off in offsets:
-                    strike = round(spot_price * (1 + off))
-                    # Find matching strike in filtered data
-                    for row in fetcher.filtered_data:
-                        if row['strike'] == strike:
-                            prem = row['call_ltp'] if side == "call" else row['put_ltp']
-                            premiums[off] = prem
-                            break
+            # Priority 2: Try NSE option chain
+            if HAS_LIVE_FETCHER:
+                try:
+                    fetcher = NIFTYOptionChainFetcher(spot_price=spot_price)
+                    fetcher.fetch_yesterday_close()
+                    fetcher.calculate_bands(price_range_percent=4.5)
+                    fetcher.fetch_option_chain()
+                    fetcher.filter_by_band()
+
+                    # Extract premium data for each offset
+                    for off in offsets:
+                        strike = round(spot_price * (1 + off))
+                        for row in fetcher.filtered_data:
+                            if row['strike'] == strike:
+                                prem = row['call_ltp'] if side == "call" else row['put_ltp']
+                                premiums[off] = prem
+                                break
+                except Exception:
+                    pass
+
         except Exception:
-            # Fallback: return None to use formula-based estimation in make_leg()
             pass
 
+        # Return None to use formula-based estimation in make_leg() if no real data
         return premiums
 
     def make_leg(offsets, side):

@@ -1,0 +1,18 @@
+2026-04-05 22:04:49,038 - INFO - Starting Dhan API data fetch...
+2026-04-05 22:04:49,038 - ERROR - [CRITICAL] DHAN_CLIENT_ID not set in environment
+2026-04-05 22:04:49,038 - INFO - 
+2026-04-05 22:04:49,039 - INFO - SETUP REQUIRED:
+2026-04-05 22:04:49,039 - INFO - ================================================================================
+2026-04-05 22:04:49,039 - INFO - 1. Get your Dhan credentials from: https://dhan.co/
+2026-04-05 22:04:49,039 - INFO - 2. Set environment variables:
+2026-04-05 22:04:49,039 - INFO - 
+2026-04-05 22:04:49,039 - INFO -    Windows (Command Prompt):
+2026-04-05 22:04:49,040 - INFO -    SET DHAN_CLIENT_ID=your_client_id_here
+2026-04-05 22:04:49,040 - INFO -    SET DHAN_ACCESS_TOKEN=your_access_token_here
+2026-04-05 22:04:49,040 - INFO - 
+2026-04-05 22:04:49,040 - INFO -    Windows (PowerShell):
+2026-04-05 22:04:49,040 - INFO -    $env:DHAN_CLIENT_ID='your_client_id_here'
+2026-04-05 22:04:49,041 - INFO -    $env:DHAN_ACCESS_TOKEN='your_access_token_here'
+2026-04-05 22:04:49,041 - INFO - 
+2026-04-05 22:04:49,041 - INFO - 3. Then run this script again
+2026-04-05 22:04:49,041 - INFO - ================================================================================

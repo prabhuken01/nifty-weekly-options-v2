@@ -1,0 +1,30 @@
+2026-04-05 22:53:41,952 - INFO - ================================================================================
+2026-04-05 22:53:41,952 - INFO - DAILY EOD DATA - Last 6 Months (Oct 2025 to Apr 2026)
+2026-04-05 22:53:41,952 - INFO - ================================================================================
+2026-04-05 22:53:41,952 - INFO - 
+[ATTEMPT 1] Kite API - Daily EOD Data
+2026-04-05 22:53:41,953 - INFO - --------------------------------------------------------------------------------
+2026-04-05 22:53:41,954 - WARNING - [SKIP] Kite API not available in this context: No module named 'mcp__kite'
+2026-04-05 22:53:41,954 - INFO - 
+[ATTEMPT 2] YFinance - Spot Price Data
+2026-04-05 22:53:41,955 - INFO - --------------------------------------------------------------------------------
+2026-04-05 22:53:44,130 - INFO - [OK] Downloaded 120 days of NIFTY spot data
+2026-04-05 22:53:44,130 - INFO - 
+[ATTEMPT 3] Realistic Synthetic Daily EOD Data
+2026-04-05 22:53:44,130 - INFO - --------------------------------------------------------------------------------
+2026-04-05 22:53:44,130 - INFO - [OK] Generating 6 months of realistic daily EOD data...
+2026-04-05 22:53:44,178 - INFO - [OK] Generated 780 daily records
+2026-04-05 22:53:44,178 - INFO - 
+[INSERT] Loading into option_bars_daily table...
+2026-04-05 22:53:44,263 - INFO - [OK] Cleared old test data
+2026-04-05 22:53:44,374 - INFO - 
+[SUMMARY] Data loaded successfully:
+2026-04-05 22:53:44,374 - INFO -   SENSEX: 50 records
+2026-04-05 22:53:44,374 - INFO -     Date range: 2026-03-30 15:30:00 to 2026-04-03 15:30:00
+2026-04-05 22:53:44,374 - INFO -   NIFTY: 830 records
+2026-04-05 22:53:44,374 - INFO -     Date range: 2025-10-06 15:30:00 to 2026-04-03 15:30:00
+2026-04-05 22:53:44,374 - INFO - 
+================================================================================
+2026-04-05 22:53:44,374 - INFO - [OK] Daily EOD data loaded (6 months: Oct 2025 - Apr 2026)
+2026-04-05 22:53:44,374 - INFO - [READY] Ready for backtesting with realistic daily OHLCV + Greeks
+2026-04-05 22:53:44,374 - INFO - ================================================================================
