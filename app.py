@@ -21,12 +21,6 @@ for module_dir in ['Live-Signal-Generator', 'Live-fetching']:
         break
 
 try:
-    from shoonya_fetcher import ShoomyaLiveDataFetcher
-    HAS_SHOONYA = True
-except ImportError:
-    HAS_SHOONYA = False
-
-try:
     from fetch_nifty_option_chain import NIFTYOptionChainFetcher
     HAS_LIVE_FETCHER = True
 except ImportError:
@@ -97,115 +91,106 @@ with st.sidebar:
     dte_adj    = effective_dte(today_dt, expiry_dt)
     st.info(f"Effective DTE: **{dte_adj} days** (holidays excluded)")
     st.markdown("---")
-    lot_size     = 65 if instrument == "NIFTY 50" else 20
-    capital_base = 500_000
-    st.caption(f"Lot: {lot_size} | Capital: Rs {capital_base:,}")
+    lot_size = 65 if instrument == "NIFTY 50" else 20
+    st.markdown("---")
+    st.markdown("**💰 Capital (from Dhan)**")
+    _f = st.session_state.get("_funds_display", None)
+    if _f:
+        st.metric("Available", f"₹{_f['available']:,.0f}")
+        st.metric("Used Margin", f"₹{_f['used']:,.0f}")
+        st.metric("Total Limit", f"₹{_f['total']:,.0f}")
+    else:
+        capital_base = st.number_input("Capital (Rs)", value=500_000, step=50_000)
+        st.caption("Enter token in Tab 2 to auto-fill from Dhan")
 
-# Fetch live prices from Shoonya API every hour
-@st.cache_data(ttl=3600)  # Cache for 1 hour
-def fetch_live_prices():
-    """
-    Fetch current live prices with priority:
-    1. Shoonya API (real-time, requires credentials)
-    2. NSE yesterday close (fallback)
-    3. Mock data (fallback)
-    """
+DHAN_CLIENT_ID = "1109450231"
+
+# ── Token: load priority: session → Streamlit secrets → empty ──
+# This means: once set in Streamlit Cloud secrets, works on ALL devices automatically
+if not st.session_state.get("dhan_tok"):
     try:
-        # Priority 1: Try Shoonya API
-        if HAS_SHOONYA:
-            try:
-                fetcher = ShoomyaLiveDataFetcher()
-                if fetcher.authenticated:
-                    nifty_data = fetcher.fetch_live_spot("NIFTY", "NSE")
-                    if nifty_data:
-                        sensex_data = fetcher.fetch_live_spot("SENSEX", "BSE")
-                        sensex_spot = sensex_data["spot"] if sensex_data else int(nifty_data["spot"] * 3.23)
-                        sensex_chg = sensex_data["change_pct"] if sensex_data else "+0 (0.00%)"
+        _secret_tok = st.secrets["dhan"]["access_token"]
+        if _secret_tok:
+            st.session_state["dhan_tok"] = _secret_tok
+    except Exception:
+        pass
 
-                        return {
-                            "NIFTY 50": {
-                                "spot": nifty_data["spot"],
-                                "chg": f"{nifty_data['change']} ({nifty_data['change_pct']})",
-                                "iv": nifty_data["iv"],
-                                "ivp": 42  # Would need historical calculation
-                            },
-                            "SENSEX": {
-                                "spot": sensex_spot,
-                                "chg": sensex_chg,
-                                "iv": 0.138,
-                                "ivp": 38
-                            },
-                            "timestamp": nifty_data["timestamp"],
-                            "source": "✨ Shoonya API (Real-time)"
-                        }
-            except Exception as e:
-                st.warning(f"Shoonya API error: {e}. Falling back to mock data.")
+def _dhan_headers(tok):
+    return {"Content-Type": "application/json",
+            "client-id": DHAN_CLIENT_ID, "access-token": tok}
 
-        # Priority 2: Try NSE yesterday close
-        if HAS_LIVE_FETCHER:
-            try:
-                fetcher = NIFTYOptionChainFetcher()
-                spot = fetcher.fetch_yesterday_close()
-                if spot:
-                    return {
-                        "NIFTY 50": {"spot": spot, "chg": "N/A (yesterday close)", "iv": 0.142, "ivp": 42},
-                        "SENSEX": {"spot": int(spot * 3.23), "chg": "N/A (yesterday close)", "iv": 0.138, "ivp": 38},
-                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        "source": "NSE (Yesterday close - outdated)"
-                    }
-            except Exception:
-                pass
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_dhan_ltp(tok):
+    """Fetch NIFTY50 and SENSEX LTP from Dhan market quote API."""
+    try:
+        r = requests.post("https://api.dhan.co/v2/marketfeed/ltp",
+                          json={"NSE_EQ": [], "IDX_I": [13, 51]},
+                          headers=_dhan_headers(tok), timeout=8)
+        d = r.json()
+        idx = d.get("data", {}).get("IDX_I", {})
+        n_ltp = idx.get("13", {}).get("last_price", 0)
+        s_ltp = idx.get("51", {}).get("last_price", 0)
+        if n_ltp and s_ltp:
+            return {"nifty": float(n_ltp), "sensex": float(s_ltp),
+                    "source": "Dhan LTP", "ts": datetime.now().strftime("%H:%M:%S")}
+    except Exception:
+        pass
+    return None
 
-        # Fallback 3: Mock data
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_dhan_funds(tok):
+    """Fetch available capital from Dhan funds API."""
+    try:
+        r = requests.get("https://api.dhan.co/v2/fundlimit",
+                         headers=_dhan_headers(tok), timeout=8)
+        d = r.json()
         return {
-            "NIFTY 50": {"spot": 22700, "chg": "+87 (+0.38%)", "iv": 0.142, "ivp": 42},
-            "SENSEX": {"spot": 73320, "chg": "-112 (-0.14%)", "iv": 0.138, "ivp": 38},
-            "timestamp": "Mock data",
-            "source": "📌 Mock (Setup Shoonya API for real data)"
+            "available": d.get("availabelBalance", 0),
+            "used":      d.get("utilizedAmount", 0),
+            "total":     d.get("sodLimit", 0),
         }
+    except Exception:
+        return None
 
-    except Exception as e:
-        return {
-            "NIFTY 50": {"spot": 22700, "chg": "+87 (+0.38%)", "iv": 0.142, "ivp": 42},
-            "SENSEX": {"spot": 73320, "chg": "-112 (-0.14%)", "iv": 0.138, "ivp": 38},
-            "timestamp": "Error",
-            "source": f"📌 Mock (Error: {str(e)[:30]})"
-        }
+# ── Fetch live data using token from session ──
+_tok_now = st.session_state.get("dhan_tok", "")
+_ltp     = fetch_dhan_ltp(_tok_now) if _tok_now else None
+_funds   = fetch_dhan_funds(_tok_now) if _tok_now else None
 
-prices_data = fetch_live_prices()
-SPOT   = {"NIFTY 50": prices_data["NIFTY 50"]["spot"], "SENSEX": prices_data["SENSEX"]["spot"]}
-IV_ANN = {"NIFTY 50": prices_data["NIFTY 50"]["iv"], "SENSEX": prices_data["SENSEX"]["iv"]}
-IVP    = {"NIFTY 50": prices_data["NIFTY 50"]["ivp"], "SENSEX": prices_data["SENSEX"]["ivp"]}
-CHG    = {"NIFTY 50": prices_data["NIFTY 50"]["chg"], "SENSEX": prices_data["SENSEX"]["chg"]}
-PRICE_TIMESTAMP = prices_data["timestamp"]
+SPOT = {
+    "NIFTY 50": _ltp["nifty"]  if _ltp else 22700,
+    "SENSEX":   _ltp["sensex"] if _ltp else 73320,
+}
+IV_ANN = {"NIFTY 50": 0.142, "SENSEX": 0.138}
+IVP    = {"NIFTY 50": 42,    "SENSEX": 38}
+CHG    = {"NIFTY 50": "", "SENSEX": ""}
+PRICE_TIMESTAMP = _ltp["ts"] if _ltp else "token not set"
+prices_data = {"source": _ltp["source"] if _ltp else "Mock (enter token)"}
 
 spot   = SPOT[instrument]
 iv     = IV_ANN[instrument]
 ivp    = IVP[instrument]
 ivp_ok = ivp_range[0] <= ivp <= ivp_range[1]
 
+# ── Store funds for sidebar display ──
+if _funds:
+    st.session_state["_funds_display"] = _funds
+capital_base = int(_funds["total"]) if _funds and _funds["total"] > 0 else 500_000
+
 PUT_OFFSETS  = [-0.045, -0.040, -0.035, -0.030, -0.025]
 CALL_OFFSETS = [+0.025, +0.030, +0.035, +0.040, +0.045]
 
 def top_bar():
-    # Mobile-responsive: use fewer columns on smaller screens
-    try:
-        # Try 5-column layout (desktop)
-        c1, c2, c3, c4, c5 = st.columns([2, 2, 2, 2, 3])
-    except:
-        # Fallback to 2-column on mobile
-        c1, c2 = st.columns(2)
-        c3, c4 = st.columns(2)
-        c5 = st.container()
-
-    c1.metric("NIFTY 50", f"Rs {SPOT['NIFTY 50']:,}", CHG["NIFTY 50"])
-    c2.metric("NIFTY IV", f"{IV_ANN['NIFTY 50']*100:.1f}%", f"IVP {IVP['NIFTY 50']}")
-    c3.metric("SENSEX",   f"Rs {SPOT['SENSEX']:,}", CHG["SENSEX"])
-    c4.metric("SENSEX IV", f"{IV_ANN['SENSEX']*100:.1f}%", f"IVP {IVP['SENSEX']}")
+    # Always use SPOT dict which is now Dhan-sourced when token present
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("NIFTY 50",  f"₹{SPOT['NIFTY 50']:,.0f}")
+    c2.metric("NIFTY IV",  f"{IV_ANN['NIFTY 50']*100:.1f}%", f"IVP {IVP['NIFTY 50']}")
+    c3.metric("SENSEX",    f"₹{SPOT['SENSEX']:,.0f}")
+    c4.metric("SENSEX IV", f"{IV_ANN['SENSEX']*100:.1f}%",   f"IVP {IVP['SENSEX']}")
     regime = "ALLOW" if ivp_ok else "SKIP"
-    c5.info(f"**Regime:** {regime} | IVP {ivp} | DTE {dte_adj} | {'Fri excluded' if excl_fri else 'All days'}")
-    source = prices_data.get("source", "Unknown")
-    st.caption(f"🕐 Prices: {source} | {PRICE_TIMESTAMP} | ♻️ Hourly refresh")
+    st.info(f"**Regime:** {regime} | IVP {ivp} | DTE {dte_adj} | {'Fri excluded' if excl_fri else 'All days'}")
+    src = prices_data.get("source", "Mock")
+    st.caption(f"🕐 {src} | {PRICE_TIMESTAMP} | auto-refresh 1 min")
 
 # Tabs
 tab1, tab2, tab3 = st.tabs(["Tab 1 - Backtest", "Tab 2 - Live Signal", "Tab 3 - IV History"])
@@ -361,116 +346,159 @@ with tab2:
     top_bar()
     st.markdown("---")
 
-    if not ivp_ok:
-        st.error(f"REGIME: SKIP - IVP={ivp} outside {ivp_range[0]}-{ivp_range[1]}%. No trades today.")
-    else:
-        st.success(f"REGIME: ALLOW - IVP={ivp} in range. DTE={dte_adj} days (holiday-adjusted).")
+    # ── Dhan API credentials ──────────────────────────────────────────────────
+    DHAN_CLIENT_ID  = "1109450231"
+    NIFTY_SCRIP_ID  = 13
+    SENSEX_SCRIP_ID = 51
+    IDX_SEG         = "IDX_I"
 
-    @st.cache_data(ttl=3600)
-    def fetch_option_premiums(instrument_type, offsets, side, spot_price, expiry_date):
-        """Fetch actual option premiums with priority:
-        1. Shoonya API (real-time)
-        2. NSE option chain (fallback)
-        3. Formula-based (final fallback)
+    with st.expander("🔑 Dhan Access Token", expanded=not st.session_state.get("dhan_loaded")):
+        _has_secret = bool(st.session_state.get("dhan_tok"))
+        dhan_token = st.text_input("Dhan Access Token",
+                                   type="password", key="dhan_tok",
+                                   placeholder="eyJ0eXAiOiJKV1QiLCJhbGci..." if not _has_secret else "")
+        if _has_secret:
+            st.success("✅ Token loaded (from secrets or previous entry). All devices share this.")
+        st.caption(f"Client ID: `{DHAN_CLIENT_ID}` (hardcoded) | "
+                   "Update daily token at: **share.streamlit.io → App → Settings → Secrets**")
 
-        TTL=3600 ensures hourly refresh without excessive API calls.
-        """
-        premiums = {off: None for off in offsets}
-
+    def fetch_dhan_expiry_list(scrip_id, tok):
+        url = "https://api.dhan.co/v2/optionchain/expirylist"
         try:
-            # Priority 1: Try Shoonya API
-            if HAS_SHOONYA:
-                try:
-                    fetcher = ShoomyaLiveDataFetcher()
-                    if fetcher.authenticated:
-                        option_chain = fetcher.fetch_option_chain(instrument, expiry_date=expiry_date)
-                        if option_chain:
-                            for off in offsets:
-                                strike = round(spot_price * (1 + off))
-                                for row in option_chain:
-                                    if row['strike'] == strike:
-                                        prem = row['ce_ltp'] if side == "call" else row['pe_ltp']
-                                        premiums[off] = prem
-                                        break
-                            return premiums
-                except Exception:
-                    pass
+            r = requests.post(url,
+                              json={"UnderlyingScrip": scrip_id, "UnderlyingSeg": IDX_SEG},
+                              headers={"Content-Type": "application/json",
+                                       "client-id": DHAN_CLIENT_ID, "access-token": tok},
+                              timeout=10)
+            d = r.json()
+            if d.get("status") == "success":
+                return d.get("data", [])
+            else:
+                st.error(f"Dhan expiry error: `{d}`")
+        except Exception as e:
+            st.error(f"Expiry request failed: `{e}`")
+        return []
 
-            # Priority 2: Try NSE option chain
-            if HAS_LIVE_FETCHER:
-                try:
-                    fetcher = NIFTYOptionChainFetcher(spot_price=spot_price)
-                    fetcher.fetch_yesterday_close()
-                    fetcher.calculate_bands(price_range_percent=4.5)
-                    fetcher.fetch_option_chain()
-                    fetcher.filter_by_band()
+    def fetch_dhan_chain(scrip_id, expiry_str, tok):
+        url = "https://api.dhan.co/v2/optionchain"
+        try:
+            r = requests.post(url,
+                              json={"UnderlyingScrip": scrip_id,
+                                    "UnderlyingSeg": IDX_SEG,
+                                    "Expiry": expiry_str},
+                              headers={"Content-Type": "application/json",
+                                       "client-id": DHAN_CLIENT_ID, "access-token": tok},
+                              timeout=10)
+            d = r.json()
+            if d.get("status") == "success":
+                return d.get("data", {})
+            else:
+                st.error(f"Dhan chain error: `{d}`")
+        except Exception as e:
+            st.error(f"Chain request failed: `{e}`")
+        return {}
 
-                    # Extract premium data for each offset
-                    for off in offsets:
-                        strike = round(spot_price * (1 + off))
-                        for row in fetcher.filtered_data:
-                            if row['strike'] == strike:
-                                prem = row['call_ltp'] if side == "call" else row['put_ltp']
-                                premiums[off] = prem
-                                break
-                except Exception:
-                    pass
+    def get_premium_from_chain(chain_data, strike_price, side):
+        """Return LTP (1 decimal) for a strike+side from Dhan chain response."""
+        oc = chain_data.get("oc", {})
+        for key, val in oc.items():
+            if abs(float(key) - strike_price) < 1:
+                leg = val.get("ce" if side == "call" else "pe", {})
+                ltp = leg.get("last_price", 0)
+                return round(float(ltp), 1)
+        return None
 
-        except Exception:
-            pass
+    # ── Expiry selector ───────────────────────────────────────────────────────
+    scrip_id = NIFTY_SCRIP_ID if instrument == "NIFTY 50" else SENSEX_SCRIP_ID
+    tok       = st.session_state.get("dhan_tok", "")
+    has_creds = bool(tok)
 
-        # Return None to use formula-based estimation in make_leg() if no real data
-        return premiums
+    ec1, ec2, ec3 = st.columns([2, 2, 1])
+    with ec1:
+        if has_creds:
+            expiry_list = fetch_dhan_expiry_list(scrip_id, tok)
+            if expiry_list:
+                selected_expiry_str = st.selectbox("Expiry (from Dhan)", expiry_list, key="tab2_expiry")
+            else:
+                selected_expiry_str = str(expiry_dt)
+                st.warning("Could not load expiries — check credentials.")
+        else:
+            selected_expiry_str = str(expiry_dt)
+            st.info("Enter Dhan credentials above to load live expiry list.")
+    with ec2:
+        fetch_chain_btn = st.button("📡 Fetch Live Chain", type="primary", disabled=not has_creds)
+    with ec3:
+        st.caption("Rate limit:\n1 req / 3 sec")
 
+    if fetch_chain_btn and has_creds:
+        with st.spinner("Fetching option chain from Dhan..."):
+            chain = fetch_dhan_chain(scrip_id, selected_expiry_str, tok)
+        if chain:
+            st.session_state["dhan_chain"]      = chain
+            st.session_state["dhan_expiry"]     = selected_expiry_str
+            st.session_state["dhan_loaded"]     = True
+            st.session_state["dhan_fetched_at"] = datetime.now().strftime("%H:%M:%S")
+            st.session_state["dhan_spot"]       = chain.get("last_price", spot)
+            st.success(f"✅ Chain loaded | Spot: ₹{chain.get('last_price', spot):,.1f} | Expiry: {selected_expiry_str}")
+        else:
+            st.error("Empty response from Dhan. Check credentials / expiry date.")
+
+    # Use Dhan spot if fetched, else sidebar spot
+    live_spot  = st.session_state.get("dhan_spot", spot)
+    chain_data = st.session_state.get("dhan_chain", {})
+    fetched_at = st.session_state.get("dhan_fetched_at", "")
+    src_label  = f"Dhan API (fetched {fetched_at})" if chain_data else "Formula estimate (no Dhan data)"
+
+    if not ivp_ok:
+        st.error(f"REGIME: SKIP — IVP={ivp} outside {ivp_range[0]}-{ivp_range[1]}%. No trades today.")
+    else:
+        st.success(f"REGIME: ALLOW — IVP={ivp} in range. DTE={dte_adj} days (holiday-adjusted). Source: {src_label}")
+
+    # ── Build leg tables ──────────────────────────────────────────────────────
     def make_leg(offsets, side):
         rows = []
-
-        # Fetch actual premiums from Kite API
-        premium_map = fetch_option_premiums(instrument, offsets, side, spot, expiry_dt)
-
         for off in offsets:
-            strike = round(spot * (1 + off))
+            # Round strike to nearest 50 (NSE standard)
+            strike = int(round(live_spot * (1 + off) / 50) * 50)
 
-            # Use ACTUAL Kite API premium if available, fallback to formula
-            prem = premium_map.get(off)
-            if prem is None:
-                # Fallback: formula-based if API unavailable
-                iv_factor = iv / 0.14
-                offset_factor = 1.0 - (abs(off) - 0.025) / 0.02
-                offset_factor = max(0.3, min(1.0, offset_factor))
-                base_premium = 1267
-                prem = max(5, int(base_premium * offset_factor * iv_factor / 65))
+            # Live premium from Dhan chain first, fall back to formula
+            prem = get_premium_from_chain(chain_data, strike, side) if chain_data else None
+            if prem is None or prem == 0:
+                iv_factor     = iv / 0.14
+                offset_factor = max(0.3, 1.0 - (abs(off) - 0.025) / 0.02)
+                prem          = round(max(5.0, 1267 * offset_factor * iv_factor / 65), 1)
+                prem_src      = "~est"
             else:
-                prem = int(prem)  # Convert to Rs (already per contract)
+                prem_src = "live"
 
-            profit    = prem * lot_size
-            # Capital requirement: Fixed at 2.5L per side (not offset-dependent)
-            cap_req   = 250_000 if instrument == "NIFTY 50" else 125_000
-            ret_pct   = round(profit / cap_req * 100, 1)
-            prob      = bs_nd2(spot, strike, iv, dte_adj) if side == "put" \
-                        else 1 - bs_nd2(spot, strike, iv, dte_adj)
-            theta     = round(prem * lot_size / dte_adj)
-            vega      = round(-prem * lot_size * 0.15)
-            cushion   = round(theta / abs(vega), 1) if vega != 0 else 0
-            score     = comp_score(prob, ivp)
-            action    = sig_label(score, sig_thresh)
-            ext_spot  = strike * (0.995 if side == "put" else 1.005)
-            ext_loss  = round((strike - ext_spot) * lot_size) if side == "put" \
-                        else round((ext_spot - strike) * lot_size)
+            profit   = round(prem * lot_size, 1)
+            cap_req  = 250_000 if instrument == "NIFTY 50" else 125_000
+            ret_pct  = round(profit / cap_req * 100, 1)
+            prob     = bs_nd2(live_spot, strike, iv, dte_adj) if side == "put" \
+                       else 1 - bs_nd2(live_spot, strike, iv, dte_adj)
+            theta    = round(prem * lot_size / dte_adj, 1)
+            vega     = round(-prem * lot_size * 0.15, 1)
+            cushion  = round(theta / abs(vega), 1) if vega != 0 else 0
+            score    = comp_score(prob, ivp)
+            action   = sig_label(score, sig_thresh)
+            ext_spot = strike * (0.995 if side == "put" else 1.005)
+            ext_loss = round((strike - ext_spot) * lot_size) if side == "put" \
+                       else round((ext_spot - strike) * lot_size)
             rows.append({
-                "Offset": f"{off*100:+.1f}%",
-                "Strike": strike,
-                "Premium (Rs)": prem,
-                "Profit/lot (Rs)": profit,
-                "Capital (Rs)": cap_req,
-                "Return/lot (%)": ret_pct,
-                "Prob N(d2) (%)": round(prob * 100),
-                "Theta (Rs/day)": theta,
-                "Vega (Rs/1%IV)": vega,
-                "Cushion": cushion,
-                "Score": score,
-                "Action": action,
-                "Extreme loss (Rs)": ext_loss,
+                "Offset":          f"{off*100:+.1f}%",
+                "Strike":          strike,
+                "Premium":         prem,
+                "Src":             prem_src,
+                "Profit/lot (Rs)": int(profit),
+                "Capital (Rs)":    cap_req,
+                "Return (%)":      ret_pct,
+                "Prob N(d2) (%)":  round(prob * 100),
+                "Theta (Rs/day)":  theta,
+                "Vega (Rs/1%IV)":  vega,
+                "Cushion":         cushion,
+                "Score":           score,
+                "Action":          action,
+                "Ext. loss (Rs)":  ext_loss,
             })
         return pd.DataFrame(rows)
 
@@ -479,16 +507,10 @@ with tab2:
     bp = put_df.loc[put_df["Score"].idxmax()]
     bc = call_df.loc[call_df["Score"].idxmax()]
 
-    # Mobile-responsive metrics (2 cols on mobile, 4 on desktop)
-    try:
-        v1, v2, v3, v4 = st.columns(4)
-    except:
-        v1, v2 = st.columns(2)
-        v3, v4 = st.columns(2)
-
-    v1.metric("Best put strike",  f"{bp['Strike']:,} ({bp['Offset']})",
+    v1, v2, v3, v4 = st.columns(4)
+    v1.metric("Best put strike",  f"₹{bp['Strike']:,} ({bp['Offset']})",
               f"Score {bp['Score']} | Prob {bp['Prob N(d2) (%)']}%")
-    v2.metric("Best call strike", f"{bc['Strike']:,} ({bc['Offset']})",
+    v2.metric("Best call strike", f"₹{bc['Strike']:,} ({bc['Offset']})",
               f"Score {bc['Score']} | Prob {bc['Prob N(d2) (%)']}%")
     strangle = bp["Score"] >= sig_thresh and bc["Score"] >= sig_thresh
     rec = "Strangle" if strangle else \
@@ -504,13 +526,23 @@ with tab2:
             if col.name == "Action":
                 colors = []
                 for v in col:
-                    bg_color = sig_color(v)
-                    # High contrast text: white on dark, black on light
-                    text_color = "color: black;" if bg_color == "#C6EFCE" else "color: white;"
-                    colors.append(f"background-color:{bg_color}; {text_color} font-weight: bold;")
+                    bg  = sig_color(v)
+                    txt = "color: black;" if bg == "#C6EFCE" else "color: white;"
+                    colors.append(f"background-color:{bg}; {txt} font-weight: bold;")
                 return colors
+            if col.name == "Src":
+                return ["color: #00cc88;" if v == "live" else "color: #888888;"
+                        for v in col]
             return [""] * len(col)
-        return df.style.apply(_apply)
+        return df.style.apply(_apply).format({
+            "Premium":         "{:.1f}",
+            "Profit/lot (Rs)": "{:,}",
+            "Capital (Rs)":    "{:,}",
+            "Return (%)":      "{:.1f}",
+            "Theta (Rs/day)":  "{:.1f}",
+            "Vega (Rs/1%IV)":  "{:.1f}",
+            "Cushion":         "{:.1f}x",
+        })
 
     st.markdown("**PUT LEG — sell put (profit if spot stays above strike)**")
     st.dataframe(color_row(put_df), use_container_width=True, hide_index=True)
@@ -519,76 +551,144 @@ with tab2:
     st.dataframe(color_row(call_df), use_container_width=True, hide_index=True)
 
     st.markdown("---")
-    st.caption(f"Extreme loss = 0.5% beyond outer strike on last trading day. "
-               f"Max acceptable loss < 5% of Rs {capital_base:,} = Rs {capital_base//20:,}")
+    st.caption(f"Premium: **live** = Dhan API real LTP (1 decimal) | **~est** = formula fallback. "
+               f"Extreme loss = 0.5% beyond outer strike. "
+               f"Max loss target < 5% of ₹{capital_base:,} = ₹{capital_base//20:,}")
 
     with st.expander("Glossary - live signal"):
         st.markdown("""
-**Prob N(d2)** — Black-Scholes probability the option expires worthless. Inputs: Spot, Strike, IV (annualised), r=6.5%, holiday-adjusted DTE. Example: 94% on a put means 94% chance spot stays above that strike at expiry.
+**Premium** — Actual Last Traded Price from Dhan API option chain, shown to 1 decimal. Green "live" = real Dhan data. Grey "~est" = Black-Scholes formula estimate (shown when Dhan not connected or strike not found).
 
-**Cushion ratio (Theta / |Vega|)** — How many IV percentage-points must spike in ONE day to wipe your daily Theta income. Example: Theta=+440, Vega=-220, ratio=2.0x means IV must rise 2 full points (e.g. 14% to 16%) in a single day to cancel out today's decay income. Green >= 2x, Amber 1-2x, Red < 1x.
+**Strike rounding** — Rounded to nearest ₹50 to match NSE standard option strikes.
 
-**Signal score** — Composite 0-100. Formula: N(d2) probability x 0.60 + IVP quality x 0.40. IVP quality = IVP x 1.25 capped at 100. Threshold set in sidebar (default 65).
+**Prob N(d2)** — Black-Scholes probability the option expires worthless. Inputs: Spot (from Dhan), Strike, IV (annualised), r=6.5%, holiday-adjusted DTE.
 
-**Extreme loss 0.5%** — Worst-case loss if spot moves 0.5% beyond the outer strike on the last trading day before expiry. You enter at fag-end of theta decay so extreme moves beyond this are tail events. Use this to size: extreme loss should be below 5% of capital.
+**Cushion ratio (Theta / |Vega|)** — How many IV points must spike in ONE day to wipe daily Theta. Green >= 2x, Amber 1-2x, Red < 1x.
 
-**Holiday-adjusted DTE** — Apr 3 (Thu) to Apr 7 (Mon): Apr 5 (Sat) + Apr 6 (Sun) = 0 trading days. Effective DTE = 2. This compresses Theta (faster decay per day) and lifts N(d2) probability (strike is safer with less time).
+**Signal score** — N(d2) x 0.60 + IVP quality x 0.40. IVP quality = IVP x 1.25 capped at 100. Threshold set in sidebar.
+
+**Extreme loss 0.5%** — Worst-case loss if spot moves 0.5% beyond the outer strike at expiry.
         """)
 
 # ── TAB 3 ─────────────────────────────────────────────────────────────────────
 with tab3:
     top_bar()
     st.markdown("---")
+    st.subheader("📊 IV & Option Chain Data — Expiry Wise")
+    st.caption("Source: Dhan API (live) | No charts — table format only")
 
-    period_sel = st.radio("Period", ["1D", "1H", "5M"], horizontal=True)
-    src_note = {
-        "1D": "Source: NSE Bhavcopy EOD | ATM mid-price IV | Free, T+1 by 6 PM",
-        "1H": "Source: DhanHQ Historical API or Kite Instruments | Requires API key",
-        "5M": "Source: Same as 1H | High noise - cross-check with 1D IVP before acting",
-    }
-    st.caption(src_note[period_sel])
+    tok3 = st.session_state.get("dhan_tok", "")
+    DHAN_CLIENT_ID_T3 = "1109450231"
+    IDX_SEG_T3 = "IDX_I"
 
-    np.random.seed(42)
-    base_iv = 14.2
-    nifty_iv  = np.clip(base_iv + np.cumsum(np.random.randn(30) * 0.3), 10, 22).round(1)
-    sensex_iv = np.clip(base_iv - 0.4 + np.cumsum(np.random.randn(30) * 0.3), 10, 22).round(1)
-    periods = [f"P{i+1}" for i in range(30)]
+    def dhan_post(url, payload, tok):
+        try:
+            r = requests.post(url,
+                              json=payload,
+                              headers={"Content-Type": "application/json",
+                                       "client-id": DHAN_CLIENT_ID_T3,
+                                       "access-token": tok},
+                              timeout=10)
+            d = r.json()
+            return d if d.get("status") == "success" else None
+        except Exception:
+            return None
 
-    iv_df = pd.DataFrame({
-        "Period": periods,
-        "NIFTY IV (%)":  nifty_iv,
-        "SENSEX IV (%)": sensex_iv,
-    })
-    iv_df["NIFTY IVP (%)"]  = [round(sum(nifty_iv[:i+1]  < nifty_iv[i])  / min(i+1,30) * 100) for i in range(30)]
-    iv_df["SENSEX IVP (%)"] = [round(sum(sensex_iv[:i+1] < sensex_iv[i]) / min(i+1,30) * 100) for i in range(30)]
+    def fetch_chain_tab3(scrip_id, expiry, tok):
+        d = dhan_post("https://api.dhan.co/v2/optionchain",
+                      {"UnderlyingScrip": scrip_id, "UnderlyingSeg": IDX_SEG_T3, "Expiry": expiry}, tok)
+        return d.get("data", {}) if d else {}
 
-    st.markdown("**Implied Volatility - last 30 periods**")
-    st.line_chart(iv_df.set_index("Period")[["NIFTY IV (%)", "SENSEX IV (%)"]])
+    def fetch_expiries_tab3(scrip_id, tok):
+        d = dhan_post("https://api.dhan.co/v2/optionchain/expirylist",
+                      {"UnderlyingScrip": scrip_id, "UnderlyingSeg": IDX_SEG_T3}, tok)
+        return d.get("data", []) if d else []
 
-    st.caption(f"IVP floor: {ivp_range[0]}% | IVP ceiling: {ivp_range[1]}% | "
-               f"Current NIFTY IVP: {ivp} | Current SENSEX IVP: {IVP['SENSEX']}")
+    def chain_to_df(chain, spot, band=4.5):
+        oc = chain.get("oc", {})
+        spot = chain.get("last_price", spot)
+        rows = []
+        for k, v in oc.items():
+            strike = float(k)
+            if not (spot*(1-band/100) <= strike <= spot*(1+band/100)):
+                continue
+            ce = v.get("ce", {}); pe = v.get("pe", {})
+            rows.append({
+                "Strike":    int(strike),
+                "CE LTP":    round(ce.get("last_price", 0), 1),
+                "CE OI":     ce.get("oi", 0),
+                "CE IV%":    round(ce.get("implied_volatility", 0), 2),
+                "CE Delta":  round(ce.get("greeks", {}).get("delta", 0), 3),
+                "CE Vol":    ce.get("volume", 0),
+                "PE LTP":    round(pe.get("last_price", 0), 1),
+                "PE OI":     pe.get("oi", 0),
+                "PE IV%":    round(pe.get("implied_volatility", 0), 2),
+                "PE Delta":  round(pe.get("greeks", {}).get("delta", 0), 3),
+                "PE Vol":    pe.get("volume", 0),
+            })
+        return pd.DataFrame(rows).sort_values("Strike").reset_index(drop=True), spot
 
-    st.markdown("**IVP rank by period**")
-    st.bar_chart(iv_df.set_index("Period")[["NIFTY IVP (%)", "SENSEX IVP (%)"]])
+    if not tok3:
+        st.info("👆 Paste your Dhan Access Token in Tab 2 first, then come back here.")
+    else:
+        t3c1, t3c2 = st.columns(2)
 
-    st.markdown("---")
-    st.dataframe(iv_df, use_container_width=True, hide_index=True)
+        # ── NIFTY section ──
+        with t3c1:
+            st.markdown("#### NIFTY 50")
+            nifty_expiries = fetch_expiries_tab3(13, tok3)
+            if nifty_expiries:
+                sel_n = st.selectbox("Nifty Expiry", nifty_expiries, key="t3_nifty_exp")
+                if st.button("Load Nifty Chain", key="t3_nifty_btn"):
+                    ch = fetch_chain_tab3(13, sel_n, tok3)
+                    if ch:
+                        st.session_state["t3_nifty_chain"] = ch
+                        st.session_state["t3_nifty_exp_used"] = sel_n
+                if "t3_nifty_chain" in st.session_state:
+                    df_n, spot_n = chain_to_df(st.session_state["t3_nifty_chain"], SPOT["NIFTY 50"])
+                    atm_n = df_n.iloc[(df_n["Strike"] - spot_n).abs().argsort()[:1]]["Strike"].values[0]
+                    st.caption(f"Spot: ₹{spot_n:,.1f} | ATM: ₹{atm_n:,} | Expiry: {st.session_state.get('t3_nifty_exp_used','')}")
+                    def hl_atm_n(row):
+                        return ["background-color:#2d2d4e;font-weight:bold"]*len(row) if row["Strike"]==atm_n else [""]*len(row)
+                    st.dataframe(
+                        df_n.style.apply(hl_atm_n, axis=1).format({
+                            "CE LTP":"{:.1f}","PE LTP":"{:.1f}",
+                            "CE IV%":"{:.2f}","PE IV%":"{:.2f}",
+                            "CE Delta":"{:.3f}","PE Delta":"{:.3f}",
+                            "CE OI":"{:,.0f}","PE OI":"{:,.0f}",
+                            "CE Vol":"{:,.0f}","PE Vol":"{:,.0f}",
+                        }),
+                        use_container_width=True, hide_index=True, height=450
+                    )
+            else:
+                st.warning("Could not load Nifty expiries.")
 
-    with st.expander("Glossary - IV history"):
-        st.markdown("""
-**ATM IV%** — Implied Volatility extracted from At-The-Money option mid-price using Black-Scholes reverse. Represents the market's consensus forecast of future volatility. Higher = market fears larger moves.
-
-**IVP rank** — IV Percentile over last 30 periods. Formula: count(periods where IV < today's IV) / 30. 0% = IV at historic low. 100% = historic high. Trade zone: 20-80%.
-
-**1D period** — One trading day's closing ATM IV. Source: NSE Bhavcopy (free, T+1 available by 6 PM).
-
-**1H period** — One hourly IV snapshot. Source: DhanHQ Historical API or Kite Instruments. Requires API key.
-
-**5M period** — One 5-minute candle. Same source as 1H. Use only for final-hour entry timing. High noise.
-
-**Rising IV + low IVP** — Volatility expanding from base. Cautious - potential skip.
-
-**Falling IV + high IVP** — Volatility compressing from peak. Ideal selling environment.
-
-**Flat IV + mid IVP (30-60)** — Stable regime. Standard signal logic applies.
-        """)
+        # ── SENSEX section ──
+        with t3c2:
+            st.markdown("#### SENSEX")
+            sensex_expiries = fetch_expiries_tab3(51, tok3)
+            if sensex_expiries:
+                sel_s = st.selectbox("Sensex Expiry", sensex_expiries, key="t3_sensex_exp")
+                if st.button("Load Sensex Chain", key="t3_sensex_btn"):
+                    ch = fetch_chain_tab3(51, sel_s, tok3)
+                    if ch:
+                        st.session_state["t3_sensex_chain"] = ch
+                        st.session_state["t3_sensex_exp_used"] = sel_s
+                if "t3_sensex_chain" in st.session_state:
+                    df_s, spot_s = chain_to_df(st.session_state["t3_sensex_chain"], SPOT["SENSEX"])
+                    atm_s = df_s.iloc[(df_s["Strike"] - spot_s).abs().argsort()[:1]]["Strike"].values[0]
+                    st.caption(f"Spot: ₹{spot_s:,.1f} | ATM: ₹{atm_s:,} | Expiry: {st.session_state.get('t3_sensex_exp_used','')}")
+                    def hl_atm_s(row):
+                        return ["background-color:#2d2d4e;font-weight:bold"]*len(row) if row["Strike"]==atm_s else [""]*len(row)
+                    st.dataframe(
+                        df_s.style.apply(hl_atm_s, axis=1).format({
+                            "CE LTP":"{:.1f}","PE LTP":"{:.1f}",
+                            "CE IV%":"{:.2f}","PE IV%":"{:.2f}",
+                            "CE Delta":"{:.3f}","PE Delta":"{:.3f}",
+                            "CE OI":"{:,.0f}","PE OI":"{:,.0f}",
+                            "CE Vol":"{:,.0f}","PE Vol":"{:,.0f}",
+                        }),
+                        use_container_width=True, hide_index=True, height=450
+                    )
+            else:
+                st.warning("Could not load Sensex expiries.")
