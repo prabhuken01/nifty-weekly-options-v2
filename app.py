@@ -73,35 +73,53 @@ def cushion_color(ratio):
     if ratio >= 1.0: return "#FFEB9C"
     return "#FFC7CE"
 
-# Sidebar
+# Sidebar - 5 Sections
 with st.sidebar:
-    st.markdown("### Controls")
-    data_src   = st.selectbox("Data source", ["NSE Bhavcopy (EOD)", "DhanHQ API", "Kite Connect"])
-    instrument = st.selectbox("Instrument", ["NIFTY 50", "SENSEX"])
-    lookback_m = st.selectbox("Lookback (months)", [6, 12, 24, 36], index=1)
-    entry_time = st.selectbox("Entry time", ["T-2 closing","T-1 opening","T-1 closing","T opening","T closing"])
-    exit_time  = st.selectbox("Exit time",  ["T-1 closing","T opening","T closing"])
+    # SECTION 1: Data Source
+    st.markdown("### 1️⃣ Data Source")
+    data_src   = st.selectbox("Source", ["NSE Bhavcopy (EOD)", "DhanHQ API", "Kite Connect"], key="data_src")
+    instrument = st.selectbox("Instrument", ["NIFTY 50", "SENSEX"], key="instrument")
+    dhan_token_input = st.text_input("Dhan Token (optional)", type="password", key="dhan_token")
+    if dhan_token_input:
+        st.session_state["dhan_tok"] = dhan_token_input
+    st.button("Fetch Live Chain", key="fetch_live_btn")
     st.markdown("---")
-    ivp_range  = st.slider("IVP regime filter (%)", 0, 100, (20, 80))
-    excl_fri   = st.toggle("Exclude Friday entries", value=True)
-    sig_thresh = st.slider("Signal threshold", 50, 90, 65)
+
+    # SECTION 2: Backtest Settings
+    st.markdown("### 2️⃣ Backtest Settings")
+    lookback_m = st.selectbox("Lookback (months)", [6, 12, 24, 36], index=1, key="lookback")
+    entry_time = st.selectbox("Entry time", ["T-2 closing","T-1 opening","T-1 closing","T opening","T closing"], key="entry")
+    exit_time  = st.selectbox("Exit time",  ["T-1 closing","T opening","T closing"], key="exit")
     st.markdown("---")
-    expiry_dt  = st.date_input("Next expiry", value=date(2026, 4, 7))
-    today_dt   = st.date_input("Today's date", value=date(2026, 4, 3))
+
+    # SECTION 3: Signal Filters
+    st.markdown("### 3️⃣ Signal Filters")
+    ivp_range  = st.slider("IVP regime (%)", 0, 100, (20, 80), key="ivp")
+    excl_fri   = st.toggle("Exclude Friday", value=True, key="excl_fri")
+    sig_thresh = st.slider("Signal threshold", 50, 90, 65, key="sig_thresh")
+    st.markdown("---")
+
+    # SECTION 4: Expiry & Timeline
+    st.markdown("### 4️⃣ Expiry & Timeline")
+    expiry_dt  = st.date_input("Next expiry", value=date(2026, 4, 7), key="expiry")
+    today_dt   = st.date_input("Today's date", value=date(2026, 4, 3), key="today")
     dte_adj    = effective_dte(today_dt, expiry_dt)
     st.info(f"Effective DTE: **{dte_adj} days** (holidays excluded)")
+    offset_pct = st.slider("Offset range (%)", 0.1, 1.0, 0.5, 0.1, key="offset_pct")
+    st.caption(f"Generates {5} strike levels from {-offset_pct:.1f}% to {offset_pct:.1f}%")
     st.markdown("---")
+
+    # SECTION 5: Capital Status
+    st.markdown("### 5️⃣ Capital Status")
     lot_size = 65 if instrument == "NIFTY 50" else 20
-    st.markdown("---")
-    st.markdown("**💰 Capital (from Dhan)**")
     _f = st.session_state.get("_funds_display", None)
     if _f:
         st.metric("Available", f"₹{_f['available']:,.0f}")
         st.metric("Used Margin", f"₹{_f['used']:,.0f}")
-        st.metric("Total Limit", f"₹{_f['total']:,.0f}")
+        st.metric("Total", f"₹{_f['total']:,.0f}")
     else:
-        capital_base = st.number_input("Capital (Rs)", value=500_000, step=50_000)
-        st.caption("Enter token in Tab 2 to auto-fill from Dhan")
+        capital_base = st.number_input("Capital (Rs)", value=500_000, step=50_000, key="capital")
+        st.caption("Enter token above to auto-fill from Dhan")
 
 DHAN_CLIENT_ID = "1109450231"
 
@@ -192,8 +210,8 @@ def top_bar():
     src = prices_data.get("source", "Mock")
     st.caption(f"🕐 {src} | {PRICE_TIMESTAMP} | auto-refresh 1 min")
 
-# Tabs
-tab1, tab2, tab3 = st.tabs(["Tab 1 - Backtest", "Tab 2 - Live Signal", "Tab 3 - IV History"])
+# Tabs (reordered: Live Signal first)
+tab1, tab2, tab3 = st.tabs(["Tab 1 - Live Signal", "Tab 2 - Backtest", "Tab 3 - IV History"])
 
 # ── TAB 1 ─────────────────────────────────────────────────────────────────────
 with tab1:
