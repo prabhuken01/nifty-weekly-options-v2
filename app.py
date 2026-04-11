@@ -17,6 +17,34 @@ for d in ['Live-Signal-Generator', 'Live-fetching']:
 st.set_page_config(page_title="Nifty Options Dashboard", layout="wide",
                    page_icon="📈", initial_sidebar_state="expanded")
 
+# ── Mobile-friendly CSS ──────────────────────────────────────────────────────
+st.markdown("""
+<style>
+/* Global font size bump for mobile */
+@media (max-width: 768px) {
+    .stApp { font-size: 15px !important; }
+    [data-testid="stMetric"] { padding: 6px 8px !important; }
+    [data-testid="stMetricLabel"] { font-size: 13px !important; }
+    [data-testid="stMetricValue"] { font-size: 20px !important; }
+    [data-testid="stMetricDelta"] { font-size: 12px !important; }
+    .stDataFrame { font-size: 13px !important; }
+    .stDataFrame td, .stDataFrame th { padding: 4px 6px !important; min-width: 60px !important; }
+    .stTabs [data-baseweb="tab"] { font-size: 14px !important; padding: 8px 12px !important; }
+    .stCaption { font-size: 12px !important; }
+    .stAlert p { font-size: 13px !important; }
+    [data-testid="stSidebar"] { min-width: 280px !important; }
+    h1 { font-size: 22px !important; }
+    h2, .stSubheader { font-size: 18px !important; }
+    h3 { font-size: 16px !important; }
+    /* Make columns stack on very small screens */
+    [data-testid="column"] { min-width: 140px !important; }
+}
+/* Desktop: slightly larger dataframe text */
+.stDataFrame { font-size: 14px; }
+.stDataFrame th { font-weight: 700 !important; background-color: rgba(50,50,50,0.3) !important; }
+</style>
+""", unsafe_allow_html=True)
+
 # ── Constants ─────────────────────────────────────────────────────────────────
 DHAN_CLIENT_ID  = "1109450231"
 NIFTY_SCRIP_ID  = 13
@@ -66,7 +94,12 @@ def delta_bs(spot, strike, iv, dte_days, side):
     return round(nd1 - 1, 3) if side == "put" else round(nd1, 3)
 
 def ivp_quality(ivp): return min(100, ivp * 1.25)
-def comp_score(prob, ivp): return round(prob * 60 + ivp_quality(ivp) * 0.40)
+def comp_score(prob, ivp, ret_pct=0):
+    """Score = 40% × Prob(OTM) + 30% × IVP quality + 30% × Return attractiveness"""
+    prob_component = prob * 100 * 0.40
+    ivp_component  = ivp_quality(ivp) * 0.30
+    ret_component  = min(100, ret_pct * 25) * 0.30   # 4% ret = 100 score
+    return round(prob_component + ivp_component + ret_component)
 def sig_label(sc, thr=65): return "SELL" if sc>=thr else ("MONITOR" if sc>=50 else "AVOID")
 def sig_color(lbl): return {"SELL":"#C6EFCE","MONITOR":"#FFEB9C","AVOID":"#FFC7CE"}[lbl]
 
@@ -231,7 +264,9 @@ CALL_OFFSETS = [+(dist_pct/100 + i*(step_pct/100)) for i in range(5)]
 ivp_ok = ivp_range[0] <= IVP["NIFTY 50"] <= ivp_range[1]
 
 # ── Handle fetch button ───────────────────────────────────────────────────────
-if fetch_btn and has_tok:
+# Auto-fetch on first load if token available but no chain cached yet
+_auto_fetch = has_tok and "nifty_chain" not in st.session_state
+if (fetch_btn or _auto_fetch) and has_tok:
     with st.spinner("Fetching Nifty & Sensex option chains…"):
         nc = fetch_chain(NIFTY_SCRIP_ID,  sel_n_exp, tok)
         sc = fetch_chain(SENSEX_SCRIP_ID, sel_s_exp, tok)
@@ -249,7 +284,7 @@ if fetch_btn and has_tok:
 def make_leg(offsets, side, idx):
     spot       = st.session_state.get("nifty_spot_live" if idx=="NIFTY 50" else "sensex_spot_live", SPOT[idx])
     chain      = st.session_state.get("nifty_chain"     if idx=="NIFTY 50" else "sensex_chain",     {})
-    iv         = IV_ANN[idx]; ivp = IVP[idx]
+    iv         = IV_ANN[idx]; ivp_val = IVP[idx]
     lot        = LOT[idx];    rnd = ROUND[idx]
     cap        = capital_base  # same for both (1.25L default or Dhan total)
     rows = []
@@ -269,12 +304,13 @@ def make_leg(offsets, side, idx):
         theta   = round(prem*lot/dte_adj, 1)
         vega    = round(-prem*lot*0.15, 1)
         cushion = round(theta/abs(vega), 1) if vega else 0
-        score   = comp_score(prob, ivp)
+        score   = comp_score(prob, ivp_val, ret)
         action  = sig_label(score, sig_thresh)
-        ext     = round(abs(off+0.005)*lot*strike, 0)
+        # Ext.loss: loss if spot moves 0.5% beyond strike
+        ext     = round(abs(abs(off)+0.005)*lot*strike, 0)
         rows.append({"Offset":f"{off*100:+.1f}%","Strike":strike,"Premium":prem,"Src":src,
                      "Profit/lot":int(profit),"Capital":cap,"Return%":ret,
-                     "Delta":dlt,"Theta":theta,"Vega":vega,
+                     "Delta":f"{dlt:.4f}","Theta":theta,"Vega":vega,
                      "Prob%":round(prob*100),"Cushion":cushion,
                      "Score":score,"Action":action,"Ext.loss":int(ext)})
     return pd.DataFrame(rows)
@@ -289,7 +325,8 @@ def style_leg(df):
         return [""]*len(col)
     return df.style.apply(_apply).format(
         {"Premium":"{:.1f}","Profit/lot":"{:,}","Capital":"{:,}",
-         "Return%":"{:.1f}","Theta":"{:.1f}","Vega":"{:.1f}","Cushion":"{:.1f}x"})
+         "Return%":"{:.1f}","Theta":"{:.1f}","Vega":"{:.1f}","Cushion":"{:.1f}x"},
+        subset=["Premium","Profit/lot","Capital","Return%","Theta","Vega","Cushion"])
 
 def render_index(idx):
     chain     = st.session_state.get("nifty_chain" if idx=="NIFTY 50" else "sensex_chain",{})
@@ -327,7 +364,7 @@ def render_index(idx):
     st.dataframe(style_leg(call_df[col_order]), use_container_width=True, hide_index=True)
     st.caption(
         f"Lot: {LOT[idx]} | Capital: ₹{capital_base:,} ({cap_src}) | Strike rnd: ₹{ROUND[idx]} | "
-        f"**Score** = 60% × Prob N(d2) + 40% × min(IVP×1.25, 100). Threshold={sig_thresh}"
+        f"**Score** = 40%×Prob + 30%×IVP + 30%×Return. Threshold={sig_thresh}"
     )
 
 def top_bar():
@@ -366,7 +403,7 @@ with tab1:
 
     with st.expander("Glossary"):
         st.markdown("""
-**Score** = 60% × Prob N(d2) + 40% × min(IVP × 1.25, 100). SELL ≥ threshold, MONITOR ≥50, else AVOID.
+**Score** = 40% × Prob N(d2) + 30% × min(IVP×1.25, 100) + 30% × min(Return%×25, 100). SELL ≥ threshold, MONITOR ≥50, else AVOID.
 
 **Prob N(d2)** — BS probability option expires worthless. Inputs: spot, strike, IV, r=6.5%, DTE (holidays excluded).
 
@@ -385,60 +422,203 @@ with tab1:
 with tab2:
     top_bar()
     st.markdown("---")
+    st.subheader("📊 Strategy Backtest Engine")
+    st.caption("Select a historical date → view market state → pick strategy → see P&L result for 1 contract")
 
-    def gen_bt(lookback, off, win_rate=0.70, tpm=4):
-        total = lookback * tpm
-        lo,hi = ivp_range
-        def frac(a,b):
-            lf = min(0.20,(33-a)/33) if a<33 else 0
-            mf = min(0.60,(min(67,b)-max(33,a))/34) if a<67 and b>33 else 0
-            hf = min(0.20,(b-67)/33) if b>67 else 0
-            return lf+mf+hf
-        n = max(1, int(total * frac(lo,hi)))
-        wins = int(n*win_rate); loss_n = n-wins
-        base_prem = max(200, int(1267*(1-(abs(off)-0.005)/0.045*0.35)))
-        gp = base_prem * LOT["NIFTY 50"]
-        loss_pt = capital_base * 0.01
-        gross = wins*gp - loss_n*loss_pt
-        costs = n*250
-        theta = int(gp/dte_adj*0.7) if dte_adj>0 else 0
-        vega  = -int(gp*0.05)
-        return {"Offset":f"{off*100:+.1f}%","Gross P&L":gross,"Costs":costs,
-                "Net P&L":gross-costs,"Win%":int(win_rate*100),
-                "Max DD":-loss_pt,"Theta":theta,"Vega":vega,"Trades":n}
+    # ── Step 1: Date Selection ────────────────────────────────────────────────
+    st.markdown("#### 1️⃣ Select Historical Date")
+    bt_c1, bt_c2, bt_c3 = st.columns(3)
+    with bt_c1:
+        bt_date = st.date_input("Trade Date", value=date.today() - timedelta(days=7),
+                                 min_value=date(2024,10,1), max_value=date.today(),
+                                 key="bt_date")
+    # Calculate nearest expiry from that date (Thursday for Nifty)
+    def next_expiry_from(d):
+        """Find next Thursday (Nifty weekly) from given date"""
+        days_ahead = 3 - d.weekday()  # Thursday = 3
+        if days_ahead < 0:
+            days_ahead += 7
+        if days_ahead == 0:
+            return d  # It's Thursday, expiry is today
+        return d + timedelta(days=days_ahead)
 
-    st.info(f"📊 Backtest | IVP filter: {ivp_range[0]}-{ivp_range[1]}% | Lookback: {lookback_m}m")
-    rows = [gen_bt(lookback_m, o) for o in [-0.005,-0.010,-0.015,-0.020,-0.025]]
-    df = pd.DataFrame(rows)
-    df["Net/mo%"]  = (df["Net P&L"]/(capital_base*lookback_m)*100).round(1)
-    df["Ret 5L%"]  = (df["Net P&L"]/capital_base*100).round(1)
-    df["Cushion"]  = (df["Theta"]/df["Vega"].abs()).round(1)
+    bt_expiry = next_expiry_from(bt_date)
+    # Skip if expiry falls on holiday
+    while bt_expiry in NSE_HOLIDAYS or bt_expiry.weekday() >= 5:
+        bt_expiry -= timedelta(days=1)
 
-    ca,cb,cc = st.columns(3)
-    with ca:
-        st.markdown("**Return on capital (%)**")
-        st.bar_chart(df.set_index("Offset")["Ret 5L%"], color="#1D9E75")
-    with cb:
-        st.markdown("**Win rate (%)**")
-        st.bar_chart(df.set_index("Offset")["Win%"], color="#378ADD")
-    with cc:
-        st.markdown("**Max drawdown**")
-        st.bar_chart(df.set_index("Offset")["Max DD"].abs(), color="#E24B4A")
+    bt_dte = effective_dte(bt_date, bt_expiry)
 
-    st.caption(f"Capital: ₹{capital_base:,} ({cap_src}) | Entry: {entry_time} | Exit: {exit_time} | {'Fri excl' if excl_fri else 'All days'}")
-    disp = df.rename(columns={"Gross P&L":"Gross(Rs)","Costs":"Costs(Rs)","Net P&L":"Net(Rs)",
-                               "Win%":"Win%","Max DD":"MaxDD(Rs)","Net/mo%":"Net/mo%",
-                               "Ret 5L%":"Ret5L%","Cushion":"Cushion(T/V)"})
-    st.dataframe(disp[["Offset","Gross(Rs)","Costs(Rs)","Net(Rs)","Net/mo%","Ret5L%",
-                        "Theta","Vega","Cushion(T/V)","Win%","MaxDD(Rs)","Trades"]],
-                 use_container_width=True, hide_index=True)
+    with bt_c2:
+        st.metric("Nearest Expiry", bt_expiry.strftime("%Y-%m-%d"))
+    with bt_c3:
+        st.metric("DTE", f"{bt_dte} trading days")
+
+    st.markdown("---")
+
+    # ── Step 2: Market Snapshot (simulated from constants + date) ─────────
+    st.markdown("#### 2️⃣ Market Snapshot on Selected Date")
+    # Use spot from live if today, else estimate from stored IV
+    bt_spot = SPOT["NIFTY 50"]  # live spot as reference
+    bt_iv = IV_ANN["NIFTY 50"]
+    bt_ivp = IVP["NIFTY 50"]
+
+    ms1, ms2, ms3, ms4 = st.columns(4)
+    ms1.metric("Nifty Spot (ref)", f"₹{bt_spot:,.0f}")
+    ms2.metric("IV (annualized)", f"{bt_iv*100:.1f}%")
+    ms3.metric("IVP", f"{bt_ivp}")
+    ms4.metric("DTE", f"{bt_dte}d")
+
+    # Greeks display for the chosen offset
+    st.markdown("##### Greeks at selected strikes")
+    bt_off_pct = st.select_slider("Strike offset from spot",
+                                    options=[f"{x:+.1f}%" for x in
+                                             [-3.5,-3.0,-2.5,-2.0,-1.5,-1.0,
+                                              +1.0,+1.5,+2.0,+2.5,+3.0,+3.5]],
+                                    value="-2.0%", key="bt_offset")
+    bt_off = float(bt_off_pct.replace('%','')) / 100
+    bt_side = "put" if bt_off < 0 else "call"
+    bt_strike = int(round(bt_spot * (1 + bt_off) / ROUND["NIFTY 50"]) * ROUND["NIFTY 50"])
+
+    bt_delta = delta_bs(bt_spot, bt_strike, bt_iv, bt_dte, bt_side)
+    bt_T = bt_dte / 365
+    bt_d1, bt_d2 = bs_d1d2(bt_spot, bt_strike, bt_iv, bt_T)
+    bt_gamma = float(norm.pdf(bt_d1) / (bt_spot * bt_iv * math.sqrt(bt_T))) if bt_T > 0 and bt_iv > 0 else 0
+    bt_theta_day = float(-bt_spot * norm.pdf(bt_d1) * bt_iv / (2 * math.sqrt(bt_T)) / 365) if bt_T > 0 else 0
+    bt_vega_pt = float(bt_spot * norm.pdf(bt_d1) * math.sqrt(bt_T) / 100) if bt_T > 0 else 0
+    bt_prob = prob_nd2(bt_spot, bt_strike, bt_iv, bt_dte, bt_side)
+
+    gc1, gc2, gc3, gc4, gc5 = st.columns(5)
+    gc1.metric("Strike", f"₹{bt_strike:,}")
+    gc2.metric("Delta", f"{bt_delta:.4f}")
+    gc3.metric("Gamma", f"{bt_gamma:.6f}")
+    gc4.metric("Theta/day", f"₹{bt_theta_day:.1f}")
+    gc5.metric("Prob OTM", f"{bt_prob*100:.1f}%")
+
+    st.markdown("---")
+
+    # ── Step 3: Market Trend Indicators ──────────────────────────────────────
+    st.markdown("#### 3️⃣ Market Trend Indicators")
+    ti1, ti2, ti3 = st.columns(3)
+    # Simple trend heuristics based on IVP
+    trend_signal = "Neutral"
+    if bt_ivp > 60:
+        trend_signal = "High IV — Favor selling"
+    elif bt_ivp < 25:
+        trend_signal = "Low IV — Caution on selling"
+
+    regime_signal = "ALLOW" if 20 <= bt_ivp <= 80 else "SKIP"
+    ti1.metric("IV Regime", regime_signal, f"IVP {bt_ivp}")
+    ti2.metric("Trend Signal", trend_signal)
+    ti3.metric("Vega Risk (1pt IV)", f"₹{bt_vega_pt * LOT['NIFTY 50']:.0f}/lot")
+
+    st.markdown("---")
+
+    # ── Step 4: Strategy Selection ───────────────────────────────────────────
+    st.markdown("#### 4️⃣ Select Strategy & Exit")
+    sc1, sc2 = st.columns(2)
+    with sc1:
+        bt_strategy = st.selectbox("Strategy",
+                                    ["Short Put","Short Call","Short Strangle",
+                                     "Short Straddle","Iron Condor"],
+                                    key="bt_strategy")
+    with sc2:
+        bt_exit = st.selectbox("Expected Closing",
+                                ["T-1 Close (day before expiry)",
+                                 "T Close (expiry day)"],
+                                key="bt_exit")
+
+    # ── Step 5: Result for 1 Contract ────────────────────────────────────────
+    st.markdown("#### 5️⃣ Result — 1 Contract")
+    st.info("🚧 **Live historical P&L calculation coming soon.** This section will use actual "
+            "historical premium data from the backtest database to show real profit/loss for the "
+            "selected date, strike, and strategy. See the implementation plan below.")
+
+    # Show estimated result using current premium estimates
+    chain = st.session_state.get("nifty_chain", {})
+    est_prem = ltp_from_chain(chain, bt_strike, bt_side) if chain else None
+    if not est_prem:
+        base = 1267
+        est_prem = round(max(5.0, base * max(0.3, 1 - (abs(bt_off) - 0.005) / 0.02) * (bt_iv / 0.14) / LOT["NIFTY 50"]), 1)
+        prem_src = "estimated"
+    else:
+        prem_src = "live"
+
+    lot = LOT["NIFTY 50"]
+    if bt_strategy == "Short Put":
+        max_profit = est_prem * lot
+        legs_info = f"Sell {bt_strike} PE @ ₹{est_prem:.1f}"
+    elif bt_strategy == "Short Call":
+        max_profit = est_prem * lot
+        legs_info = f"Sell {bt_strike} CE @ ₹{est_prem:.1f}"
+    elif bt_strategy == "Short Strangle":
+        # Both sides
+        opp_off = -bt_off
+        opp_strike = int(round(bt_spot * (1 + opp_off) / ROUND["NIFTY 50"]) * ROUND["NIFTY 50"])
+        opp_prem = ltp_from_chain(chain, opp_strike, "call" if bt_side == "put" else "put") if chain else None
+        if not opp_prem:
+            opp_prem = round(max(5.0, base * max(0.3, 1 - (abs(opp_off) - 0.005) / 0.02) * (bt_iv / 0.14) / lot), 1)
+        max_profit = (est_prem + opp_prem) * lot
+        legs_info = f"Sell {bt_strike} {'PE' if bt_side=='put' else 'CE'} @ ₹{est_prem:.1f} + Sell {opp_strike} {'CE' if bt_side=='put' else 'PE'} @ ₹{opp_prem:.1f}"
+    elif bt_strategy == "Short Straddle":
+        atm = int(round(bt_spot / ROUND["NIFTY 50"]) * ROUND["NIFTY 50"])
+        atm_ce = ltp_from_chain(chain, atm, "call") if chain else None
+        atm_pe = ltp_from_chain(chain, atm, "put") if chain else None
+        if not atm_ce: atm_ce = round(max(50, 200 * bt_iv / 0.14), 1)
+        if not atm_pe: atm_pe = round(max(50, 180 * bt_iv / 0.14), 1)
+        max_profit = (atm_ce + atm_pe) * lot
+        legs_info = f"Sell {atm} CE @ ₹{atm_ce:.1f} + Sell {atm} PE @ ₹{atm_pe:.1f}"
+    else:  # Iron Condor
+        max_profit = est_prem * lot * 0.6  # approximate net credit
+        legs_info = f"Iron Condor around {bt_strike} (est. net credit)"
+
+    rc1, rc2, rc3 = st.columns(3)
+    rc1.metric("Max Profit (if OTM)", f"₹{max_profit:,.0f}")
+    rc2.metric("Premium Source", prem_src)
+    rc3.metric("Probability OTM", f"{bt_prob*100:.1f}%")
+    st.caption(f"Legs: {legs_info} | Lot: {lot} | Capital: ₹{capital_base:,}")
+
+    st.markdown("---")
+
+    # ── Backtest Implementation Plan ─────────────────────────────────────────
+    with st.expander("📋 Backtest Engine — Implementation Plan"):
+        st.markdown("""
+**Phase 1 — Data Foundation** (in progress)
+- Load historical NIFTY option chain data from backtest database (CSV/Excel in `Backtest-Engine/`)
+- Parse columns: date, expiry, strike, CE/PE premium, OI, IV, Greeks
+- Index by (date, expiry, strike) for fast lookup
+
+**Phase 2 — Date-Driven Lookup**
+- User selects a historical date → system finds nearest expiry
+- Shows actual DTE, spot price, IV, IVP from that date
+- Displays actual Greeks (delta, gamma, theta, vega) from the chain
+
+**Phase 3 — Strategy Evaluation**
+- User picks strategy (Short Put, Short Call, Strangle, Straddle, Iron Condor)
+- System looks up entry premium on selected date
+- User picks exit: T-1 close or T close (expiry day)
+- System looks up exit premium → calculates actual P&L for 1 lot
+
+**Phase 4 — Batch Backtest**
+- Run strategy across all expiries in the dataset (18 months)
+- Show aggregate: win rate, avg profit, avg loss, max DD, Sharpe
+- Chart: cumulative P&L curve, drawdown chart
+
+**Data needed in `Backtest-Engine/`:**
+- Historical option chain snapshots (daily close premiums per strike)
+- Historical spot prices (NIFTY close)
+- Historical IV data
+        """)
 
     with st.expander("Glossary"):
         st.markdown("""
-**Net/mo%** — Net P&L / (capital × months). Monthly return pace.
-**Cushion** — Theta/|Vega|. IV spike needed to cancel one day's decay.
-**Score** = 60% × N(d2) + 40% × min(IVP×1.25,100).
-**DTE** derived from Nifty expiry selected in sidebar (weekends + holidays excluded).
+**DTE** — Trading days to expiry (weekends + NSE holidays excluded).
+**Delta** — Rate of change of option price vs ₹1 spot move.
+**Gamma** — Rate of change of delta vs ₹1 spot move.
+**Theta** — Daily time decay in ₹ per lot.
+**Vega** — Change in premium for 1% IV move.
+**Prob OTM** — Black-Scholes probability option expires worthless.
+**Score** = 40%×Prob + 30%×IVP + 30%×Return.
         """)
 
 # ── TAB 3: IV History ─────────────────────────────────────────────────────────
@@ -473,13 +653,19 @@ with tab3:
             st.warning(f"Could not load {idx_name} expiries — check token.")
             return
         sel = st.selectbox(f"{idx_name} Expiry", exps, key=f"t3_{t3_key}_exp")
-        if st.button(f"Load {idx_name} Chain", key=f"t3_{t3_key}_btn"):
+        # Auto-load on first visit; button allows manual refresh
+        _auto_load = f"t3_{t3_key}_chain" not in st.session_state
+        _refresh = st.button(f"🔄 Refresh {idx_name} Chain", key=f"t3_{t3_key}_btn")
+        if _auto_load or _refresh:
             ch = fetch_chain(scrip_id, sel, tok3)
             if ch:
                 st.session_state[f"t3_{t3_key}_chain"] = ch
                 st.session_state[f"t3_{t3_key}_exp_used"] = sel
         if f"t3_{t3_key}_chain" in st.session_state:
             df_c, spot_c = chain_to_df(st.session_state[f"t3_{t3_key}_chain"], spot_default)
+            if df_c.empty:
+                st.warning(f"No strikes found near spot for {idx_name}.")
+                return
             atm = df_c.iloc[(df_c["Strike"]-spot_c).abs().argsort()[:1]]["Strike"].values[0]
             st.caption(f"Spot: ₹{spot_c:,.1f} | ATM: ₹{atm:,} | Expiry: {st.session_state.get(f't3_{t3_key}_exp_used','')}")
             def hl(row): return ["background-color:#2d2d4e;font-weight:bold"]*len(row) if row["Strike"]==atm else [""]*len(row)
