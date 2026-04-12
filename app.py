@@ -705,29 +705,135 @@ def val_kite_legs_dataframe(val_spot, dist_pct, strat_name, stype_v, rnd_v, val_
 def val_kite_live_configured():
     try:
         k = st.secrets.get("kite", {})
-        return bool(k.get("enable_live") and k.get("api_key") and k.get("access_token"))
+        en = k.get("enable_live")
+        if isinstance(en, str):
+            en = en.strip().lower() in ("1", "true", "yes", "on")
+        return bool(en and k.get("api_key") and k.get("access_token"))
     except Exception:
         return False
 
 
-def val_kite_try_place_orders(order_records):
+def _kite_inst_expiry_date(exp):
+    """Normalize Zerodha `instruments()` expiry to datetime.date."""
+    if exp is None:
+        return None
+    if isinstance(exp, date) and not isinstance(exp, datetime):
+        return exp
+    if isinstance(exp, datetime):
+        return exp.date()
+    try:
+        return pd.to_datetime(exp).date()
+    except Exception:
+        return None
+
+
+def _kite_match_nfo_symbol(nfo_list, exp_date, strike, inst_type):
     """
-    Zerodha Kite: requires `pip install kiteconnect` + Secrets `[kite]`:
-    enable_live, api_key, access_token. Instrument tokens must be resolved per symbol — not automated here.
+    Find NIFTY index option on NFO matching expiry (date), strike, CE/PE.
+    Returns (tradingsymbol, instrument_token, lot_size) or (None, None, 0).
+    """
+    strike = float(strike)
+    inst_type = str(inst_type).upper()
+    candidates = []
+    for inst in nfo_list:
+        ex = inst.get("exchange")
+        seg = str(inst.get("segment") or "")
+        if ex != "NFO" and not seg.upper().startswith("NFO"):
+            continue
+        if inst.get("name") != "NIFTY":
+            continue
+        if str(inst.get("instrument_type", "")).upper() != inst_type:
+            continue
+        try:
+            sk = float(inst.get("strike") or 0)
+        except (TypeError, ValueError):
+            continue
+        if abs(sk - strike) > 0.01:
+            continue
+        exd = _kite_inst_expiry_date(inst.get("expiry"))
+        if exd != exp_date:
+            continue
+        candidates.append(inst)
+    if not candidates:
+        return None, None, 0
+    candidates.sort(key=lambda x: int(x.get("lot_size") or 999999))
+    best = candidates[0]
+    return (
+        best.get("tradingsymbol"),
+        best.get("instrument_token"),
+        int(best.get("lot_size") or 0),
+    )
+
+
+def val_kite_try_place_orders(order_records, val_exp_date):
+    """
+    Place NRML MARKET orders on NFO. Requires `kiteconnect`, Secrets `[kite]`:
+    enable_live, api_key, access_token. Resolves `tradingsymbol` via Kite instrument master.
     """
     if not val_kite_live_configured():
         return False, (
-            "Live API off: add Streamlit Secrets `[kite]` with `enable_live = true`, `api_key`, `access_token` "
-            "and install `kiteconnect`. NFO `tradingsymbol` must match Zerodha (use instrument dump / lookup)."
+            "Live API off: in Secrets add `[kite]` with `enable_live = true`, `api_key`, `access_token`. "
+            "Redeploy after adding `kiteconnect` to requirements.txt."
         )
     try:
-        import kiteconnect  # noqa: F401
+        from kiteconnect import KiteConnect
     except ImportError:
-        return False, "Install `kiteconnect` on the server to enable placement."
-    return False, (
-        "Live `place_order` not wired to instrument_token lookup in this build — use payload below in Kite web "
-        "basket or extend `val_kite_try_place_orders` with your symbol→token map."
-    )
+        return False, (
+            "Python package `kiteconnect` is missing on the server. "
+            "Add `kiteconnect>=4.2.0` to **requirements.txt**, commit, and **reboot** the Streamlit Cloud app."
+        )
+    try:
+        ksec = st.secrets["kite"]
+        api_key = ksec["api_key"]
+        access_token = ksec["access_token"]
+    except Exception as e:
+        return False, f"Secrets `[kite]` read error: {e}"
+
+    kite = KiteConnect(api_key=api_key)
+    kite.set_access_token(access_token)
+
+    try:
+        nfo = kite.instruments("NFO")
+    except Exception as e:
+        return False, f"Could not download NFO instruments (check token / network): {e}"
+
+    placed_ids = []
+    for row in order_records:
+        strike = int(row["strike"])
+        itype = row["instrument_type"]
+        tsym, _tok, lot_sz = _kite_match_nfo_symbol(nfo, val_exp_date, strike, itype)
+        if not tsym:
+            return (
+                False,
+                f"No NFO contract for **NIFTY** {strike} **{itype}** expiry **{val_exp_date}**. "
+                f"Pick the expiry that exists on Kite (weekly series). Partial order IDs: {placed_ids}",
+            )
+        qty = int(row["quantity"])
+        if lot_sz > 0 and qty % lot_sz != 0:
+            return (
+                False,
+                f"Quantity **{qty}** must be a multiple of exchange lot **{lot_sz}** for `{tsym}`. "
+                f"Adjust qty in app (NIFTY lot is usually **{lot_sz}**). Placed so far: {placed_ids or 'none'}",
+            )
+        try:
+            oid = kite.place_order(
+                variety=KiteConnect.VARIETY_REGULAR,
+                exchange="NFO",
+                tradingsymbol=tsym,
+                transaction_type=(
+                    KiteConnect.TRANSACTION_TYPE_SELL
+                    if row.get("transaction_type") == "SELL"
+                    else KiteConnect.TRANSACTION_TYPE_BUY
+                ),
+                quantity=int(row["quantity"]),
+                order_type=KiteConnect.ORDER_TYPE_MARKET,
+                product=KiteConnect.PRODUCT_NRML,
+            )
+            placed_ids.append(f"{tsym}→{oid}")
+        except Exception as e:
+            return False, f"Kite rejected order **{tsym}**: `{e}`. Placed so far: {placed_ids or 'none'}"
+
+    return True, f"Submitted **{len(placed_ids)}** market NRML leg(s): {'; '.join(placed_ids)}"
 
 
 def bt_next_expiry_live(d):
@@ -1928,7 +2034,7 @@ with tab_val:
                         type="primary",
                         disabled=not _kite_ok,
                         key="val_kite_api_btn"):
-                    _placed, _msg = val_kite_try_place_orders(kite_api_rows)
+                    _placed, _msg = val_kite_try_place_orders(kite_api_rows, val_exp)
                     if _placed:
                         st.success(_msg)
                     else:
