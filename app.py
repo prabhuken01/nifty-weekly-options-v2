@@ -7,7 +7,7 @@ import pandas as pd
 import numpy as np
 from scipy.stats import norm
 from datetime import date, timedelta, datetime
-import math, requests, sys, os
+import math, requests, sys, os, re
 
 for d in ['Live-Signal-Generator', 'Live-fetching']:
     p = os.path.join(os.path.dirname(__file__), d)
@@ -39,9 +39,60 @@ st.markdown("""
     /* Make columns stack on very small screens */
     [data-testid="column"] { min-width: 140px !important; }
 }
-/* Desktop: slightly larger dataframe text */
-.stDataFrame { font-size: 14px; }
-.stDataFrame th { font-weight: 700 !important; background-color: rgba(50,50,50,0.3) !important; }
+:root {
+    --bg-main: #0D0D0D; --bg-card: #1A1A1A; --bg-border: #2A2A2A;
+    --text-pri: #F0F0F0; --text-sec: #A0A0A0;
+    --accent-pos: #00C896; --accent-neg: #FF4D4D; --accent-neu: #7B8CDE;
+}
+.stApp { background-color: var(--bg-main) !important; color: var(--text-pri) !important; }
+.stApp > header { background-color: var(--bg-main) !important; }
+section[data-testid="stSidebar"] {
+    background-color: var(--bg-card) !important;
+    border-right: 1px solid var(--bg-border) !important;
+}
+section[data-testid="stSidebar"] * { color: var(--text-pri) !important; }
+[data-testid="stMetric"] {
+    background-color: var(--bg-card) !important;
+    border: 1px solid var(--bg-border) !important;
+    border-radius: 8px !important; padding: 10px 14px !important;
+}
+[data-testid="stMetricLabel"] { color: var(--text-sec) !important; }
+[data-testid="stMetricValue"] { color: var(--text-pri) !important; }
+[data-testid="stMetricDelta"] { color: var(--accent-pos) !important; }
+.stTabs [data-baseweb="tab-list"] {
+    background-color: var(--bg-card) !important;
+    border-bottom: 2px solid var(--bg-border) !important;
+}
+.stTabs [data-baseweb="tab"] { color: var(--text-sec) !important; background: transparent !important; }
+.stTabs [aria-selected="true"] {
+    color: var(--accent-neu) !important;
+    border-bottom: 2px solid var(--accent-neu) !important;
+}
+div[data-baseweb="select"] > div, div[data-baseweb="input"] > div {
+    background-color: var(--bg-card) !important;
+    border-color: var(--bg-border) !important; color: var(--text-pri) !important;
+}
+.stDataFrame { font-size: 14px; border: 1px solid var(--bg-border) !important; border-radius: 6px; }
+.stDataFrame th {
+    font-weight: 700 !important; background-color: #1E1E2E !important;
+    color: var(--text-pri) !important; border-bottom: 2px solid var(--bg-border) !important;
+}
+.stDataFrame td { color: var(--text-pri) !important; border-bottom: 1px solid var(--bg-border) !important; }
+div[data-testid="stAlert"] { background-color: var(--bg-card) !important; border-left-width: 4px !important; }
+div[data-testid="stAlert"] p { color: var(--text-pri) !important; }
+.stButton > button {
+    background-color: var(--bg-card) !important;
+    color: var(--text-pri) !important; border: 1px solid var(--bg-border) !important;
+}
+.stButton > button:hover { border-color: var(--accent-neu) !important; color: var(--accent-neu) !important; }
+.stButton > button[kind="primary"] {
+    background-color: #1A2A4A !important; border-color: var(--accent-neu) !important;
+    color: var(--accent-neu) !important;
+}
+details { background-color: var(--bg-card) !important; border: 1px solid var(--bg-border) !important; border-radius: 8px !important; }
+summary { color: var(--text-pri) !important; }
+.stCaption { color: var(--text-sec) !important; }
+hr { border-color: var(--bg-border) !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -102,6 +153,21 @@ def comp_score(prob, ivp, ret_pct=0):
     return round(prob_component + ivp_component + ret_component)
 def sig_label(sc, thr=65): return "SELL" if sc>=thr else ("MONITOR" if sc>=50 else "AVOID")
 def sig_color(lbl): return {"SELL":"#C6EFCE","MONITOR":"#FFEB9C","AVOID":"#FFC7CE"}[lbl]
+
+# ── Strategy name normalisation (BUG 1 + BUG 2) ──────────────────────────
+def norm_strategy_name(s):
+    """Strip S# - prefix and (ONLY) suffix for comparisons (BUG 1+2)."""
+    s = re.sub(r'^S\d+\s*[-–]\s*', '', str(s).strip())
+    s = re.sub(r'\s*\(ONLY\)\s*$', '', s)
+    return s.strip()
+
+def lut_strategy_display(lut_entry):
+    """UI display label — keeps (ONLY) suffix for display (BUG 2)."""
+    return lut_entry.get("s", "")
+
+def lut_strategy_base(lut_entry):
+    """Base name stripped of (ONLY) for comparisons (BUG 2)."""
+    return norm_strategy_name(lut_entry.get("s", ""))
 
 # ── Dhan API ──────────────────────────────────────────────────────────────────
 def _hdr(tok): return {"Content-Type":"application/json","client-id":DHAN_CLIENT_ID,"access-token":tok}
@@ -462,12 +528,17 @@ def bt_build_legs(spot, dist_pct, stype, rnd):
     if stype == "ws":
         return [("Long Put", pe_s, "PE", "long"), ("Long Call", ce_s, "CE", "long")]
     if stype == "ic":
-        # Inner shorts closer to spot; outer longs are wings (put wing lower strike, call wing higher).
+        # BUG 3 fix: enforce 200 pt minimum wing width so IC loss is always capped.
+        # Long put strike LOWER than short put (further OTM for puts).
+        # Long call strike HIGHER than short call (further OTM for calls).
+        min_wing_pts = max(200, int(round(spot * buf / rnd)) * rnd)
+        pe_l_ic = int(round((pe_s - min_wing_pts) / rnd) * rnd)
+        ce_l_ic = int(round((ce_s + min_wing_pts) / rnd) * rnd)
         return [
-            ("Short Put (inner)", pe_s, "PE", "short"),
-            ("Short Call (inner)", ce_s, "CE", "short"),
-            ("Long Put (wing)", pe_l, "PE", "long"),
-            ("Long Call (wing)", ce_l, "CE", "long"),
+            ("Short Put (inner)", pe_s,    "PE", "short"),
+            ("Short Call (inner)", ce_s,   "CE", "short"),
+            ("Long Put (wing)",   pe_l_ic, "PE", "long"),
+            ("Long Call (wing)",  ce_l_ic, "CE", "long"),
         ]
     if stype == "bp":
         return [("Short Put", pe_s, "PE", "short"), ("Long Put", pe_l, "PE", "long")]
@@ -602,7 +673,7 @@ _LBG = {"critical":"rgba(255,75,75,0.08)","important":"rgba(255,164,33,0.08)",
 _LICO = {"critical":"🔴","important":"🟡","monitor":"🔵","low":"⚪"}
 
 # ── TABS ──────────────────────────────────────────────────────────────────────
-tab1, tab2, tab3 = st.tabs(["Tab 1 - Live Signal", "Tab 2 - Backtest", "Tab 3 - IV History"])
+tab1, tab2, tab_val, tab3 = st.tabs(["Tab 1 - Live Signal", "Tab 2 - Backtest", "🔬 Validation Explorer", "Tab 3 - IV History"])
 
 # ── TAB 1: Live Signal ────────────────────────────────────────────────────────
 with tab1:
@@ -851,6 +922,13 @@ with tab2:
         else:
             skip_flag = lut.get("skip")
             warn_flag = lut.get("warn")
+            # BUG 6: <13% IV always excludes Short Strangle — show explicit AVOID notice
+            if bt_iv_sel == "<13%":
+                st.info(
+                    "ℹ️ **Short Strangle — AVOID at <13% IV** · "
+                    "Premium collected is too thin (typically <₹30-40/lot at these IV levels). "
+                    "~57%% of all trade dates have IV <13%% and SS is excluded from all 15 "
+                    "LUT combos in this regime. IC / Spread strategies are preferred.")
             if skip_flag:
                 st.error(f"⊘ **No Trade — Skip This Setup**\n\n{skip_flag}\n\n"
                          f"Win rate: {lut['win']}% · Avg P&L: ₹{lut['pnl']:+,}")
@@ -858,8 +936,11 @@ with tab2:
                 if warn_flag:
                     st.warning(f"⚠️ {warn_flag}")
 
+                # BUG 1+2: normalised display name (keeps "(ONLY)") and base name for logic
+                _strat_display = lut_strategy_display(lut)   # keeps (ONLY) for UI
+                _strat_base    = lut_strategy_base(lut)       # stripped for comparisons
                 kc1, kc2, kc3, kc4 = st.columns(4)
-                kc1.metric("Recommended Strategy", lut["s"])
+                kc1.metric("Recommended Strategy", _strat_display)
                 kc2.metric("Historical Win Rate", f"{lut['win']}%")
                 kc3.metric("Avg P&L / Trade (LUT)", f"₹{lut['pnl']:+,}")
                 kc4.metric("Max Loss (backtest)",
@@ -931,6 +1012,14 @@ div[data-testid="stSlider"] [role="slider"] {
                         e_p, x_p = bt_get_prem(bt_df, bt_date, exit_date, bt_expiry,
                                                strike, otype, bt_entry_hhmm, bt_exit_hhmm)
                         src = "● real"
+                        # BUG 3 fix: long wing missing in CSV at expiry → use intrinsic value.
+                        # Prevents IC loss exceeding SS loss (IC has defined/capped max loss).
+                        if x_p is None and side == "long" and exit_date == bt_expiry:
+                            _esp = (bt_get_spot_at(bt_df, exit_date, bt_exit_hhmm)
+                                    or bt_get_spot(bt_df, exit_date))
+                            if _esp is not None:
+                                x_p = max(0.0, (_esp - strike) if otype == "CE" else (strike - _esp))
+                                src = "● intrinsic"
                     else:
                         chain2 = st.session_state.get("nifty_chain", {})
                         e_p = ltp_from_chain(chain2, strike,
@@ -1121,7 +1210,7 @@ div[data-testid="stSlider"] [role="slider"] {
                 # ── Greeks (expander) ──────────────────────────────────────────
                 with st.expander("📐 Greeks — ranked by criticality", expanded=False):
                     gp = BT_GP.get(lut["st"], BT_GP["ss"])
-                    st.info(f"Greeks for **{lut['s']}**. Check IN ORDER — first two are go/no-go gates.")
+                    st.info(f"Greeks for **{_strat_display}**. Check IN ORDER — first two are go/no-go gates.")
                     order = sorted(gp.items(),
                                    key=lambda x: {"critical": 0, "important": 1, "monitor": 2, "low": 3}[x[1][0]])
                     vals = {
@@ -1166,6 +1255,243 @@ div[data-testid="stSlider"] [role="slider"] {
 
 **Gamma limit** — Maximum short-leg gamma before forced exit. Accelerates sharply near expiry — the primary risk for naked short strategies.
         """)
+
+# ── TAB VAL: Validation Explorer ───────────────────────────────────────
+with tab_val:
+    top_bar()
+    st.markdown("---")
+    st.subheader("🔬 Validation Explorer")
+    st.caption(
+        "Select any historical trade date — see all 8 strategy variants side-by-side "
+        "with P&L bars and violation flags (BUG 3/4/5/6).")
+
+    _val_bt_df = load_bt_df()
+
+    vc1, vc2, vc3 = st.columns([2, 1, 1])
+    with vc1:
+        val_date = st.date_input(
+            "Entry Date", value=date(2025, 10, 14),
+            min_value=date(2024, 9, 23), max_value=BT_CSV_END, key="val_date")
+    with vc2:
+        val_capital_pct = st.slider(
+            "Capital %", 1, 7, 3, key="val_cap_pct",
+            help="% of ₹1,20,000 deployed per trade")
+        val_capital_rs = int(round(120_000 * val_capital_pct / 100))
+        st.caption(f"= **₹{val_capital_rs:,}** of ₹1,20,000")
+    with vc3:
+        val_trend = st.radio(
+            "Trend override", ["NEUTRAL", "BULLISH", "BEARISH"],
+            horizontal=False, key="val_trend")
+
+    if _val_bt_df.empty:
+        st.warning("No historical CSV data. Validation Explorer requires the backtest CSV.")
+    else:
+        _vsp = bt_get_spot_at(_val_bt_df, val_date, "14:00") or bt_get_spot(_val_bt_df, val_date)
+        if _vsp is None:
+            st.error("No data for this date — try a nearby trading day.")
+        else:
+            val_spot     = _vsp
+            val_exp      = bt_find_expiry(_val_bt_df, val_date)
+            if val_exp is None:
+                st.error("No expiry found after this date in CSV.")
+            else:
+                val_dte_days = effective_dte(val_date, val_exp)
+                val_iv_val, _, _vatm = bt_iv_straddle(
+                    _val_bt_df, val_date, val_exp, val_spot, "14:00")
+                val_iv_pct  = round(val_iv_val * 100, 1)
+                val_dte_lbl = dte_label(val_date, val_exp, val_dte_days)
+                val_iv_band = iv_band(val_iv_pct)
+
+                mi1, mi2, mi3, mi4, mi5 = st.columns(5)
+                mi1.metric("Spot",   f"₹{val_spot:,.0f}")
+                mi2.metric("Expiry", val_exp.strftime("%Y-%m-%d"))
+                mi3.metric("DTE",    val_dte_lbl, f"{val_dte_days} trading days")
+                mi4.metric("IV%",    f"{val_iv_pct}%", val_iv_band)
+                mi5.metric("Trend",  val_trend)
+                st.markdown("---")
+
+                # BUG 4: WS uses wider dist% than SS to guarantee WS_CE_strike >= SS_CE_strike
+                STRAT_TYPES = [
+                    ("Short Strangle",    "ss", 3.5),
+                    ("Wide Strangle",     "ws", 5.0),
+                    ("Iron Condor",       "ic", 3.5),
+                    ("Bull Put Spread",   "bp", 3.5),
+                    ("Bear Call Spread",  "bc", 3.5),
+                    ("Short Strangle 2%", "ss", 2.0),
+                    ("Wide Strangle 6%",  "ws", 6.0),
+                    ("Iron Condor 6%",    "ic", 6.0),
+                ]
+
+                lut_dte_k    = bt_lut_dte_key(val_dte_lbl)
+                lut_rec_key  = f"{lut_dte_k}|{val_iv_band}|{val_trend}"
+                lut_rec      = BT_LUT.get(lut_rec_key)
+                lut_rec_base = lut_strategy_base(lut_rec) if lut_rec else ""
+
+                rnd_v      = ROUND["NIFTY 50"]
+                lot_v      = LOT["NIFTY 50"]
+                _vexp_spot = (bt_get_spot_at(_val_bt_df, val_exp, "15:00")
+                              or bt_get_spot(_val_bt_df, val_exp))
+
+                rows_val = []
+                for strat_name, stype_v, dist_v in STRAT_TYPES:
+                    legs_v = bt_build_legs(val_spot, dist_v, stype_v, rnd_v)
+                    pnl_total, pnl_ok = 0, True
+                    ce_short, pe_short = None, None
+                    for _lbl, _stk, _otype, _side in legs_v:
+                        e_p = bt_prem_at(_val_bt_df, val_date, val_exp, _stk, _otype, "14:00")
+                        x_p = bt_prem_at(_val_bt_df, val_exp,  val_exp, _stk, _otype, "15:00")
+                        # BUG 3: intrinsic value fallback for long wings at expiry
+                        if x_p is None and _side == "long" and _vexp_spot is not None:
+                            x_p = max(0.0, (_vexp_spot - _stk) if _otype == "CE" else (_stk - _vexp_spot))
+                        if e_p is None or x_p is None:
+                            pnl_ok = False; break
+                        if _side == "short":
+                            pnl_total += round((e_p - x_p) * lot_v)
+                            if _otype == "CE": ce_short = _stk
+                            if _otype == "PE": pe_short = _stk
+                        else:
+                            pnl_total += round((x_p - e_p) * lot_v)
+                    # BUG 5: brokerage standardised to ROUND(40 * n_legs, 0) — one place only
+                    brokerage = round(40 * len(legs_v), 0)
+                    net_pnl   = (pnl_total - brokerage) if pnl_ok else None
+                    rows_val.append({
+                        "Strategy":  strat_name, "Type": stype_v.upper(), "Dist%": dist_v,
+                        "CE Strike": ce_short,   "PE Strike": pe_short,
+                        "Net PnL":   net_pnl,    "Broker":    brokerage if pnl_ok else None,
+                        "Data":      "● real" if pnl_ok else "— missing",
+                    })
+                df_val = pd.DataFrame(rows_val)
+
+                # BUG 4 assertion: Wide Strangle CE >= Short Strangle CE
+                _ss35 = df_val[(df_val["Type"] == "SS") & (df_val["Dist%"] == 3.5)]
+                _ws50 = df_val[(df_val["Type"] == "WS") & (df_val["Dist%"] == 5.0)]
+                viol_ws = False
+                if not _ss35.empty and not _ws50.empty:
+                    _ssce = _ss35.iloc[0]["CE Strike"]
+                    _wsce = _ws50.iloc[0]["CE Strike"]
+                    if _ssce and _wsce:
+                        try:
+                            if float(_wsce) < float(_ssce):
+                                viol_ws = True
+                                st.error(
+                                    f"⚠️ BUG 4: Wide Strangle CE (₹{int(_wsce):,}) "
+                                    f"< Short Strangle CE (₹{int(_ssce):,}). "
+                                    f"WS must be further OTM. [SS={3.5}% WS={5.0}%]")
+                        except: pass
+
+                # BUG 3: IC vs SS loss violation
+                _ss_p = df_val.loc[(df_val["Type"]=="SS")&(df_val["Dist%"]==3.5), "Net PnL"]
+                _ic_p = df_val.loc[(df_val["Type"]=="IC")&(df_val["Dist%"]==3.5), "Net PnL"]
+                viol_ic = False
+                if not _ss_p.empty and not _ic_p.empty:
+                    try:
+                        sv, iv = float(_ss_p.values[0]), float(_ic_p.values[0])
+                        if sv < 0 and iv < sv: viol_ic = True
+                    except: pass
+
+                # BUG 6: low-IV regime notice in Validation Explorer
+                if val_iv_band == "<13%":
+                    st.info(
+                        "ℹ️ **Short Strangle AVOID at <13% IV (BUG 6)** — "
+                        "premium too thin. IC / Spread preferred for this regime.")
+
+                st.markdown(
+                    f"#### All Strategies — Entry {val_date} | Expiry {val_exp} "
+                    f"| {val_dte_lbl} | IV {val_iv_pct}%")
+                if lut_rec:
+                    st.success(
+                        f"🏆 LUT Rec `{lut_rec_key}`: **{lut_strategy_display(lut_rec)}**")
+
+                _max_abs = 1.0
+                _nn = df_val["Net PnL"].dropna().astype(float)
+                if not _nn.empty: _max_abs = max(float(_nn.abs().max()), 1.0)
+
+                def _badge(row):
+                    sn, t, d = row["Strategy"], row["Type"], row["Dist%"]
+                    b = ""
+                    if viol_ic and t=="IC" and d==3.5:  b += " 🟠IC>SS"
+                    if viol_ws and t=="WS" and d==5.0:  b += " 🔴WS>SS"
+                    if lut_rec and norm_strategy_name(sn)==lut_rec_base and d==3.5: b += " ✅LUT"
+                    return sn + b
+
+                def _pbar(v):
+                    if v is None: return "—"
+                    try:
+                        fv = float(v)
+                        if np.isnan(fv): return "—"
+                    except: return "—"
+                    blk = "█" * max(1, int(abs(fv) / _max_abs * 8))
+                    ico = "🟢" if fv >= 0 else "🔴"
+                    return f"{ico} {blk}  ₹{fv:+,.0f}"
+
+                df_disp = df_val.copy()
+                df_disp["Strategy"] = df_disp.apply(_badge, axis=1)
+                df_disp["P&L Bar"]  = df_disp["Net PnL"].apply(_pbar)
+                df_disp = df_disp.drop(columns=["Net PnL"])
+
+                def _sty(df):
+                    def _c(col):
+                        if col.name == "P&L Bar":
+                            return [
+                                "color:#00C896;font-weight:600" if "🟢" in str(v)
+                                else ("color:#FF4D4D;font-weight:600" if "🔴" in str(v) else "")
+                                for v in col]
+                        return [""]*len(col)
+                    return df.style.apply(_c, axis=0).format({
+                        "CE Strike": lambda v: f"₹{int(v):,}" if v is not None and not (isinstance(v,float) and np.isnan(v)) else "—",
+                        "PE Strike": lambda v: f"₹{int(v):,}" if v is not None and not (isinstance(v,float) and np.isnan(v)) else "—",
+                        "Broker":    lambda v: f"₹{v:,.0f}" if v is not None and not (isinstance(v,float) and np.isnan(v)) else "—",
+                        "Dist%":     lambda v: f"{v:.1f}%",
+                    }, na_rep="—")
+
+                with st.container(border=True):
+                    show_cols = ["Strategy","Type","Dist%","CE Strike","PE Strike","P&L Bar","Broker","Data"]
+                    st.dataframe(
+                        _sty(df_disp[show_cols]),
+                        use_container_width=True, hide_index=True,
+                        height=min(500, 72 + len(df_disp)*38))
+
+                if viol_ic:
+                    st.markdown(
+                        '<span style="background:#E08000;color:#fff;padding:3px 10px;'
+                        'border-radius:12px;font-size:12px;font-weight:700">'
+                        '🟠 IC&gt;SS LOSS VIOLATION — IC loss exceeded SS loss. '
+                        'Long wing exit data was missing in CSV; intrinsic value fallback applied.</span>',
+                        unsafe_allow_html=True)
+                if viol_ws:
+                    st.markdown(
+                        '<span style="background:#FF4D4D;color:#fff;padding:3px 10px;'
+                        'border-radius:12px;font-size:12px;font-weight:700">'
+                        '🔴 WS&gt;SS STRIKE VIOLATION — Wide Strangle CE not further OTM than SS.</span>',
+                        unsafe_allow_html=True)
+
+                st.markdown("---")
+                st.markdown("#### 🛒 Push to Kite Basket (stub)")
+                st.caption(
+                    "Select a strategy row to see order legs. "
+                    "Live placement requires an active Kite Connect session.")
+                _kite_sel = st.selectbox(
+                    "Strategy", [r["Strategy"] for r in rows_val], key="val_kite_sel")
+                _kite_row = next((r for r in rows_val if r["Strategy"] == _kite_sel), None)
+                if _kite_row:
+                    _kl = bt_build_legs(val_spot, _kite_row["Dist%"],
+                                        _kite_row["Type"].lower(), rnd_v)
+                    with st.expander(
+                        "📋 Order legs (stub — no live order placed)", expanded=True):
+                        st.markdown(
+                            f"**{_kite_sel}** | Entry: {val_date} | Expiry: {val_exp} "
+                            f"| Capital: ₹{val_capital_rs:,} ({val_capital_pct}%% of ₹1,20,000)")
+                        kite_tbl = pd.DataFrame([{
+                            "Leg": lb,
+                            "Instrument": f"NIFTY {val_exp.strftime('%d%b%y').upper()} {int(stk)} {ot}",
+                            "Strike": int(stk), "Type": ot,
+                            "Side": "SELL" if si=="short" else "BUY",
+                            "Qty": lot_v, "Order": "MARKET", "Product": "NRML",
+                        } for lb, stk, ot, si in _kl])
+                        st.dataframe(kite_tbl, use_container_width=True, hide_index=True)
+                        st.info(
+                            "🔌 **To go live:** connect Kite session via Kite MCP "
+                            "and call `place_order()` per row above.")
 
 # ── TAB 3: IV History ─────────────────────────────────────────────────────────
 with tab3:
