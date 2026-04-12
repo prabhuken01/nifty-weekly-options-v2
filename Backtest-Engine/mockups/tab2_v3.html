@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Tab 2 v3 — Dynamic Strike Distance & Proper Capital Logic</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#0a0e1a;--surface:#151a2b;--surface2:#1e2438;--border:#2d3548;
+  --text:#e8eaf0;--text2:#9ca3af;--text3:#6b7280;
+  --green:#10b981;--green-bg:rgba(16,185,129,0.1);--green-border:rgba(16,185,129,0.3);
+  --red:#ef4444;--red-bg:rgba(239,68,68,0.1);--red-border:rgba(239,68,68,0.3);
+  --blue:#3b82f6;--blue-bg:rgba(59,130,246,0.1);--blue-border:rgba(59,130,246,0.3);
+  --amber:#f59e0b;--purple:#a855f7;
+}
+body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);padding:0;}
+.container{max-width:1200px;margin:0 auto;padding:20px;}
+.topbar{background:var(--surface);border-bottom:1px solid var(--border);padding:12px 24px;margin-bottom:24px;display:flex;align-items:center;gap:20px;}
+.topbar-title{font-size:18px;font-weight:600;}
+.section{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:20px;margin-bottom:20px;}
+.section-title{font-size:14px;font-weight:600;color:var(--text2);margin-bottom:16px;}
+.input-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-bottom:16px;}
+.field{display:flex;flex-direction:column;gap:6px;}
+.field label{font-size:12px;color:var(--text3);font-weight:500;}
+.field input,.field select{background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:8px 12px;color:var(--text);font-size:13px;}
+.radio-group{display:flex;gap:8px;}
+.radio-btn{padding:6px 16px;border:1px solid var(--border);border-radius:6px;font-size:12px;cursor:pointer;background:var(--surface2);color:var(--text2);transition:all .15s;user-select:none;}
+.radio-btn:hover{border-color:var(--text3);}
+.radio-btn.active{background:var(--blue);border-color:var(--blue);color:white;font-weight:500;}
+
+/* Slider */
+.slider-field{margin-top:12px;}
+.slider-label{display:flex;justify-content:space-between;font-size:12px;color:var(--text3);margin-bottom:8px;}
+.slider-value{color:var(--blue);font-weight:600;font-size:14px;}
+input[type="range"]{width:100%;height:6px;border-radius:3px;background:var(--surface2);outline:none;-webkit-appearance:none;}
+input[type="range"]::-webkit-slider-thumb{-webkit-appearance:none;appearance:none;width:16px;height:16px;border-radius:50%;background:var(--blue);cursor:pointer;}
+input[type="range"]::-moz-range-thumb{width:16px;height:16px;border-radius:50%;background:var(--blue);cursor:pointer;border:none;}
+
+.metrics-row{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin-bottom:8px;}
+.metric{background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:12px 14px;}
+.metric-label{font-size:10px;color:var(--text3);margin-bottom:4px;text-transform:uppercase;}
+.metric-value{font-size:18px;font-weight:600;font-family:'JetBrains Mono',monospace;}
+.metric-sub{font-size:11px;color:var(--text3);margin-top:3px;}
+
+.result-box{background:linear-gradient(135deg, #10b98115 0%, #059669 0%);border:2px solid var(--green-border);border-radius:12px;padding:24px;margin-bottom:20px;}
+.result-box.loss{background:linear-gradient(135deg, #ef444415 0%, #dc2626 0%);border-color:var(--red-border);}
+.result-header{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:16px;}
+.result-strat{font-size:22px;font-weight:700;}
+.result-badge{padding:6px 16px;border-radius:20px;font-size:13px;font-weight:600;}
+.badge-profit{background:var(--green);color:white;}
+.badge-loss{background:var(--red);color:white;}
+
+.legs-table{width:100%;border-collapse:collapse;margin-bottom:16px;font-size:13px;}
+.legs-table th{background:rgba(0,0,0,0.3);padding:10px 12px;text-align:left;font-size:11px;color:var(--text3);border-bottom:1px solid var(--border);}
+.legs-table td{padding:10px 12px;border-bottom:1px solid rgba(255,255,255,0.05);}
+.legs-table .total-row{background:rgba(0,0,0,0.3);font-weight:600;}
+
+.summary-cards{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;}
+.sum-card{background:rgba(0,0,0,0.25);border-radius:8px;padding:14px;}
+.sum-label{font-size:10px;color:var(--text3);margin-bottom:6px;}
+.sum-value{font-size:20px;font-weight:700;font-family:'JetBrains Mono',monospace;}
+
+.info-box{padding:12px;background:var(--blue-bg);border:1px solid var(--blue-border);border-radius:6px;font-size:12px;margin-top:12px;}
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <div class="topbar-title">📊 Tab 2 v3 — Dynamic Strike Distance & Proper Capital Logic</div>
+</div>
+
+<div class="container">
+
+  <!-- USER INPUT -->
+  <div class="section">
+    <div class="section-title">📅 User Input</div>
+    
+    <div class="input-grid">
+      <div class="field">
+        <label>Trade Date</label>
+        <input type="date" value="2024-10-14" id="trade-date" onchange="calculate()">
+      </div>
+      <div class="field">
+        <label>Entry Timing</label>
+        <div class="radio-group">
+          <div class="radio-btn" onclick="toggleRadio(this,'entry')">Opening (10:00)</div>
+          <div class="radio-btn active" onclick="toggleRadio(this,'entry')">Closing (14:00)</div>
+        </div>
+      </div>
+      <div class="field">
+        <label>Market Trend</label>
+        <div class="radio-group">
+          <div class="radio-btn active" onclick="toggleRadio(this,'trend');calculate()">Neutral</div>
+          <div class="radio-btn" onclick="toggleRadio(this,'trend');calculate()">Bullish</div>
+          <div class="radio-btn" onclick="toggleRadio(this,'trend');calculate()">Bearish</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="slider-field">
+      <div class="slider-label">
+        <span>Strike Distance from Spot</span>
+        <span class="slider-value" id="dist-value">5.0%</span>
+      </div>
+      <input type="range" min="3" max="8" step="0.5" value="5" id="dist-slider" oninput="updateDist();calculate()">
+      <div style="font-size:11px;color:var(--text3);margin-top:6px;">
+        <strong>Default for T-3:</strong> 5% · T-1: 2% · T-2: 3.5% · T-4: 6%
+      </div>
+    </div>
+
+    <div class="info-box">
+      📌 <strong>Strike Logic:</strong>
+      <span id="strike-logic">Short Strangle: PUT at -5%, CALL at +5%</span>
+    </div>
+  </div>
+
+  <!-- MARKET SNAPSHOT -->
+  <div class="section" style="background:var(--blue-bg);border-color:var(--blue-border);">
+    <div class="section-title">📈 Market Snapshot</div>
+    
+    <div class="metrics-row">
+      <div class="metric">
+        <div class="metric-label">Spot</div>
+        <div class="metric-value">₹25,122</div>
+        <div class="metric-sub">● 14:00 actual</div>
+      </div>
+      <div class="metric">
+        <div class="metric-label">Expiry</div>
+        <div class="metric-value" style="font-size:16px;">2024-10-17</div>
+        <div class="metric-sub">Thursday (T+3)</div>
+      </div>
+      <div class="metric">
+        <div class="metric-label">DTE</div>
+        <div class="metric-value">3</div>
+        <div class="metric-sub">trading days</div>
+      </div>
+      <div class="metric">
+        <div class="metric-label">ATM IV</div>
+        <div class="metric-value" style="color:var(--amber);">16.5%</div>
+        <div class="metric-sub">from straddle</div>
+      </div>
+      <div class="metric">
+        <div class="metric-label">IV Band</div>
+        <div class="metric-value" style="font-size:15px;">15-18%</div>
+        <div class="metric-sub">auto-classified</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- RESULT -->
+  <div class="result-box">
+    <div class="result-header">
+      <div>
+        <div class="result-strat" id="strat-name">Short Strangle</div>
+        <div style="font-size:13px;color:var(--text2);margin-top:4px;">
+          Entry: 14:00 Oct 14 · Exit: 14:00 Oct 16 (T-1)
+        </div>
+      </div>
+      <div class="result-badge badge-profit">✓ PROFIT</div>
+    </div>
+
+    <table class="legs-table" id="legs-table">
+      <thead>
+        <tr>
+          <th>Leg</th><th>Strike</th><th>Type</th><th>Entry Prem</th><th>Exit Prem</th><th>P&L (Lot 65)</th><th>Capital Req</th>
+        </tr>
+      </thead>
+      <tbody id="legs-body">
+        <tr>
+          <td>Short Put</td><td id="put-strike">₹23,866</td><td style="color:var(--red)">PE</td>
+          <td id="put-entry">₹4.50</td><td id="put-exit">₹0.80</td>
+          <td style="color:var(--green);font-weight:600;" id="put-pnl">+₹241</td>
+          <td id="put-cap">₹1,25,000</td>
+        </tr>
+        <tr>
+          <td>Short Call</td><td id="call-strike">₹26,378</td><td style="color:var(--blue)">CE</td>
+          <td id="call-entry">₹3.20</td><td id="call-exit">₹0.45</td>
+          <td style="color:var(--green);font-weight:600;" id="call-pnl">+₹179</td>
+          <td id="call-cap">₹1,25,000</td>
+        </tr>
+        <tr class="total-row">
+          <td colspan="5" style="text-align:right;">TOTAL P&L</td>
+          <td style="color:var(--green);font-size:20px;" id="total-pnl">+₹420</td>
+          <td style="font-size:14px;" id="total-cap">₹2,50,000</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="summary-cards">
+      <div class="sum-card">
+        <div class="sum-label">Actual P&L</div>
+        <div class="sum-value" style="color:var(--green);" id="sum-pnl">+₹420</div>
+      </div>
+      <div class="sum-card">
+        <div class="sum-label">Total Capital</div>
+        <div class="sum-value" id="sum-cap">₹2,50,000</div>
+      </div>
+      <div class="sum-card">
+        <div class="sum-label">Return %</div>
+        <div class="sum-value" style="color:var(--green);" id="sum-ret">+0.17%</div>
+      </div>
+      <div class="sum-card">
+        <div class="sum-label">LUT Avg</div>
+        <div class="sum-value" style="color:var(--text2);">+₹246</div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+const SPOT = 25122;
+const LOT = 65;
+const CAP_PER_LEG = 125000;
+
+// Sample entry/exit data (in real app, this comes from CSV)
+const SAMPLE_DATA = {
+  '23866_PE': {entry: 4.50, exit: 0.80},
+  '24100_PE': {entry: 7.20, exit: 1.50},
+  '24350_PE': {entry: 9.94, exit: 3.20},
+  '24600_PE': {entry: 14.10, exit: 5.30},
+  '25600_CE': {entry: 6.25, exit: 1.30},
+  '25850_CE': {entry: 4.80, exit: 0.90},
+  '26100_CE': {entry: 3.70, exit: 0.60},
+  '26378_CE': {entry: 3.20, exit: 0.45},
+};
+
+function toggleRadio(el, group){
+  el.parentElement.querySelectorAll('.radio-btn').forEach(b => b.classList.remove('active'));
+  el.classList.add('active');
+}
+
+function updateDist(){
+  const val = document.getElementById('dist-slider').value;
+  document.getElementById('dist-value').textContent = val + '%';
+}
+
+function calculate(){
+  const dist = parseFloat(document.getElementById('dist-slider').value) / 100;
+  const trend = document.querySelector('.radio-btn.active[onclick*="trend"]')?.textContent.trim() || 'Neutral';
+  
+  // Calculate strikes
+  const putStrike = Math.round(SPOT * (1 - dist) / 50) * 50;
+  const callStrike = Math.round(SPOT * (1 + dist) / 50) * 50;
+  
+  // Get premiums (mock lookup from SAMPLE_DATA)
+  const putData = SAMPLE_DATA[putStrike + '_PE'] || {entry: 5, exit: 1};
+  const callData = SAMPLE_DATA[callStrike + '_CE'] || {entry: 4, exit: 0.8};
+  
+  // Calculate P&L
+  const putPnl = (putData.entry - putData.exit) * LOT;
+  const callPnl = (callData.entry - callData.exit) * LOT;
+  const totalPnl = putPnl + callPnl;
+  
+  // Capital = 1.25L per short leg
+  const totalCap = CAP_PER_LEG * 2; // Short Strangle has 2 short legs
+  const returnPct = (totalPnl / totalCap * 100).toFixed(2);
+  
+  // Update UI
+  document.getElementById('put-strike').textContent = '₹' + putStrike.toLocaleString();
+  document.getElementById('call-strike').textContent = '₹' + callStrike.toLocaleString();
+  document.getElementById('put-entry').textContent = '₹' + putData.entry.toFixed(2);
+  document.getElementById('put-exit').textContent = '₹' + putData.exit.toFixed(2);
+  document.getElementById('call-entry').textContent = '₹' + callData.entry.toFixed(2);
+  document.getElementById('call-exit').textContent = '₹' + callData.exit.toFixed(2);
+  document.getElementById('put-pnl').textContent = '+₹' + Math.round(putPnl);
+  document.getElementById('call-pnl').textContent = '+₹' + Math.round(callPnl);
+  document.getElementById('put-cap').textContent = '₹' + CAP_PER_LEG.toLocaleString();
+  document.getElementById('call-cap').textContent = '₹' + CAP_PER_LEG.toLocaleString();
+  document.getElementById('total-pnl').textContent = '+₹' + Math.round(totalPnl);
+  document.getElementById('total-cap').textContent = '₹' + totalCap.toLocaleString();
+  document.getElementById('sum-pnl').textContent = '+₹' + Math.round(totalPnl);
+  document.getElementById('sum-cap').textContent = '₹' + totalCap.toLocaleString();
+  document.getElementById('sum-ret').textContent = '+' + returnPct + '%';
+  
+  // Update strike logic text
+  document.getElementById('strike-logic').textContent = 
+    `Short Strangle: PUT at -${(dist*100).toFixed(1)}% (₹${putStrike}), CALL at +${(dist*100).toFixed(1)}% (₹${callStrike})`;
+}
+
+// Initial calc
+calculate();
+</script>
+</body>
+</html>

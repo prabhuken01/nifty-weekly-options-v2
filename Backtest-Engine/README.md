@@ -12,6 +12,7 @@ Historical backtesting and strategy validation for NIFTY short strangle.
 - `validate_strategy.py` — Strategy validation and data fetching
 - `validate_sample_trade.py` — Quick CSV sanity check (sample date; mirrors Tab 2 entry/exit bars)
 - `nifty_options_framework_v2.html` / `nifty_options_framework_v3.html` — UI / spec reference for Tab 2
+- `mockups/` — static HTML prototypes (`tab2_mockup.html`, `tab2_corrected_mockup.html`, `tab2_v3.html`); see `mockups/README.md`
 
 ## Integration
 - `app.py` **Tab 1** — live signal grids
