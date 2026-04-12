@@ -17,28 +17,58 @@ for d in ['Live-Signal-Generator', 'Live-fetching']:
 st.set_page_config(page_title="Nifty Options Dashboard", layout="wide",
                    page_icon="📈", initial_sidebar_state="expanded")
 
-# ── Mobile-friendly CSS ──────────────────────────────────────────────────────
-st.markdown("""
+
+def _is_mobile_client():
+    """Best-effort mobile detection (Streamlit Cloud forwards User-Agent)."""
+    try:
+        ctx = getattr(st, "context", None)
+        if ctx is None or not getattr(ctx, "headers", None):
+            return False
+        ua = (ctx.headers.get("User-Agent") or "").lower()
+        return "mobi" in ua or "iphone" in ua or "ipod" in ua or "android" in ua
+    except Exception:
+        return False
+
+
+_IS_MOBILE = _is_mobile_client()
+
+# ── Mobile-friendly CSS (desktop vs phone font scale) ────────────────────────
+_desktop_fs = 16
+_mobile_fs = 18
+_df_fs = 15 if not _IS_MOBILE else 16
+_sub = 20 if not _IS_MOBILE else 22
+_h1 = 26 if not _IS_MOBILE else 24
+_h2 = 21 if not _IS_MOBILE else 20
+
+st.markdown(f"""
 <style>
-/* Global font size bump for mobile */
-@media (max-width: 768px) {
-    .stApp { font-size: 15px !important; }
-    [data-testid="stMetric"] { padding: 6px 8px !important; }
-    [data-testid="stMetricLabel"] { font-size: 13px !important; }
-    [data-testid="stMetricValue"] { font-size: 20px !important; }
-    [data-testid="stMetricDelta"] { font-size: 12px !important; }
-    .stDataFrame { font-size: 13px !important; }
-    .stDataFrame td, .stDataFrame th { padding: 4px 6px !important; min-width: 60px !important; }
-    .stTabs [data-baseweb="tab"] { font-size: 14px !important; padding: 8px 12px !important; }
-    .stCaption { font-size: 12px !important; }
-    .stAlert p { font-size: 13px !important; }
-    [data-testid="stSidebar"] { min-width: 280px !important; }
-    h1 { font-size: 22px !important; }
-    h2, .stSubheader { font-size: 18px !important; }
-    h3 { font-size: 16px !important; }
-    /* Make columns stack on very small screens */
-    [data-testid="column"] { min-width: 140px !important; }
-}
+/* Desktop: larger readable base; mobile: slightly larger again */
+.stApp {{ font-size: {_desktop_fs if not _IS_MOBILE else _mobile_fs}px !important; }}
+[data-testid="stMarkdownContainer"] p, [data-testid="stMarkdownContainer"] li {{
+    font-size: {0.98 * (_desktop_fs if not _IS_MOBILE else _mobile_fs):.0f}px !important;
+    line-height: 1.5 !important;
+}}
+.stDataFrame, [data-testid="stDataFrame"] {{
+    font-size: {_df_fs}px !important;
+}}
+.stDataFrame td, .stDataFrame th {{
+    padding: {"10px 12px" if not _IS_MOBILE else "8px 10px"} !important;
+}}
+[data-testid="stMetricLabel"] {{ font-size: {14 if not _IS_MOBILE else 15}px !important; }}
+[data-testid="stMetricValue"] {{ font-size: {22 if not _IS_MOBILE else 24}px !important; font-weight: 700 !important; }}
+h1 {{ font-size: {_h1}px !important; }}
+h2, .stSubheader {{ font-size: {_sub}px !important; }}
+h3 {{ font-size: {18 if not _IS_MOBILE else 17}px !important; }}
+.stCaption {{ font-size: {13 if not _IS_MOBILE else 14}px !important; }}
+
+@media (max-width: 768px) {{
+    .stApp {{ font-size: {_mobile_fs}px !important; }}
+    [data-testid="stMetric"] {{ padding: 8px 10px !important; }}
+    [data-testid="stMetricValue"] {{ font-size: 23px !important; }}
+    .stTabs [data-baseweb="tab"] {{ font-size: 15px !important; padding: 10px 14px !important; }}
+    [data-testid="stSidebar"] {{ min-width: 280px !important; }}
+    [data-testid="column"] {{ min-width: 140px !important; }}
+}}
 :root {
     --bg-main: #0D0D0D; --bg-card: #1A1A1A; --bg-border: #2A2A2A;
     --text-pri: #F0F0F0; --text-sec: #A0A0A0;
@@ -72,7 +102,7 @@ div[data-baseweb="select"] > div, div[data-baseweb="input"] > div {
     background-color: var(--bg-card) !important;
     border-color: var(--bg-border) !important; color: var(--text-pri) !important;
 }
-.stDataFrame { font-size: 14px; border: 1px solid var(--bg-border) !important; border-radius: 6px; }
+.stDataFrame { border: 1px solid var(--bg-border) !important; border-radius: 6px; }
 .stDataFrame th {
     font-weight: 700 !important; background-color: #1E1E2E !important;
     color: var(--text-pri) !important; border-bottom: 2px solid var(--bg-border) !important;
@@ -241,19 +271,23 @@ with st.sidebar:
         not st.session_state.get("dhan_token")
     )
     if st.session_state.get("dhan_tok"):
-        st.success("🔑 Token active — shared across all devices via Streamlit Secrets")
+        st.success("🔑 **Token active** — with **Secrets**, this works on **every device** automatically.")
         with st.expander("Override token (this session only)"):
             _ov = st.text_input("New token", type="password", key="dhan_token_override")
             if _ov:
                 st.session_state["dhan_tok"] = _ov
                 st.session_state["_tok_manually_set"] = True
     else:
-        st.warning("No token found in Secrets")
-        _inp = st.text_input("Dhan Token (this session)", type="password", key="dhan_token")
+        st.warning("⚠️ No token in Secrets — paste below to load live chains & LTP")
+        _inp = st.text_input("Dhan access token", type="password", key="dhan_token")
         if _inp:
             st.session_state["dhan_tok"] = _inp
             st.session_state["_tok_manually_set"] = True
-        st.caption(f"To share across devices: add to Streamlit Secrets as `dhan.access_token`")
+        st.caption(
+            "📱 **Phone / tablet:** open this app here and paste the **same** token once per session. "
+            "Streamlit does not copy your desktop session to mobile — use **Secrets** (`dhan.access_token`) "
+            "for automatic market data on all devices.")
+        st.caption("☁️ **Streamlit Cloud:** Project Settings → Secrets → `dhan.access_token` = your token")
 
     tok = st.session_state.get("dhan_tok","")
     has_tok = bool(tok)
@@ -494,6 +528,40 @@ def bt_prem_at(df, d, ed, strike, otype, hhmm):
 
 def bt_get_prem(df, entry_d, exit_d, ed, strike, otype, entry_hhmm="15:00", exit_hhmm="15:00"):
     return bt_prem_at(df, entry_d, ed, strike, otype, entry_hhmm), bt_prem_at(df, exit_d, ed, strike, otype, exit_hhmm)
+
+
+def bt_gross_pnl_for_legs(bt_df, is_historical, bt_date, exit_date, bt_expiry,
+                          bt_entry_hhmm, bt_exit_hhmm, legs_spec, lot,
+                          bt_spot_val, chain2, bt_iv_val):
+    """Sum of leg P&Ls × lot (gross, before brokerage). Same rules as Tab 2 leg loop."""
+    total = 0
+    ok = True
+    for label, strike, otype, side in legs_spec:
+        if is_historical:
+            e_p, x_p = bt_get_prem(bt_df, bt_date, exit_date, bt_expiry,
+                                   strike, otype, bt_entry_hhmm, bt_exit_hhmm)
+            if x_p is None and side == "long" and exit_date == bt_expiry:
+                _esp = (bt_get_spot_at(bt_df, exit_date, bt_exit_hhmm)
+                        or bt_get_spot(bt_df, exit_date))
+                if _esp is not None:
+                    x_p = max(0.0, (_esp - strike) if otype == "CE" else (strike - _esp))
+        else:
+            e_p = ltp_from_chain(chain2, strike,
+                                 "call" if otype == "CE" else "put") if chain2 else None
+            if not e_p:
+                off = abs(strike / bt_spot_val - 1)
+                e_p = round(max(5.0, 1267 * max(0.3, 1 - (off - 0.005) / 0.02)
+                                * (bt_iv_val / 0.14) / lot), 1)
+            x_p = None
+        if e_p is not None and x_p is not None:
+            if side == "short":
+                total += round((e_p - x_p) * lot)
+            else:
+                total += round((x_p - e_p) * lot)
+        else:
+            ok = False
+    return total, ok
+
 
 def bt_default_dist_pct(dte_sel):
     return {"T": 2.0, "T-1": 2.0, "T-2": 3.5, "T-3": 5.0, "T-4": 6.0, "T-5": 6.0}.get(dte_sel, 5.0)
@@ -938,13 +1006,11 @@ with tab2:
         else:
             skip_flag = lut.get("skip")
             warn_flag = lut.get("warn")
-            # BUG 6: <13% IV always excludes Short Strangle — show explicit AVOID notice
             if bt_iv_sel == "<13%":
-                st.info(
-                    "ℹ️ **Short Strangle — AVOID at <13% IV** · "
-                    "Premium collected is too thin (typically <₹30-40/lot at these IV levels). "
-                    "~57%% of all trade dates have IV <13%% and SS is excluded from all 15 "
-                    "LUT combos in this regime. IC / Spread strategies are preferred.")
+                st.caption(
+                    "📉 **<13% IV** — the **LUT** usually prefers spreads/condors (thinner premiums). "
+                    "**Short Strangle is still calculated below** when the LUT pick isn’t SS, "
+                    "so you can compare side-by-side.")
             if skip_flag:
                 st.error(f"⊘ **No Trade — Skip This Setup**\n\n{skip_flag}\n\n"
                          f"Win rate: {lut['win']}% · Avg P&L: ₹{lut['pnl']:+,}")
@@ -1180,21 +1246,59 @@ div[data-testid="stSlider"] [role="slider"] {
                             column_order=_leg_cols,
                         )
 
-                    r1, r2, r3, r4 = st.columns(4)
+                    brokerage_bt = round(40 * len(legs_spec), 0)
+                    net_bt = (total_pnl - brokerage_bt) if has_exit else None
+                    ret_pct_net = (
+                        (net_bt / total_cap * 100) if total_cap and net_bt is not None else None)
+                    r1, r2, r3, r4, r5 = st.columns(5)
                     if is_historical and has_exit:
-                        outcome = "✅ PROFIT" if total_pnl > 0 else "❌ LOSS"
-                        r1.metric("Actual P&L (1 lot)", f"₹{total_pnl:+,.0f}", outcome)
-                        r2.metric("Basis for return %", f"₹{total_cap:,.0f}",
-                                  cap_basis_lbl if n_short else "sum of entry premium × lot")
-                        r3.metric("Return on capital", f"{ret_pct:+.2f}%" if ret_pct is not None else "—")
-                        diff = round((total_pnl - lut["pnl"]) / max(abs(lut["pnl"]), 1) * 100)
-                        r4.metric("vs LUT avg", f"{diff:+.0f}%",
+                        outcome = (
+                            "✅ net profit" if net_bt is not None and net_bt > 0 else
+                            "❌ net loss" if net_bt is not None and net_bt < 0 else "—")
+                        r1.metric("📊 Gross P&L", f"₹{total_pnl:+,.0f}", "before brokerage")
+                        r2.metric("🏦 Brokerage", f"₹{brokerage_bt:,.0f}",
+                                  f"{len(legs_spec)} legs × ₹40")
+                        r3.metric("💰 Net P&L", f"₹{net_bt:+,.0f}" if net_bt is not None else "—", outcome)
+                        r4.metric("Return on capital", f"{ret_pct_net:+.2f}%" if ret_pct_net is not None else "—",
+                                  cap_basis_lbl if n_short else "vs premium basis")
+                        diff = round((net_bt - lut["pnl"]) / max(abs(lut["pnl"]), 1) * 100) if net_bt is not None else 0
+                        r5.metric("vs LUT avg", f"{diff:+.0f}%",
                                   "above avg" if diff > 0 else "below avg")
                     else:
-                        r1.metric("Estimated P&L", "~ pending" if not has_exit else f"₹{total_pnl:+,.0f}")
-                        r2.metric("Basis for return %", f"₹{total_cap:,.0f}" if total_cap else "—")
-                        r3.metric("Return %", "—" if not has_exit else f"{ret_pct:+.2f}%")
-                        r4.metric("LUT Avg", f"₹{lut['pnl']:+,}")
+                        r1.metric("📊 Gross P&L", "~ pending" if not has_exit else f"₹{total_pnl:+,.0f}")
+                        r2.metric("🏦 Brokerage", f"₹{brokerage_bt:,.0f}")
+                        r3.metric("💰 Net P&L", "—" if not has_exit else f"₹{net_bt:+,.0f}")
+                        r4.metric("Return %", "—" if not has_exit else (
+                            f"{ret_pct_net:+.2f}%" if ret_pct_net is not None else "—"))
+                        r5.metric("LUT Avg", f"₹{lut['pnl']:+,}")
+
+                    if (
+                        bt_iv_sel == "<13%"
+                        and stype != "ss"
+                        and is_historical
+                        and has_exit
+                    ):
+                        legs_ss = bt_build_legs(bt_spot_val, dist_pct, "ss", rnd)
+                        chain2 = st.session_state.get("nifty_chain", {})
+                        gross_ss, ok_ss = bt_gross_pnl_for_legs(
+                            bt_df, is_historical, bt_date, exit_date, bt_expiry,
+                            bt_entry_hhmm, bt_exit_hhmm, legs_ss, lot,
+                            bt_spot_val, chain2, bt_iv_val)
+                        brok_ss = round(40 * len(legs_ss), 0)
+                        net_ss = (gross_ss - brok_ss) if ok_ss else None
+                        st.markdown("---")
+                        st.markdown("##### ⚡ Short Strangle — same % OTM (comparison)")
+                        st.caption(
+                            "LUT pick is **not** SS in this <13% band — this block shows how **Short Strangle** "
+                            "would have performed at the **same strike %** for context.")
+                        ss1, ss2, ss3 = st.columns(3)
+                        if ok_ss:
+                            ss1.metric("📊 Gross P&L", f"₹{gross_ss:+,.0f}")
+                            ss2.metric("🏦 Brokerage", f"₹{brok_ss:,.0f}")
+                            tag = "✅" if net_ss > 0 else "❌" if net_ss < 0 else "➖"
+                            ss3.metric("💰 Net P&L", f"₹{net_ss:+,.0f}", tag)
+                        else:
+                            st.warning("⚠️ Could not price every SS leg from CSV for this date.")
                 else:
                     st.info("No legs to display for this strategy.")
 
@@ -1434,19 +1538,20 @@ with tab_val:
                     brokerage = round(40 * len(legs_v), 0)
                     net_pnl   = (pnl_total - brokerage) if pnl_ok else None
                     rows_val.append({
-                        "Strategy":  strat_name,
-                        "Type":      stype_v.upper(),
-                        "Dist%":     dist_v,
-                        "CE Strike": ce_short if ce_short is not None else ce_any,
-                        "PE Strike": pe_short if pe_short is not None else pe_any,
-                        "Net PnL":   net_pnl,
-                        "Broker":    brokerage if pnl_ok else None,
-                        "Data":      "● real" if pnl_ok else "— missing",
+                        "Strategy":   strat_name,
+                        "Type":       stype_v.upper(),
+                        "Dist%":      dist_v,
+                        "CE Strike":  ce_short if ce_short is not None else ce_any,
+                        "PE Strike":  pe_short if pe_short is not None else pe_any,
+                        "Gross P&L":  round(pnl_total, 0) if pnl_ok else None,
+                        "Brokerage":  brokerage if pnl_ok else None,
+                        "Net P&L":    net_pnl,
+                        "Data":       "✅ real" if pnl_ok else "⚠️ missing",
                     })
                 df_val = pd.DataFrame(rows_val)
 
-                _ss_p = df_val.loc[(df_val["Type"] == "SS") & (df_val["Dist%"] == val_dist_pct), "Net PnL"]
-                _ic_p = df_val.loc[(df_val["Type"] == "IC") & (df_val["Dist%"] == val_dist_pct), "Net PnL"]
+                _ss_p = df_val.loc[(df_val["Type"] == "SS") & (df_val["Dist%"] == val_dist_pct), "Net P&L"]
+                _ic_p = df_val.loc[(df_val["Type"] == "IC") & (df_val["Dist%"] == val_dist_pct), "Net P&L"]
                 viol_ic = False
                 if not _ss_p.empty and not _ic_p.empty:
                     try:
@@ -1457,9 +1562,9 @@ with tab_val:
                         pass
 
                 if val_iv_band == "<13%":
-                    st.info(
-                        "ℹ️ **Short Strangle AVOID at <13% IV** — "
-                        "premium too thin. IC / Spread preferred for this regime.")
+                    st.caption(
+                        "📉 **<13% IV** — premiums are thin; **Short Strangle still appears** in the table "
+                        "below for comparison with spreads/condors.")
 
                 st.markdown(
                     f"#### All strategies — Entry {val_date} `{val_entry_hhmm}` | Expiry {val_exp} "
@@ -1473,7 +1578,7 @@ with tab_val:
 
                 if show_profitable_only:
                     df_val = df_val[
-                        df_val["Net PnL"].apply(
+                        df_val["Net P&L"].apply(
                             lambda v: v is not None
                             and not (isinstance(v, float) and np.isnan(float(v)))
                             and float(v) > 0)]
@@ -1482,39 +1587,74 @@ with tab_val:
                     sn, t = row["Strategy"], row["Type"]
                     b = ""
                     if viol_ic and t == "IC":
-                        b += " 🟠IC>SS"
+                        b += " ⚠️IC>SS"
                     if lut_rec and t == lut_rec.get("st", "").upper():
                         if norm_strategy_name(sn) == lut_rec_base:
-                            b += " ✅LUT"
+                            b += " 🏆LUT"
                     return sn + b
 
                 df_disp = df_val.copy()
                 df_disp["Strategy"] = df_disp.apply(_badge, axis=1)
 
-                _num_df = df_disp.copy()
-                for _c in ("CE Strike", "PE Strike", "Net PnL", "Broker", "Dist%"):
-                    if _c in _num_df.columns:
-                        _num_df[_c] = pd.to_numeric(_num_df[_c], errors="coerce")
+                show_cols = [
+                    "Strategy", "Type", "Dist%", "CE Strike", "PE Strike",
+                    "Gross P&L", "Brokerage", "Net P&L", "Data",
+                ]
+                _disp = df_disp[show_cols].copy()
 
-                show_cols = ["Strategy", "Type", "Dist%", "CE Strike", "PE Strike", "Net PnL", "Broker", "Data"]
+                def _pnl_color(s):
+                    out = []
+                    for v in s:
+                        try:
+                            fv = float(v)
+                            if np.isnan(fv):
+                                out.append("")
+                            elif fv > 0:
+                                out.append("background-color: rgba(0,200,150,0.18); color: #6ee7b7; font-weight: 600")
+                            elif fv < 0:
+                                out.append("background-color: rgba(255,77,77,0.15); color: #fca5a5; font-weight: 600")
+                            else:
+                                out.append("color: #e5e7eb")
+                        except (TypeError, ValueError):
+                            out.append("")
+                    return out
+
+                def _ru_fmt(v):
+                    if v is None or (isinstance(v, float) and np.isnan(v)):
+                        return "—"
+                    try:
+                        return f"₹{float(v):+,.0f}"
+                    except (TypeError, ValueError):
+                        return "—"
+
+                def _ru_plain(v):
+                    if v is None or (isinstance(v, float) and np.isnan(v)):
+                        return "—"
+                    try:
+                        return f"₹{float(v):,.0f}"
+                    except (TypeError, ValueError):
+                        return "—"
+
+                _styled = (
+                    _disp.style
+                    .apply(_pnl_color, subset=["Gross P&L", "Net P&L"], axis=0)
+                    .format({
+                        "Gross P&L": lambda x: _ru_fmt(x),
+                        "Brokerage": lambda x: _ru_plain(x),
+                        "Net P&L": lambda x: _ru_fmt(x),
+                        "CE Strike": lambda x: f"₹{int(x):,}" if x is not None and not (isinstance(x, float) and np.isnan(x)) else "—",
+                        "PE Strike": lambda x: f"₹{int(x):,}" if x is not None and not (isinstance(x, float) and np.isnan(x)) else "—",
+                        "Dist%": lambda x: f"{x:.1f}%" if x is not None and not (isinstance(x, float) and np.isnan(x)) else "—",
+                    }, na_rep="—")
+                )
+
                 with st.container(border=True):
+                    st.markdown("**📋 Strategy results** — Gross → Brokerage → **Net** (green / red = profit / loss)")
                     st.dataframe(
-                        _num_df[show_cols],
+                        _styled,
                         use_container_width=True,
                         hide_index=True,
-                        height=min(500, 72 + len(df_disp) * 38),
-                        column_config={
-                            "Net PnL": st.column_config.NumberColumn(
-                                "Net P&L", format="₹%+,.0f"),
-                            "CE Strike": st.column_config.NumberColumn(
-                                "CE Strike", format="₹%,.0f"),
-                            "PE Strike": st.column_config.NumberColumn(
-                                "PE Strike", format="₹%,.0f"),
-                            "Dist%": st.column_config.NumberColumn(
-                                "Dist%", format="%.1f%%"),
-                            "Broker": st.column_config.NumberColumn(
-                                "Brokerage", format="₹%,.0f"),
-                        },
+                        height=min(520, 76 + len(_disp) * 40),
                     )
 
                 if viol_ic:
