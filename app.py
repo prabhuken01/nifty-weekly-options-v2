@@ -395,14 +395,21 @@ def bt_find_expiry(df, d):
     fut = sorted(df[df["edate"] > d]["edate"].unique())
     return fut[0] if fut else None
 
-def bt_get_spot(df, d):
-    r = df[(df["tdate"]==d) & (df["hhmm"]=="15:00")]
+def bt_get_spot_at(df, d, hhmm):
+    r = df[(df["tdate"]==d) & (df["hhmm"]==hhmm)]
     return float(r["underlying_spot_close"].iloc[0]) if len(r) else None
 
-def bt_iv_straddle(df, d, ed, spot):
+def bt_get_spot(df, d):
+    """Prefer 15:00, then 14:00, then first available."""
+    for h in ("15:00", "14:00", "10:00"):
+        v = bt_get_spot_at(df, d, h)
+        if v is not None: return v
+    return None
+
+def bt_iv_straddle(df, d, ed, spot, hhmm="15:00"):
     rnd = ROUND["NIFTY 50"]
     atm = int(round(spot/rnd)*rnd)
-    rows = df[(df["tdate"]==d) & (df["edate"]==ed) & (df["hhmm"]=="15:00")]
+    rows = df[(df["tdate"]==d) & (df["edate"]==ed) & (df["hhmm"]==hhmm)]
     ce = rows[(rows["strike_price"]==atm) & (rows["option_type"]=="CE")]["close"]
     pe = rows[(rows["strike_price"]==atm) & (rows["option_type"]=="PE")]["close"]
     if len(ce) and len(pe):
@@ -412,13 +419,39 @@ def bt_iv_straddle(df, d, ed, spot):
         return iv, round(stv, 1), atm
     return IV_ANN["NIFTY 50"], None, atm
 
-def bt_get_prem(df, entry_d, exit_d, ed, strike, otype):
-    def _q(d):
-        r = df[(df["tdate"]==d) & (df["edate"]==ed) &
-               (df["strike_price"]==float(strike)) & (df["option_type"]==otype) &
-               (df["hhmm"]=="15:00")]
-        return float(r["close"].iloc[0]) if len(r) else None
-    return _q(entry_d), _q(exit_d)
+def bt_prem_at(df, d, ed, strike, otype, hhmm):
+    r = df[(df["tdate"]==d) & (df["edate"]==ed) &
+           (df["strike_price"]==float(strike)) & (df["option_type"]==otype) &
+           (df["hhmm"]==hhmm)]
+    return float(r["close"].iloc[0]) if len(r) else None
+
+def bt_get_prem(df, entry_d, exit_d, ed, strike, otype, entry_hhmm="15:00", exit_hhmm="15:00"):
+    return bt_prem_at(df, entry_d, ed, strike, otype, entry_hhmm), bt_prem_at(df, exit_d, ed, strike, otype, exit_hhmm)
+
+def bt_default_dist_pct(dte_sel):
+    return {"T-1": 2.0, "T-2": 3.5, "T-3": 5.0, "T-4": 6.0}.get(dte_sel, 5.0)
+
+def bt_dist_slider_bounds(dte_sel):
+    return {"T-1": (1.0, 4.0), "T-2": (2.0, 6.0), "T-3": (3.0, 8.0), "T-4": (4.0, 10.0)}.get(dte_sel, (3.0, 8.0))
+
+def bt_build_legs(spot, dist_pct, stype, rnd):
+    """dist_pct as percent (e.g. 5.0 for 5%). 1% buffer between short/long for spreads & IC."""
+    X   = dist_pct / 100.0
+    buf = 0.01
+    pe_s = int(round(spot*(1-X)/rnd)*rnd)
+    ce_s = int(round(spot*(1+X)/rnd)*rnd)
+    pe_l = int(round(spot*(1-X-buf)/rnd)*rnd)
+    ce_l = int(round(spot*(1+X+buf)/rnd)*rnd)
+    if stype in ("ss", "ws"):
+        return [("Short Put", pe_s, "PE", "short"), ("Short Call", ce_s, "CE", "short")]
+    if stype == "ic":
+        return [("Short Put", pe_s, "PE", "short"), ("Long Put", pe_l, "PE", "long"),
+                ("Short Call", ce_s, "CE", "short"), ("Long Call", ce_l, "CE", "long")]
+    if stype == "bp":
+        return [("Short Put", pe_s, "PE", "short"), ("Long Put", pe_l, "PE", "long")]
+    if stype == "bc":
+        return [("Short Call", ce_s, "CE", "short"), ("Long Call", ce_l, "CE", "long")]
+    return [("Short Put", pe_s, "PE", "short"), ("Short Call", ce_s, "CE", "short")]
 
 def bt_next_expiry_live(d):
     """For live dates: Tuesday expiry (current NSE rule)."""
@@ -583,35 +616,48 @@ with tab1:
 with tab2:
     top_bar()
     st.markdown("---")
-    st.subheader("📊 Historical Strategy Simulator")
-    st.caption("Select any date → get real market data → choose your 3-step inputs → validate actual P&L vs expectation")
+    st.subheader("📊 Historical Strategy Simulator (v3)")
+    st.caption("Entry bar + strike % slider · ₹1.25L per short leg · IC/spreads +1% long buffer · P&L first, details in expanders")
 
     bt_df = load_bt_df()
 
     # ── Section 1: Date & Mode ────────────────────────────────────────────────
-    st.markdown("#### 1️⃣ Select Date & Exit Timing")
-    s1c1, s1c2 = st.columns([2, 2])
+    st.markdown("#### 1️⃣ Select Date, Entry & Exit Timing")
+    s1c1, s1c2, s1c3 = st.columns(3)
     with s1c1:
         bt_date = st.date_input("Trade Date", value=date(2025, 10, 14),
                                 min_value=date(2024, 9, 23), max_value=date.today(),
                                 key="bt_date2")
     with s1c2:
+        bt_entry_hhmm = st.selectbox(
+            "Entry bar (CSV 30m)",
+            ["14:00", "10:00", "15:00"],
+            index=0,
+            format_func=lambda x: {"14:00": "Closing — 14:00",
+                                   "10:00": "Opening — 10:00",
+                                   "15:00": "EOD — 15:00"}[x],
+            key="bt_entry_hhmm",
+            help="Premiums at this timestamp on trade date. Exit always uses 15:00 on exit date.")
+    with s1c3:
         bt_exit_mode = st.selectbox("Exit Timing",
                                     ["T-1 Close (day before expiry)",
                                      "T Close (expiry day close)"],
                                     key="bt_exit2")
     exit_is_T1   = "T-1" in bt_exit_mode
+    bt_exit_hhmm = "15:00"
     is_historical = (not bt_df.empty) and (bt_date <= BT_CSV_END)
 
     if is_historical:
-        st.success("📁 **Historical Mode — Real P&L** · Actual CSV data (Sep 2024 – Mar 2026). Premiums are real 15:00 close prices.")
+        st.success("📁 **Historical Mode — Real P&L** · CSV premiums at **entry** bar + **15:00** on exit date.")
     else:
         st.warning("📡 **Live Mode — Estimated P&L** · Beyond CSV database. Entry from DhanHQ chain if available; exit estimated from LUT avg.")
 
     # Snapshot
     bt_valid = True
     if is_historical:
-        _sp = bt_get_spot(bt_df, bt_date)
+        _sp = bt_get_spot_at(bt_df, bt_date, bt_entry_hhmm)
+        if _sp is None:
+            _sp = bt_get_spot(bt_df, bt_date)
         if _sp is None:
             st.error("No data for this date — market may have been closed. Try a nearby trading day.")
             bt_valid = False
@@ -622,7 +668,8 @@ with tab2:
                 st.error("Could not find a future expiry in data for this date.")
                 bt_valid = False
             else:
-                bt_iv_val, bt_straddle_val, bt_atm = bt_iv_straddle(bt_df, bt_date, bt_expiry, bt_spot_val)
+                bt_iv_val, bt_straddle_val, bt_atm = bt_iv_straddle(
+                    bt_df, bt_date, bt_expiry, bt_spot_val, bt_entry_hhmm)
     else:
         bt_spot_val     = SPOT["NIFTY 50"]
         bt_expiry       = bt_next_expiry_live(bt_date)
@@ -640,7 +687,7 @@ with tab2:
 
         sm1, sm2, sm3, sm4, sm5 = st.columns(5)
         sm1.metric("Nifty Spot", f"₹{bt_spot_val:,.0f}",
-                   "● actual" if is_historical else "~ live")
+                   f"● {bt_entry_hhmm}" if is_historical else "~ live")
         sm2.metric("Nearest Expiry", bt_expiry.strftime("%Y-%m-%d"),
                    bt_expiry.strftime("%A"))
         sm3.metric("DTE", f"{bt_dte_val} trading days")
@@ -693,13 +740,14 @@ with tab2:
 
         st.markdown("---")
 
-        # ── Section 3: Strategy Recommendation + Do's & Don'ts ───────────────
-        st.markdown("#### 3️⃣ Strategy Recommendation + Do's & Don'ts")
+        # ── Section 3: Strategy + dynamic strikes + P&L (v3) ───────────────────
+        st.markdown("#### 3️⃣ Strategy Recommendation & P&L")
         lut_key = f"{bt_dte_sel}|{bt_iv_sel}|{bt_trend}"
         lut = BT_LUT.get(lut_key)
         gam = BT_GAMMA.get(bt_dte_sel, BT_GAMMA["T-4"])
         rnd = ROUND["NIFTY 50"]
         lot = LOT["NIFTY 50"]
+        cap_leg = CAP["NIFTY 50"]  # ₹1,25,000 per short leg
 
         if not lut:
             st.error(f"No LUT entry for `{lut_key}`")
@@ -716,33 +764,140 @@ with tab2:
                 kc1, kc2, kc3, kc4 = st.columns(4)
                 kc1.metric("Recommended Strategy", lut["s"])
                 kc2.metric("Historical Win Rate", f"{lut['win']}%")
-                kc3.metric("Avg P&L / Trade", f"₹{lut['pnl']:+,}")
+                kc3.metric("Avg P&L / Trade (LUT)", f"₹{lut['pnl']:+,}")
                 kc4.metric("Max Loss (backtest)",
                            f"₹{lut['ml']:,}" if lut["ml"] else "None in dataset")
                 st.caption(
-                    f"Theta/Capital: **{lut['tc']}%/day** · Min theta: **{lut['th']} pts/day** · "
-                    f"Gamma max: **{gam['max']}** · LUT key: `{lut_key}`")
+                    f"Theta/Capital: **{lut['tc']}%/day** (per ₹1,25,000 short leg) · "
+                    f"Min theta: **{lut['th']} pts/day** · Gamma max: **{gam['max']}** · LUT: `{lut_key}`")
 
-                dc = lut.get("dc"); dp = lut.get("dp")
-                ce_strike = int(round(bt_spot_val*(1+dc)/rnd)*rnd) if dc else None
-                pe_strike = int(round(bt_spot_val*(1+dp)/rnd)*rnd) if dp else None
+                lo, hi = bt_dist_slider_bounds(bt_dte_sel)
+                ddef = bt_default_dist_pct(bt_dte_sel)
+                dist_pct = st.slider(
+                    f"Strike distance from spot (% OTM — symmetric shorts; "
+                    f"spreads/IC add **+1%** buffer between short & long)",
+                    float(lo), float(hi), float(ddef), 0.5, key="bt_dist_slider",
+                    help="T-1 default 2% · T-2 → 3.5% · T-3 → 5% · T-4 → 6%")
 
-                t_entry, t_greeks, t_pnl = st.tabs(
-                    ["📋 Entry Params (Do's & Don'ts)", "📐 Greeks", "💰 Actual P&L Result"])
+                stype = lut["st"]
+                legs_spec = bt_build_legs(bt_spot_val, dist_pct, stype, rnd)
+                dc, dp = lut.get("dc"), lut.get("dp")
+                if stype in ("ss", "ws"):
+                    strike_note = (f"Short Strangle / Wide: PUT −{dist_pct:.1f}% / CALL +{dist_pct:.1f}% "
+                                   f"(LUT ref Δ PE {dp} / CE {dc})")
+                elif stype == "ic":
+                    strike_note = (f"Iron Condor: shorts ±{dist_pct:.1f}%, longs ±{dist_pct+1:.1f}% "
+                                   f"(1% buffer) · LUT ref Δ PE {dp} / CE {dc}")
+                elif stype == "bp":
+                    strike_note = (f"Bull Put Spread: short PUT −{dist_pct:.1f}%, long PUT −{dist_pct+1:.1f}% "
+                                   f"(1% buffer) · LUT ref Δ {dp}")
+                elif stype == "bc":
+                    strike_note = (f"Bear Call Spread: short CALL +{dist_pct:.1f}%, long CALL +{dist_pct+1:.1f}% "
+                                   f"(1% buffer) · LUT ref Δ {dc}")
+                else:
+                    strike_note = ""
+                st.info(strike_note)
 
-                # ── Entry Params ───────────────────────────────────────────────
-                with t_entry:
+                # ── Actual P&L first ───────────────────────────────────────────
+                st.markdown("##### 💰 Actual P&L Result")
+                st.caption(
+                    f"Entry **{bt_date}** `{bt_entry_hhmm}` · Exit **{exit_date}** `{bt_exit_hhmm}` · "
+                    f"{bt_exit_mode}")
+                rows_data = []
+                _s = {"pnl": 0, "has_exit": True}
+                n_short = sum(1 for t in legs_spec if t[3] == "short")
+                total_cap = cap_leg * n_short
+
+                for label, strike, otype, side in legs_spec:
+                    if is_historical:
+                        e_p, x_p = bt_get_prem(bt_df, bt_date, exit_date, bt_expiry,
+                                               strike, otype, bt_entry_hhmm, bt_exit_hhmm)
+                        src = "● real"
+                    else:
+                        chain2 = st.session_state.get("nifty_chain", {})
+                        e_p = ltp_from_chain(chain2, strike,
+                                             "call" if otype == "CE" else "put") if chain2 else None
+                        if not e_p:
+                            off = abs(strike / bt_spot_val - 1)
+                            e_p = round(max(5.0, 1267 * max(0.3, 1 - (off - 0.005) / 0.02)
+                                            * (bt_iv_val / 0.14) / lot), 1)
+                        x_p = None
+                        src = "~ est"
+                    if e_p is not None and x_p is not None:
+                        if side == "short":
+                            leg_pnl = round((e_p - x_p) * lot)
+                        else:
+                            leg_pnl = round((x_p - e_p) * lot)
+                        _s["pnl"] += leg_pnl
+                    else:
+                        leg_pnl = None
+                        _s["has_exit"] = False
+                    cap_show = f"₹{cap_leg:,}" if side == "short" else "—"
+                    rows_data.append({
+                        "Leg": label, "Strike": f"₹{strike:,}", "Type": otype, "Side": side[:1].upper(),
+                        "Entry Prem": f"₹{e_p:.1f}" if e_p else "—",
+                        "Exit Prem": f"₹{x_p:.1f}" if x_p else "pending",
+                        "P&L / Lot": f"₹{leg_pnl:+,.0f}" if leg_pnl is not None else "~ est",
+                        "Cap / leg": cap_show,
+                        "Src": src,
+                    })
+
+                total_pnl = _s["pnl"]
+                has_exit = _s["has_exit"]
+                ret_pct = (total_pnl / total_cap * 100) if total_cap and has_exit else None
+
+                if rows_data:
+                    df_legs = pd.DataFrame(rows_data)
+
+                    def _style_legs(df):
+                        def _rc(col):
+                            if col.name == "P&L / Lot":
+                                return [("color:#21c55d" if "+" in str(v) else
+                                         "color:#ef4444" if "-" in str(v) else "")
+                                        for v in col]
+                            if col.name == "Type":
+                                return [("color:#3b82f6" if v == "CE" else
+                                         "color:#ef4444" if v == "PE" else "")
+                                        for v in col]
+                            if col.name == "Src":
+                                return [("color:#21c55d" if "real" in str(v) else "color:#6b7280")
+                                        for v in col]
+                            return [""] * len(col)
+                        return df.style.apply(_rc)
+
+                    st.dataframe(_style_legs(df_legs), use_container_width=True, hide_index=True)
+
+                    r1, r2, r3, r4 = st.columns(4)
+                    if is_historical and has_exit:
+                        outcome = "✅ PROFIT" if total_pnl > 0 else "❌ LOSS"
+                        r1.metric("Actual P&L (1 lot)", f"₹{total_pnl:+,.0f}", outcome)
+                        r2.metric("Total capital (short legs)", f"₹{total_cap:,}",
+                                  f"{n_short} × ₹1,25,000")
+                        r3.metric("Return on capital", f"{ret_pct:+.2f}%" if ret_pct is not None else "—")
+                        diff = round((total_pnl - lut["pnl"]) / max(abs(lut["pnl"]), 1) * 100)
+                        r4.metric("vs LUT avg", f"{diff:+.0f}%",
+                                  "above avg" if diff > 0 else "below avg")
+                    else:
+                        r1.metric("Estimated P&L", "~ pending" if not has_exit else f"₹{total_pnl:+,.0f}")
+                        r2.metric("Total capital (short legs)", f"₹{total_cap:,}")
+                        r3.metric("Return %", "—" if not has_exit else f"{ret_pct:+.2f}%")
+                        r4.metric("LUT Avg", f"₹{lut['pnl']:+,}")
+                else:
+                    st.info("No legs to display for this strategy.")
+
+                # ── Entry params (expander) ────────────────────────────────────
+                with st.expander("📋 Entry Params (Do's & Don'ts)", expanded=False):
+                    ce_ref = int(round(bt_spot_val * (1 + dc) / rnd) * rnd) if dc else None
+                    pe_ref = int(round(bt_spot_val * (1 + dp) / rnd) * rnd) if dp else None
                     if dc:
-                        st.markdown(f"**CE Short Δ:** `+{dc}` → Strike ≈ **₹{ce_strike:,}** "
-                                    f"(~{dc*100:.0f}% OTM call)")
+                        st.markdown(f"**LUT CE short Δ ref:** `+{dc}` → ≈ **₹{ce_ref:,}**")
                     if dp:
-                        st.markdown(f"**PE Short Δ:** `{dp}` → Strike ≈ **₹{pe_strike:,}** "
-                                    f"(~{abs(dp)*100:.0f}% OTM put)")
+                        st.markdown(f"**LUT PE short Δ ref:** `{dp}` → ≈ **₹{pe_ref:,}**")
                     st.markdown(
-                        f"**Theta check:** Combined theta must be ≥ **{lut['th']} pts/day** "
-                        f"({lut['tc']}% of ₹1,20,000). Sum theta × {lot} for all short legs from chain.")
+                        f"**Theta check:** Combined short-leg theta ≥ **{lut['th']} pts/day** "
+                        f"({lut['tc']}% of **₹1,25,000 per short leg**). Sum theta × {lot} for each short.")
                     st.markdown(
-                        f"**Gamma limit:** Short leg gamma ≤ **{gam['max']}**. {gam['rule']}.")
+                        f"**Gamma limit:** Short gamma ≤ **{gam['max']}**. {gam['rule']}.")
                     st.markdown("---")
                     col_do, col_dont = st.columns(2)
                     with col_do:
@@ -762,20 +917,19 @@ with tab2:
                              if bt_iv_sel == ">22%" else
                              "- Don't ignore rising VIX trend before entry"))
 
-                # ── Greeks ─────────────────────────────────────────────────────
-                with t_greeks:
+                # ── Greeks (expander) ──────────────────────────────────────────
+                with st.expander("📐 Greeks — ranked by criticality", expanded=False):
                     gp = BT_GP.get(lut["st"], BT_GP["ss"])
-                    st.info(f"Greeks ranked by criticality for **{lut['s']}**. "
-                            f"Check IN ORDER — first two are your go/no-go gates.")
+                    st.info(f"Greeks for **{lut['s']}**. Check IN ORDER — first two are go/no-go gates.")
                     order = sorted(gp.items(),
-                                   key=lambda x: {"critical":0,"important":1,"monitor":2,"low":3}[x[1][0]])
+                                   key=lambda x: {"critical": 0, "important": 1, "monitor": 2, "low": 3}[x[1][0]])
                     vals = {
-                        "delta": f"Net Δ target: {'≈ 0.00 (both legs cancel)' if dc and dp else (f'~+{dc} net' if dc else f'~{dp} net')}",
-                        "gamma": f"Max: {gam['max']} · Exit threshold: {gam['exit']}",
-                        "theta": f"Min: {lut['th']} pts/day · {lut['tc']}% of ₹1,20,000 capital",
-                        "vega":  "Watch India VIX trend direction before and during trade",
+                        "delta": f"Net Δ target: {'≈ 0.00' if dc and dp else (f'~+{dc}' if dc else f'~{dp}')}",
+                        "gamma": f"Max: {gam['max']} · Exit: {gam['exit']}",
+                        "theta": f"Min: {lut['th']} pts/day · {lut['tc']}% of ₹1,25,000 / short leg / day",
+                        "vega": "Watch India VIX trend before and during trade",
                     }
-                    gsym = {"delta":"Δ","gamma":"Γ","theta":"Θ","vega":"V"}
+                    gsym = {"delta": "Δ", "gamma": "Γ", "theta": "Θ", "vega": "V"}
                     gc1, gc2 = st.columns(2)
                     for i, (gname, (level, note)) in enumerate(order):
                         col = gc1 if i % 2 == 0 else gc2
@@ -789,92 +943,17 @@ with tab2:
                                 f'<span style="font-size:11px;color:#808495;">{note}</span></div>',
                                 unsafe_allow_html=True)
 
-                # ── P&L Result ─────────────────────────────────────────────────
-                with t_pnl:
-                    st.info(
-                        f"Entry date: **{bt_date.strftime('%Y-%m-%d')}** at 15:00 close · "
-                        f"Exit date: **{exit_date.strftime('%Y-%m-%d')}** ({bt_exit_mode})")
-                    rows_data = []
-                    _s = {"pnl": 0, "has_exit": True}  # mutable state for leg accumulator
-
-                    def _add_leg(strike, otype, label):
-                        if not strike: return
-                        if is_historical:
-                            e_p, x_p = bt_get_prem(bt_df, bt_date, exit_date,
-                                                    bt_expiry, strike, otype)
-                            src = "● real"
-                        else:
-                            chain2 = st.session_state.get("nifty_chain", {})
-                            e_p = ltp_from_chain(chain2, strike,
-                                                 "call" if otype=="CE" else "put") if chain2 else None
-                            if not e_p:
-                                off = abs(strike/bt_spot_val - 1)
-                                e_p = round(max(5.0, 1267*max(0.3,1-(off-0.005)/0.02)
-                                               *(bt_iv_val/0.14)/lot), 1)
-                            x_p  = None
-                            src  = "~ est"
-                        leg_pnl = round((e_p - x_p) * lot) if (e_p and x_p) else None
-                        if leg_pnl is not None:
-                            _s["pnl"] += leg_pnl
-                        else:
-                            _s["has_exit"] = False
-                        rows_data.append({
-                            "Leg": label, "Strike": f"₹{strike:,}", "Type": otype,
-                            "Entry Prem": f"₹{e_p:.1f}" if e_p else "—",
-                            "Exit Prem":  f"₹{x_p:.1f}" if x_p else "pending",
-                            "P&L / Lot":  f"₹{leg_pnl:+,.0f}" if leg_pnl is not None else "~ est",
-                            "Source": src,
-                        })
-
-                    if ce_strike: _add_leg(ce_strike, "CE", "Short Call")
-                    if pe_strike: _add_leg(pe_strike, "PE", "Short Put")
-                    total_pnl = _s["pnl"]; has_exit = _s["has_exit"]
-
-                    if rows_data:
-                        df_legs = pd.DataFrame(rows_data)
-
-                        def _style_legs(df):
-                            def _rc(col):
-                                if col.name == "P&L / Lot":
-                                    return [("color:#21c55d" if "+" in str(v) else
-                                             "color:#ef4444" if "-" in str(v) else "")
-                                            for v in col]
-                                if col.name == "Type":
-                                    return [("color:#3b82f6" if v=="CE" else
-                                             "color:#ef4444" if v=="PE" else "")
-                                            for v in col]
-                                if col.name == "Source":
-                                    return [("color:#21c55d" if "real" in str(v) else "color:#6b7280")
-                                            for v in col]
-                                return [""]*len(col)
-                            return df.style.apply(_rc)
-
-                        st.dataframe(_style_legs(df_legs),
-                                     use_container_width=True, hide_index=True)
-
-                        r1, r2, r3 = st.columns(3)
-                        if is_historical and has_exit:
-                            outcome = "✅ PROFIT" if total_pnl > 0 else "❌ LOSS"
-                            r1.metric("Actual P&L (1 lot)", f"₹{total_pnl:+,.0f}", outcome)
-                            r2.metric("LUT Avg Expected", f"₹{lut['pnl']:+,}")
-                            diff = round((total_pnl - lut["pnl"]) / max(abs(lut["pnl"]), 1) * 100)
-                            r3.metric("vs LUT Expected", f"{diff:+.0f}%",
-                                      "above avg" if diff > 0 else "below avg")
-                        else:
-                            r1.metric("Estimated Max P&L", f"~₹{lut['th']*lot:,.0f}",
-                                      "if both legs expire OTM")
-                            r2.metric("LUT Avg Expected", f"₹{lut['pnl']:+,}")
-                            r3.metric("Status", "⏳ Pending — exit date not reached")
-                    else:
-                        st.info("Select a strategy with defined delta targets to see P&L details.")
-
     with st.expander("Glossary"):
         st.markdown("""
 **LUT (Look-up Table)** — 60-entry map from backtest (Oct 2024–Mar 2026, ~1,840 trades). Maps `DTE | IV band | Trend` → recommended strategy + win rate + avg P&L + theta/gamma rules.
 
-**Historical Mode** — Date ≤ Mar 24 2026: all premiums are real 15:00 close prices from the CSV database. P&L is actual.
+**Historical Mode** — Date ≤ Mar 24 2026: entry premium at chosen **entry bar** (10:00 / 14:00 / 15:00); exit at **15:00** on exit date.
 
-**Live Mode** — Date > Mar 24 2026: entry premium from DhanHQ option chain (or estimated). Exit P&L estimated from LUT avg until expiry passes.
+**Live Mode** — Date > Mar 24 2026: entry from DhanHQ chain (or estimated). Exit pending until expiry.
+
+**Strike distance** — Slider default: T-1 → 2%, T-2 → 3.5%, T-3 → 5%, T-4 → 6%. Spreads & Iron Condor use **+1%** further OTM for long legs.
+
+**Capital** — **₹1,25,000 per short leg** (NIFTY). Strangle/IC (2 shorts) = ₹2,50,000. Bull put / Bear call (1 short) = ₹1,25,000. Return % = P&L ÷ total short capital.
 
 **Expiry rule** — Before Sep 2025: Thursday. From Sep 2025 onward: Tuesday (NSE rule change).
 
@@ -882,7 +961,7 @@ with tab2:
 
 **IV Band** — ATM straddle IV derived using Brenner-Subrahmanyam approximation from actual CE+PE close prices.
 
-**Theta/Capital** — Daily theta ÷ ₹1,20,000. Must meet LUT minimum; if not, premium is too thin for the risk.
+**Theta/Capital** — Daily theta ÷ **₹1,25,000 per short leg**. Must meet LUT minimum.
 
 **Gamma limit** — Maximum short-leg gamma before forced exit. Accelerates sharply near expiry — the primary risk for naked short strategies.
         """)
