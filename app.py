@@ -380,9 +380,20 @@ def load_bt_df():
     df["hhmm"]  = df["timestamp_30m"].dt.strftime("%H:%M")
     return df
 
+def bt_expiry_dates_as_date(df):
+    """All unique expiry dates as Python `date` (avoids dtype mismatches vs `date_input`)."""
+    if df is None or df.empty:
+        return set()
+    return set(pd.to_datetime(df["edate"]).dt.date)
+
+
+def bt_expiries_on_or_after(df, trade_d):
+    return sorted(e for e in bt_expiry_dates_as_date(df) if e >= trade_d)
+
+
 def bt_find_expiry(df, d):
     """Nearest expiry on or after trade date (includes same-day expiry sessions)."""
-    fut = sorted(df[df["edate"] >= d]["edate"].unique())
+    fut = bt_expiries_on_or_after(df, d)
     return fut[0] if fut else None
 
 def bt_get_spot_at(df, d, hhmm):
@@ -451,8 +462,13 @@ def bt_build_legs(spot, dist_pct, stype, rnd):
     if stype == "ws":
         return [("Long Put", pe_s, "PE", "long"), ("Long Call", ce_s, "CE", "long")]
     if stype == "ic":
-        return [("Short Put", pe_s, "PE", "short"), ("Long Put", pe_l, "PE", "long"),
-                ("Short Call", ce_s, "CE", "short"), ("Long Call", ce_l, "CE", "long")]
+        # Inner shorts closer to spot; outer longs are wings (put wing lower strike, call wing higher).
+        return [
+            ("Short Put (inner)", pe_s, "PE", "short"),
+            ("Short Call (inner)", ce_s, "CE", "short"),
+            ("Long Put (wing)", pe_l, "PE", "long"),
+            ("Long Call (wing)", ce_l, "CE", "long"),
+        ]
     if stype == "bp":
         return [("Short Put", pe_s, "PE", "short"), ("Long Put", pe_l, "PE", "long")]
     if stype == "bc":
@@ -668,13 +684,45 @@ with tab2:
             key="bt_entry_hhmm",
             help="Premiums at this timestamp on trade date. Exit always uses 15:00 on exit date.")
     with s1c3:
-        bt_exit_mode = st.selectbox("Exit Timing",
-                                    ["T-1 Close (day before expiry)",
-                                     "T Close (expiry day close)"],
-                                    key="bt_exit2")
+        _exit_opts = [
+            "T Close (expiry day close)",
+            "T-1 Close (day before expiry)",
+        ]
+        if "bt2_exit_sel" not in st.session_state:
+            st.session_state["bt2_exit_sel"] = _exit_opts[0]
+        bt_exit_mode = st.selectbox(
+            "Exit Timing",
+            _exit_opts,
+            key="bt2_exit_sel",
+            help="Default: hold through expiry-day 15:00 close.",
+        )
     exit_is_T1   = "T-1" in bt_exit_mode
     bt_exit_hhmm = "15:00"
     is_historical = (not bt_df.empty) and (bt_date <= BT_CSV_END)
+
+    bt_expiry_from_picker = None
+    _csv_expiry_dates = bt_expiry_dates_as_date(bt_df)
+    _on_expiry_session = is_historical and bt_date in _csv_expiry_dates
+    if _on_expiry_session:
+        _pick = bt_expiries_on_or_after(bt_df, bt_date)[:2]
+        if _pick:
+            st.info(
+                "📅 **Expiry session** — this trade date is a listed expiry in the CSV. "
+                "Pick **same day (0DTE)** or **next weekly expiry**; metrics and P&L use your choice."
+            )
+
+            def _fmt_expiry_choice(ed):
+                if ed == bt_date:
+                    return f"{ed} — same day (0DTE)"
+                return f"{ed} — next expiry ({ed.strftime('%A')})"
+
+            bt_expiry_from_picker = st.selectbox(
+                "Nearest expiry (choose series)",
+                _pick,
+                format_func=_fmt_expiry_choice,
+                key=f"bt_expiry_pick_{bt_date}",
+                help="Same day = options expiring that session. Next = following week’s expiry in the file.",
+            )
 
     if is_historical:
         st.success("📁 **Historical Mode — Real P&L** · CSV premiums at **entry** bar + **15:00** on exit date.")
@@ -683,6 +731,7 @@ with tab2:
 
     # Snapshot
     bt_valid = True
+    bt_expiry = None
     if is_historical:
         _sp = bt_get_spot_at(bt_df, bt_date, bt_entry_hhmm)
         if _sp is None:
@@ -692,7 +741,10 @@ with tab2:
             bt_valid = False
         else:
             bt_spot_val = _sp
-            bt_expiry   = bt_find_expiry(bt_df, bt_date)
+            if bt_expiry_from_picker is not None:
+                bt_expiry = bt_expiry_from_picker
+            else:
+                bt_expiry = bt_find_expiry(bt_df, bt_date)
             if bt_expiry is None:
                 st.error("Could not find a future expiry in data for this date.")
                 bt_valid = False
@@ -853,7 +905,7 @@ div[data-testid="stSlider"] [role="slider"] {
                     strike_note = (f"Long Strangle (wide): long PUT −{dist_pct:.1f}% / long CALL +{dist_pct:.1f}% "
                                    f"(LUT ref short-Δ targets PE {dp} / CE {dc} — debit strategy)")
                 elif stype == "ic":
-                    strike_note = (f"Iron Condor: shorts ±{dist_pct:.1f}%, longs ±{dist_pct+1:.1f}% "
+                    strike_note = (f"Iron Condor: **inner** shorts ±{dist_pct:.1f}%, **wing** longs ±{dist_pct+1:.1f}% "
                                    f"(1% buffer) · LUT ref Δ PE {dp} / CE {dc}")
                 elif stype == "bp":
                     strike_note = (f"Bull Put Spread: short PUT −{dist_pct:.1f}%, long PUT −{dist_pct+1:.1f}% "
@@ -936,6 +988,13 @@ div[data-testid="stSlider"] [role="slider"] {
                             return [""] * len(col)
                         return df.style.apply(_rc)
 
+                    if stype == "ic":
+                        st.caption(
+                            "**Iron condor geometry:** inner **shorts** sit closer to spot than outer **long** wings. "
+                            "Calls: inner strike **below** wing strike — inner call is less OTM so entry premium is "
+                            "typically **higher** than the wing. Puts: inner strike **above** wing strike — same idea. "
+                            "Premiums are from the CSV at your entry/exit timestamps."
+                        )
                     st.dataframe(_style_legs(df_legs), use_container_width=True, hide_index=True)
 
                     r1, r2, r3, r4 = st.columns(4)
