@@ -702,13 +702,22 @@ def val_kite_legs_dataframe(val_spot, dist_pct, strat_name, stype_v, rnd_v, val_
     return pd.DataFrame(rows)
 
 
+def _kite_secret_str(v):
+    """Strip Streamlit/TOML paste noise; empty after strip means missing."""
+    if v is None:
+        return ""
+    return str(v).strip()
+
+
 def val_kite_live_configured():
     try:
         k = st.secrets.get("kite", {})
         en = k.get("enable_live")
         if isinstance(en, str):
             en = en.strip().lower() in ("1", "true", "yes", "on")
-        return bool(en and k.get("api_key") and k.get("access_token"))
+        ak = _kite_secret_str(k.get("api_key"))
+        at = _kite_secret_str(k.get("access_token"))
+        return bool(en and ak and at)
     except Exception:
         return False
 
@@ -784,13 +793,29 @@ def val_kite_try_place_orders(order_records, val_exp_date):
         )
     try:
         ksec = st.secrets["kite"]
-        api_key = ksec["api_key"]
-        access_token = ksec["access_token"]
+        api_key = _kite_secret_str(ksec.get("api_key"))
+        access_token = _kite_secret_str(ksec.get("access_token"))
     except Exception as e:
         return False, f"Secrets `[kite]` read error: {e}"
 
+    if not api_key or not access_token:
+        return False, (
+            "Secrets `[kite]` has empty **api_key** or **access_token** after trimming spaces. "
+            "Paste the full values (no leading/trailing blank lines)."
+        )
+
     kite = KiteConnect(api_key=api_key)
     kite.set_access_token(access_token)
+
+    try:
+        kite.profile()
+    except Exception as e:
+        return False, (
+            "Kite rejected the session (**profile** failed). Usually: **access_token** expired (daily), "
+            "or it was generated with a **different** Connect app **api_key** than the one in Secrets, "
+            "or a copy-paste error. Regenerate token from the login URL for this api_key and update Secrets. "
+            f"Detail: `{e}`"
+        )
 
     try:
         nfo = kite.instruments("NFO")
@@ -831,7 +856,14 @@ def val_kite_try_place_orders(order_records, val_exp_date):
             )
             placed_ids.append(f"{tsym}→{oid}")
         except Exception as e:
-            return False, f"Kite rejected order **{tsym}**: `{e}`. Placed so far: {placed_ids or 'none'}"
+            es = str(e).lower()
+            hint = ""
+            if "api_key" in es or "access_token" in es or "incorrect" in es:
+                hint = (
+                    " If this mentions api_key/access_token, fix Secrets: same **api_key** + fresh **access_token** "
+                    "from today’s login flow; no extra spaces."
+                )
+            return False, f"Kite rejected order **{tsym}**: `{e}`. Placed so far: {placed_ids or 'none'}{hint}"
 
     return True, f"Submitted **{len(placed_ids)}** market NRML leg(s): {'; '.join(placed_ids)}"
 
