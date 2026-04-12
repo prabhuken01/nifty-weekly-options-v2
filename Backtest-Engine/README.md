@@ -9,10 +9,13 @@ Historical backtesting and strategy validation for NIFTY short strangle.
 - Configurable entry/exit times and exclusions
 
 ## Components
-- `validate_strategy.py` - Strategy validation and data fetching
+- `validate_strategy.py` — Strategy validation and data fetching
+- `validate_sample_trade.py` — Quick CSV sanity check (sample date; mirrors Tab 2 entry/exit bars)
+- `nifty_options_framework_v2.html` / `nifty_options_framework_v3.html` — UI / spec reference for Tab 2
 
 ## Integration
-Used by `app.py` Tab 1 to display backtested performance metrics.
+- `app.py` **Tab 1** — live signal grids
+- `app.py` **Tab 2** — historical simulator reads `final_merged_output_30m_strike_within_6pct.csv`
 
 ## Data Sources
 - NSE Bhavcopy (free, T+1)

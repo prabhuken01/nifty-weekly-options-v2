@@ -225,20 +225,14 @@ with st.sidebar:
                f"Call: +{dist_pct:.1f}% to +{dist_pct+4*step_pct:.1f}%")
     st.markdown("---")
 
-    # ── SECTION 2: Backtest + Signal Filters ─────────────────────────────────
-    st.markdown("### 2️⃣ Backtest & Filters")
-    _b1, _b2 = st.columns(2)
-    with _b1:
-        lookback_m = st.selectbox("Lookback", [6,12,24,36], index=1, key="lookback",
-                                   format_func=lambda x: f"{x}m")
-    with _b2:
-        sig_thresh = st.number_input("Score thr.", 50, 90, 65, key="sig_thresh")
-    entry_time = st.selectbox("Entry", ["T-2 close","T-1 open","T-1 close","T open","T close"], key="entry")
-    exit_time  = st.selectbox("Exit",  ["T-1 close","T open","T close"], key="exit")
-    ivp_range  = st.slider("IVP regime (%)", 0, 100, (20,80), key="ivp")
-    _f1, _f2 = st.columns(2)
-    with _f1:
-        excl_fri = st.toggle("Excl. Friday", value=True, key="excl_fri")
+    # ── SECTION 2: Live signal filters (Tab 1 only; Tab 2 has its own controls) ─
+    st.markdown("### 2️⃣ Live Signal Filters")
+    sig_thresh = st.number_input("Score threshold", 50, 90, 65, key="sig_thresh",
+                                 help="Used in Tab 1 — composite score SELL / MONITOR / AVOID")
+    ivp_range  = st.slider("IVP regime (%)", 0, 100, (20,80), key="ivp",
+                           help="Tab 1 regime filter on mock IVP")
+    excl_fri = st.toggle("Excl. Friday (caption)", value=True, key="excl_fri",
+                         help="Shown in Tab 1 top bar caption only")
 
 # ── Live data ─────────────────────────────────────────────────────────────────
 _ltp   = fetch_ltp(tok)   if tok else None
