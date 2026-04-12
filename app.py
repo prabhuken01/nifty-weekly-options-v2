@@ -7,7 +7,7 @@ import pandas as pd
 import numpy as np
 from scipy.stats import norm
 from datetime import date, timedelta, datetime
-import math, requests, sys, os, re
+import math, requests, sys, os, re, json
 
 for d in ['Live-Signal-Generator', 'Live-fetching']:
     p = os.path.join(os.path.dirname(__file__), d)
@@ -672,6 +672,63 @@ def bt_build_legs(spot, dist_pct, stype, rnd):
     if stype == "bc":
         return [("Short Call", ce_s, "CE", "short"), ("Long Call", ce_l, "CE", "long")]
     return [("Short Put", pe_s, "PE", "short"), ("Short Call", ce_s, "CE", "short")]
+
+
+def val_leg_otm_pct(spot, strike, otype):
+    if not spot or spot <= 0:
+        return None
+    if otype == "PE":
+        return round((spot - strike) / spot * 100.0, 2)
+    return round((strike - spot) / spot * 100.0, 2)
+
+
+def val_kite_legs_dataframe(val_spot, dist_pct, strat_name, stype_v, rnd_v, val_exp, lot_v):
+    """Per-leg rows: geometry names match bt_build_legs (inner / wing for IC)."""
+    legs = bt_build_legs(val_spot, dist_pct, stype_v, rnd_v)
+    rows = []
+    for lbl, stk, otype, side in legs:
+        otm = val_leg_otm_pct(val_spot, float(stk), otype)
+        sym = f"NIFTY {val_exp.strftime('%d%b%y').upper()} {int(stk)} {otype}"
+        rows.append({
+            "Strategy": strat_name,
+            "Geometry": lbl,
+            "Strike": int(stk),
+            "CE/PE": otype,
+            "Action": "SELL" if side == "short" else "BUY",
+            "% OTM vs spot": otm,
+            "Qty / lot": lot_v,
+            "NFO hint": sym,
+        })
+    return pd.DataFrame(rows)
+
+
+def val_kite_live_configured():
+    try:
+        k = st.secrets.get("kite", {})
+        return bool(k.get("enable_live") and k.get("api_key") and k.get("access_token"))
+    except Exception:
+        return False
+
+
+def val_kite_try_place_orders(order_records):
+    """
+    Zerodha Kite: requires `pip install kiteconnect` + Secrets `[kite]`:
+    enable_live, api_key, access_token. Instrument tokens must be resolved per symbol — not automated here.
+    """
+    if not val_kite_live_configured():
+        return False, (
+            "Live API off: add Streamlit Secrets `[kite]` with `enable_live = true`, `api_key`, `access_token` "
+            "and install `kiteconnect`. NFO `tradingsymbol` must match Zerodha (use instrument dump / lookup)."
+        )
+    try:
+        import kiteconnect  # noqa: F401
+    except ImportError:
+        return False, "Install `kiteconnect` on the server to enable placement."
+    return False, (
+        "Live `place_order` not wired to instrument_token lookup in this build — use payload below in Kite web "
+        "basket or extend `val_kite_try_place_orders` with your symbol→token map."
+    )
+
 
 def bt_next_expiry_live(d):
     """For live dates: Tuesday expiry (current NSE rule)."""
@@ -1581,232 +1638,305 @@ with tab_val:
         _vsp = (bt_get_spot_at(_val_bt_df, val_date, val_entry_hhmm)
                 or bt_get_spot(_val_bt_df, val_date))
         if _vsp is None:
-            st.error("No data for this date — try a nearby trading day.")
+            _vsp = st.session_state.get("nifty_spot_live") or SPOT.get("NIFTY 50")
+        if _vsp is None:
+            st.error(
+                "No spot — use a CSV trading day, or set **Dhan token** + **Fetch Live Chain** for Nifty LTP.")
         else:
-            val_spot     = _vsp
-            val_exp      = bt_find_expiry(_val_bt_df, val_date)
+            val_spot = float(_vsp)
+            val_exp = bt_find_expiry(_val_bt_df, val_date)
             if val_exp is None:
-                st.error("No expiry found after this date in CSV.")
-            else:
-                val_dte_days = effective_dte(val_date, val_exp)
-                val_iv_val, _, _vatm = bt_iv_straddle(
-                    _val_bt_df, val_date, val_exp, val_spot, val_entry_hhmm)
-                val_iv_pct  = round(val_iv_val * 100, 1)
-                val_dte_lbl = dte_label(val_date, val_exp, val_dte_days)
-                val_iv_band = iv_band(val_iv_pct)
+                _exs = st.session_state.get("nifty_exp_used") or st.session_state.get("nifty_exp")
+                if isinstance(_exs, str) and _exs and _exs != "—":
+                    val_exp = parse_exp(_exs)
+            if val_exp is None:
+                val_exp = bt_next_expiry_live(val_date)
 
-                mi1, mi2, mi3, mi4, mi5 = st.columns(5)
-                mi1.metric("Spot",   f"₹{val_spot:,.0f}")
-                mi2.metric("Expiry", val_exp.strftime("%Y-%m-%d"))
-                mi3.metric("DTE",    val_dte_lbl, f"{val_dte_days} trading days")
-                mi4.metric("IV%",    f"{val_iv_pct}%", val_iv_band)
-                mi5.metric("Trend",  val_trend)
-                st.markdown("---")
+            _csv_spot = (bt_get_spot_at(_val_bt_df, val_date, val_entry_hhmm)
+                         or bt_get_spot(_val_bt_df, val_date))
+            if _csv_spot is None:
+                st.info(
+                    "📡 **Spot from live feed** (no CSV row for this date) — geometry below is valid; "
+                    "P&L may be **missing** without CSV premiums.")
+            if bt_find_expiry(_val_bt_df, val_date) is None:
+                st.caption(
+                    f"📅 **Expiry** from sidebar **Nifty Exp** or next weekly rule → **{val_exp}**.")
 
-                STRAT_TYPES = [
-                    ("Short Strangle",    "ss", val_dist_pct),
-                    ("Wide Strangle",     "ws", val_dist_pct),
-                    ("Iron Condor",       "ic", val_dist_pct),
-                    ("Bull Put Spread",   "bp", val_dist_pct),
-                    ("Bear Call Spread",  "bc", val_dist_pct),
-                ]
+            val_dte_days = effective_dte(val_date, val_exp)
+            val_iv_val, _, _vatm = bt_iv_straddle(
+                _val_bt_df, val_date, val_exp, val_spot, val_entry_hhmm)
+            val_iv_pct  = round(val_iv_val * 100, 1)
+            val_dte_lbl = dte_label(val_date, val_exp, val_dte_days)
+            val_iv_band = iv_band(val_iv_pct)
 
-                lut_dte_k    = bt_lut_dte_key(val_dte_lbl)
-                lut_rec_key  = f"{lut_dte_k}|{val_iv_band}|{val_trend}"
-                lut_rec      = BT_LUT.get(lut_rec_key)
-                lut_rec_base = lut_strategy_base(lut_rec) if lut_rec else ""
+            mi1, mi2, mi3, mi4, mi5 = st.columns(5)
+            mi1.metric("Spot",   f"₹{val_spot:,.0f}")
+            mi2.metric("Expiry", val_exp.strftime("%Y-%m-%d"))
+            mi3.metric("DTE",    val_dte_lbl, f"{val_dte_days} trading days")
+            mi4.metric("IV%",    f"{val_iv_pct}%", val_iv_band)
+            mi5.metric("Trend",  val_trend)
+            st.markdown("---")
 
-                rnd_v      = ROUND["NIFTY 50"]
-                lot_v      = LOT["NIFTY 50"]
-                _vexp_spot = (bt_get_spot_at(_val_bt_df, val_exp, "15:00")
-                              or bt_get_spot(_val_bt_df, val_exp))
+            STRAT_TYPES = [
+                ("Short Strangle",    "ss", val_dist_pct),
+                ("Wide Strangle",     "ws", val_dist_pct),
+                ("Iron Condor",       "ic", val_dist_pct),
+                ("Bull Put Spread",   "bp", val_dist_pct),
+                ("Bear Call Spread",  "bc", val_dist_pct),
+            ]
 
-                rows_val = []
-                for strat_name, stype_v, dist_v in STRAT_TYPES:
-                    legs_v = bt_build_legs(val_spot, dist_v, stype_v, rnd_v)
-                    pnl_total, pnl_ok = 0, True
-                    ce_short, pe_short = None, None
-                    ce_any, pe_any = None, None
-                    for _lbl, _stk, _otype, _side in legs_v:
-                        if _otype == "CE":
-                            ce_any = _stk
-                        if _otype == "PE":
-                            pe_any = _stk
-                        e_p = bt_prem_at(
-                            _val_bt_df, val_date, val_exp, _stk, _otype, val_entry_hhmm)
-                        x_p = bt_prem_at(
-                            _val_bt_df, val_exp, val_exp, _stk, _otype, "15:00")
-                        if x_p is None and _side == "long" and _vexp_spot is not None:
-                            x_p = max(0.0, (_vexp_spot - _stk) if _otype == "CE" else (_stk - _vexp_spot))
-                        if e_p is None or x_p is None:
-                            pnl_ok = False
-                            break
-                        if _side == "short":
-                            pnl_total += round((e_p - x_p) * lot_v)
-                            if _otype == "CE":
-                                ce_short = _stk
-                            if _otype == "PE":
-                                pe_short = _stk
-                        else:
-                            pnl_total += round((x_p - e_p) * lot_v)
-                    brokerage = round(40 * len(legs_v), 0)
-                    net_pnl   = (pnl_total - brokerage) if pnl_ok else None
-                    rows_val.append({
-                        "Strategy":   strat_name,
-                        "Type":       stype_v.upper(),
-                        "Dist%":      dist_v,
-                        "CE Strike":  ce_short if ce_short is not None else ce_any,
-                        "PE Strike":  pe_short if pe_short is not None else pe_any,
-                        "Gross P&L":  round(pnl_total, 0) if pnl_ok else None,
-                        "Brokerage":  brokerage if pnl_ok else None,
-                        "Net P&L":    net_pnl,
-                        "Data":       "✅ real" if pnl_ok else "⚠️ missing",
-                    })
-                df_val = pd.DataFrame(rows_val)
+            rnd_v = ROUND["NIFTY 50"]
+            lot_v = LOT["NIFTY 50"]
 
-                _ss_p = df_val.loc[(df_val["Type"] == "SS") & (df_val["Dist%"] == val_dist_pct), "Net P&L"]
-                _ic_p = df_val.loc[(df_val["Type"] == "IC") & (df_val["Dist%"] == val_dist_pct), "Net P&L"]
-                viol_ic = False
-                if not _ss_p.empty and not _ic_p.empty:
-                    try:
-                        sv, iv = float(_ss_p.values[0]), float(_ic_p.values[0])
-                        if sv < 0 and iv < sv:
-                            viol_ic = True
-                    except Exception:
-                        pass
-
-                if val_iv_band == "<13%":
-                    st.caption(
-                        "📉 **<13% IV** — premiums are thin; **Short Strangle still appears** in the table "
-                        "below for comparison with spreads/condors.")
-
-                st.markdown(
-                    f"#### All strategies — Entry {val_date} `{val_entry_hhmm}` | Expiry {val_exp} "
-                    f"| {val_dte_lbl} | IV {val_iv_pct}%")
-                if lut_rec:
-                    st.success(
-                        f"🏆 LUT Rec `{lut_rec_key}`: **{lut_strategy_display(lut_rec)}**")
-                    st.caption(
-                        "SS appears as LUT rec only for DTE **T-2 / T-3 / T-4** + **IV ≥15%** + "
-                        "**NEUTRAL / BEARISH**. Pick a T-2 or T-3 date with **IV 15–18%+** to see it in the LUT.")
-
-                if show_profitable_only:
-                    df_val = df_val[
-                        df_val["Net P&L"].apply(
-                            lambda v: v is not None
-                            and not (isinstance(v, float) and np.isnan(float(v)))
-                            and float(v) > 0)]
-
-                def _badge(row):
-                    sn, t = row["Strategy"], row["Type"]
-                    b = ""
-                    if viol_ic and t == "IC":
-                        b += " ⚠️IC>SS"
-                    if lut_rec and t == lut_rec.get("st", "").upper():
-                        if norm_strategy_name(sn) == lut_rec_base:
-                            b += " 🏆LUT"
-                    return sn + b
-
-                df_disp = df_val.copy()
-                df_disp["Strategy"] = df_disp.apply(_badge, axis=1)
-
-                show_cols = [
-                    "Strategy", "Type", "Dist%", "CE Strike", "PE Strike",
-                    "Gross P&L", "Brokerage", "Net P&L", "Data",
-                ]
-                _disp = df_disp[show_cols].copy()
-
-                def _pnl_color(s):
-                    out = []
-                    for v in s:
-                        try:
-                            fv = float(v)
-                            if np.isnan(fv):
-                                out.append("")
-                            elif fv > 0:
-                                out.append("background-color: rgba(0,200,150,0.18); color: #6ee7b7; font-weight: 600")
-                            elif fv < 0:
-                                out.append("background-color: rgba(255,77,77,0.15); color: #fca5a5; font-weight: 600")
-                            else:
-                                out.append("color: #e5e7eb")
-                        except (TypeError, ValueError):
-                            out.append("")
-                    return out
-
-                def _ru_fmt(v):
-                    if v is None or (isinstance(v, float) and np.isnan(v)):
-                        return "—"
-                    try:
-                        return f"₹{float(v):+,.0f}"
-                    except (TypeError, ValueError):
-                        return "—"
-
-                def _ru_plain(v):
-                    if v is None or (isinstance(v, float) and np.isnan(v)):
-                        return "—"
-                    try:
-                        return f"₹{float(v):,.0f}"
-                    except (TypeError, ValueError):
-                        return "—"
-
-                _styled = (
-                    _disp.style
-                    .apply(_pnl_color, subset=["Gross P&L", "Net P&L"], axis=0)
-                    .format({
-                        "Gross P&L": lambda x: _ru_fmt(x),
-                        "Brokerage": lambda x: _ru_plain(x),
-                        "Net P&L": lambda x: _ru_fmt(x),
-                        "CE Strike": lambda x: f"₹{int(x):,}" if x is not None and not (isinstance(x, float) and np.isnan(x)) else "—",
-                        "PE Strike": lambda x: f"₹{int(x):,}" if x is not None and not (isinstance(x, float) and np.isnan(x)) else "—",
-                        "Dist%": lambda x: f"{x:.1f}%" if x is not None and not (isinstance(x, float) and np.isnan(x)) else "—",
-                    }, na_rep="—")
+            _strike_parts = [
+                val_kite_legs_dataframe(val_spot, d, n, t, rnd_v, val_exp, lot_v)
+                for n, t, d in STRAT_TYPES]
+            _strike_all_df = pd.concat(_strike_parts, ignore_index=True)
+            with st.expander(
+                    "📍 **Strike layout — all strategies** (IC inner shorts + wings · SS/WS/BP/BC legs · Kite)",
+                    expanded=True):
+                st.caption(
+                    f"**Spot** ₹{val_spot:,.0f} · **Expiry** {val_exp} · **{val_dist_pct:.1f}%** OTM vs spot on shorts "
+                    f"(spreads / IC add **+1%** wing buffer). **Geometry** column matches engine / Tab 2.")
+                st.dataframe(
+                    _strike_all_df,
+                    use_container_width=True,
+                    hide_index=True,
+                    height=min(520, 60 + len(_strike_all_df) * 34),
                 )
 
-                with st.container(border=True):
-                    st.markdown("**📋 Strategy results** — Gross → Brokerage → **Net** (green / red = profit / loss)")
-                    st.dataframe(
-                        _styled,
-                        use_container_width=True,
-                        hide_index=True,
-                        height=min(520, 76 + len(_disp) * 40),
-                    )
+            lut_dte_k    = bt_lut_dte_key(val_dte_lbl)
+            lut_rec_key  = f"{lut_dte_k}|{val_iv_band}|{val_trend}"
+            lut_rec      = BT_LUT.get(lut_rec_key)
+            lut_rec_base = lut_strategy_base(lut_rec) if lut_rec else ""
 
-                if viol_ic:
-                    st.markdown(
-                        '<span style="background:#E08000;color:#fff;padding:3px 10px;'
-                        'border-radius:12px;font-size:12px;font-weight:700">'
-                        '🟠 IC&gt;SS LOSS VIOLATION — IC loss exceeded SS loss. '
-                        'Long wing exit data was missing in CSV; intrinsic value fallback applied.</span>',
-                        unsafe_allow_html=True)
-                st.markdown("---")
-                st.markdown("#### 🛒 Push to Kite Basket (stub)")
+            _vexp_spot = (bt_get_spot_at(_val_bt_df, val_exp, "15:00")
+                          or bt_get_spot(_val_bt_df, val_exp))
+
+            rows_val = []
+            for strat_name, stype_v, dist_v in STRAT_TYPES:
+                legs_v = bt_build_legs(val_spot, dist_v, stype_v, rnd_v)
+                pnl_total, pnl_ok = 0, True
+                ce_short, pe_short = None, None
+                ce_any, pe_any = None, None
+                for _lbl, _stk, _otype, _side in legs_v:
+                    if _otype == "CE":
+                        ce_any = _stk
+                    if _otype == "PE":
+                        pe_any = _stk
+                    e_p = bt_prem_at(
+                        _val_bt_df, val_date, val_exp, _stk, _otype, val_entry_hhmm)
+                    x_p = bt_prem_at(
+                        _val_bt_df, val_exp, val_exp, _stk, _otype, "15:00")
+                    if x_p is None and _side == "long" and _vexp_spot is not None:
+                        x_p = max(0.0, (_vexp_spot - _stk) if _otype == "CE" else (_stk - _vexp_spot))
+                    if e_p is None or x_p is None:
+                        pnl_ok = False
+                        break
+                    if _side == "short":
+                        pnl_total += round((e_p - x_p) * lot_v)
+                        if _otype == "CE":
+                            ce_short = _stk
+                        if _otype == "PE":
+                            pe_short = _stk
+                    else:
+                        pnl_total += round((x_p - e_p) * lot_v)
+                brokerage = round(40 * len(legs_v), 0)
+                net_pnl   = (pnl_total - brokerage) if pnl_ok else None
+                rows_val.append({
+                    "Strategy":   strat_name,
+                    "Type":       stype_v.upper(),
+                    "Dist%":      dist_v,
+                    "CE Strike":  ce_short if ce_short is not None else ce_any,
+                    "PE Strike":  pe_short if pe_short is not None else pe_any,
+                    "Gross P&L":  round(pnl_total, 0) if pnl_ok else None,
+                    "Brokerage":  brokerage if pnl_ok else None,
+                    "Net P&L":    net_pnl,
+                    "Data":       "✅ real" if pnl_ok else "⚠️ missing",
+                })
+            df_val = pd.DataFrame(rows_val)
+
+            _ss_p = df_val.loc[(df_val["Type"] == "SS") & (df_val["Dist%"] == val_dist_pct), "Net P&L"]
+            _ic_p = df_val.loc[(df_val["Type"] == "IC") & (df_val["Dist%"] == val_dist_pct), "Net P&L"]
+            viol_ic = False
+            if not _ss_p.empty and not _ic_p.empty:
+                try:
+                    sv, iv = float(_ss_p.values[0]), float(_ic_p.values[0])
+                    if sv < 0 and iv < sv:
+                        viol_ic = True
+                except Exception:
+                    pass
+
+            if val_iv_band == "<13%":
                 st.caption(
-                    "Select a strategy row to see order legs. "
-                    "Live placement requires an active Kite Connect session.")
-                _kite_names = [r["Strategy"] for r in rows_val]
-                if not _kite_names:
-                    _kite_names = ["—"]
-                _kite_sel = st.selectbox("Strategy", _kite_names, key="val_kite_sel")
-                _kite_row = next((r for r in rows_val if r["Strategy"] == _kite_sel), None)
-                if _kite_row:
-                    _kl = bt_build_legs(
-                        val_spot, _kite_row["Dist%"], _kite_row["Type"].lower(), rnd_v)
-                    with st.expander(
-                            "📋 Order legs (stub — no live order placed)", expanded=True):
-                        st.markdown(
-                            f"**{_kite_sel}** | Entry: {val_date} | Expiry: {val_exp} "
-                            f"| Capital: ₹{val_capital_rs:,} ({val_capital_pct}% of ₹1,20,000)")
-                        kite_tbl = pd.DataFrame([{
-                            "Leg": lb,
-                            "Instrument": f"NIFTY {val_exp.strftime('%d%b%y').upper()} {int(stk)} {ot}",
-                            "Strike": int(stk), "Type": ot,
-                            "Side": "SELL" if si == "short" else "BUY",
-                            "Qty": lot_v, "Order": "MARKET", "Product": "NRML",
-                        } for lb, stk, ot, si in _kl])
-                        st.dataframe(kite_tbl, use_container_width=True, hide_index=True)
-                        st.info(
-                            "🔌 **To go live:** connect Kite session via Kite MCP "
-                            "and call `place_order()` per row above.")
+                    "📉 **<13% IV** — premiums are thin; **Short Strangle still appears** in the table "
+                    "below for comparison with spreads/condors.")
+
+            st.markdown(
+                f"#### All strategies — Entry {val_date} `{val_entry_hhmm}` | Expiry {val_exp} "
+                f"| {val_dte_lbl} | IV {val_iv_pct}%")
+            if lut_rec:
+                st.success(
+                    f"🏆 LUT Rec `{lut_rec_key}`: **{lut_strategy_display(lut_rec)}**")
+                st.caption(
+                    "SS appears as LUT rec only for DTE **T-2 / T-3 / T-4** + **IV ≥15%** + "
+                    "**NEUTRAL / BEARISH**. Pick a T-2 or T-3 date with **IV 15–18%+** to see it in the LUT.")
+
+            if show_profitable_only:
+                df_val = df_val[
+                    df_val["Net P&L"].apply(
+                        lambda v: v is not None
+                        and not (isinstance(v, float) and np.isnan(float(v)))
+                        and float(v) > 0)]
+
+            def _badge(row):
+                sn, t = row["Strategy"], row["Type"]
+                b = ""
+                if viol_ic and t == "IC":
+                    b += " ⚠️IC>SS"
+                if lut_rec and t == lut_rec.get("st", "").upper():
+                    if norm_strategy_name(sn) == lut_rec_base:
+                        b += " 🏆LUT"
+                return sn + b
+
+            df_disp = df_val.copy()
+            df_disp["Strategy"] = df_disp.apply(_badge, axis=1)
+
+            show_cols = [
+                "Strategy", "Type", "Dist%", "CE Strike", "PE Strike",
+                "Gross P&L", "Brokerage", "Net P&L", "Data",
+            ]
+            _disp = df_disp[show_cols].copy()
+
+            def _pnl_color(s):
+                out = []
+                for v in s:
+                    try:
+                        fv = float(v)
+                        if np.isnan(fv):
+                            out.append("")
+                        elif fv > 0:
+                            out.append("background-color: rgba(0,200,150,0.18); color: #6ee7b7; font-weight: 600")
+                        elif fv < 0:
+                            out.append("background-color: rgba(255,77,77,0.15); color: #fca5a5; font-weight: 600")
+                        else:
+                            out.append("color: #e5e7eb")
+                    except (TypeError, ValueError):
+                        out.append("")
+                return out
+
+            def _ru_fmt(v):
+                if v is None or (isinstance(v, float) and np.isnan(v)):
+                    return "—"
+                try:
+                    return f"₹{float(v):+,.0f}"
+                except (TypeError, ValueError):
+                    return "—"
+
+            def _ru_plain(v):
+                if v is None or (isinstance(v, float) and np.isnan(v)):
+                    return "—"
+                try:
+                    return f"₹{float(v):,.0f}"
+                except (TypeError, ValueError):
+                    return "—"
+
+            _styled = (
+                _disp.style
+                .apply(_pnl_color, subset=["Gross P&L", "Net P&L"], axis=0)
+                .format({
+                    "Gross P&L": lambda x: _ru_fmt(x),
+                    "Brokerage": lambda x: _ru_plain(x),
+                    "Net P&L": lambda x: _ru_fmt(x),
+                    "CE Strike": lambda x: f"₹{int(x):,}" if x is not None and not (isinstance(x, float) and np.isnan(x)) else "—",
+                    "PE Strike": lambda x: f"₹{int(x):,}" if x is not None and not (isinstance(x, float) and np.isnan(x)) else "—",
+                    "Dist%": lambda x: f"{x:.1f}%" if x is not None and not (isinstance(x, float) and np.isnan(x)) else "—",
+                }, na_rep="—")
+            )
+
+            with st.container(border=True):
+                st.markdown("**📋 Strategy results** — Gross → Brokerage → **Net** (green / red = profit / loss)")
+                st.dataframe(
+                    _styled,
+                    use_container_width=True,
+                    hide_index=True,
+                    height=min(520, 76 + len(_disp) * 40),
+                )
+
+            if viol_ic:
+                st.markdown(
+                    '<span style="background:#E08000;color:#fff;padding:3px 10px;'
+                    'border-radius:12px;font-size:12px;font-weight:700">'
+                    '🟠 IC&gt;SS LOSS VIOLATION — IC loss exceeded SS loss. '
+                    'Long wing exit data was missing in CSV; intrinsic value fallback applied.</span>',
+                    unsafe_allow_html=True)
+            st.markdown("---")
+            st.markdown("#### 🛒 Kite Connect — legs & API confirmation")
+            st.caption(
+                "Pick one strategy for **Zerodha** basket. **`tradingsymbol`** must match Kite’s NFO master "
+                "(instrument CSV). **No HTTP call** runs until you tick confirm and press submit.")
+            _kite_names = [r["Strategy"] for r in rows_val]
+            if not _kite_names:
+                _kite_names = ["—"]
+            _kite_sel = st.selectbox("Strategy to push", _kite_names, key="val_kite_sel")
+            _kite_row = next((r for r in rows_val if r["Strategy"] == _kite_sel), None)
+            if _kite_row:
+                _kst = _kite_row["Type"].lower()
+                _kdist = float(_kite_row["Dist%"])
+                _kl = bt_build_legs(val_spot, _kdist, _kst, rnd_v)
+                kite_geom = val_kite_legs_dataframe(
+                    val_spot, _kdist, _kite_sel, _kst, rnd_v, val_exp, lot_v)
+                st.markdown(
+                    f"**{_kite_sel}** · Entry **{val_date}** `{val_entry_hhmm}` · Expiry **{val_exp}** · "
+                    f"Capital context **₹{val_capital_rs:,}** ({val_capital_pct}% of ₹1,20,000)")
+                st.dataframe(
+                    kite_geom,
+                    use_container_width=True,
+                    hide_index=True,
+                    height=min(320, 52 + len(kite_geom) * 36),
+                )
+                kite_api_rows = []
+                for lb, stk, ot, si in _kl:
+                    _sym_hint = f"NIFTY {val_exp.strftime('%d%b%y').upper()} {int(stk)} {ot}"
+                    kite_api_rows.append({
+                        "exchange": "NFO",
+                        "tradingsymbol": _sym_hint.replace(" ", ""),
+                        "symbol_human": _sym_hint,
+                        "geometry_note": lb,
+                        "strike": int(stk),
+                        "instrument_type": ot,
+                        "transaction_type": "SELL" if si == "short" else "BUY",
+                        "order_type": "MARKET",
+                        "product": "NRML",
+                        "quantity": int(lot_v),
+                        "variety": "regular",
+                    })
+                kite_payload = {"orders": kite_api_rows, "remarks": "Verify tradingsymbol vs Kite instrument dump."}
+                _live = val_kite_live_configured()
+                c_yes, c_api = st.columns([2, 1])
+                with c_yes:
+                    _kite_ok = st.checkbox(
+                        "✅ I confirm strikes, expiry, **NRML**, SELL/BUY, qty, and market risk.",
+                        value=False,
+                        key="val_kite_user_confirm",
+                    )
+                with c_api:
+                    st.caption("**Live API**" + (" ✅ secrets" if _live else " ⛔ off"))
+
+                if st.button(
+                        "Submit to Kite API",
+                        type="primary",
+                        disabled=not _kite_ok,
+                        key="val_kite_api_btn"):
+                    _placed, _msg = val_kite_try_place_orders(kite_api_rows)
+                    if _placed:
+                        st.success(_msg)
+                    else:
+                        st.warning(_msg)
+                    st.json(kite_payload)
+
+                if st.button("Show JSON payload only (no API call)", key="val_kite_json_btn"):
+                    st.code(json.dumps(kite_payload, indent=2), language="json")
 
 # ── TAB 3: IV History ─────────────────────────────────────────────────────────
 with tab3:
