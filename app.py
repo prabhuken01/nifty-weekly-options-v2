@@ -991,7 +991,8 @@ div[data-testid="stSlider"] [role="slider"] {
                     1.0, 7.0, float(ddef), 0.5, key="bt_dist_slider",
                     on_change=_sync_val_dist_from_bt2,
                     help="Range 1–7%. Default: T / T-1 → 2% · T-2 → 3.5% · T-3 → 5% · T-4 / T-5 → 6%")
-                st.session_state["bt_dist_slider"] = float(dist_pct)
+                # Do not assign st.session_state["bt_dist_slider"] here — Streamlit forbids
+                # mutating a widget key after the widget is instantiated (same run).
 
                 stype = lut["st"]
                 legs_spec = bt_build_legs(bt_spot_val, dist_pct, stype, rnd)
@@ -1341,7 +1342,7 @@ with tab_val:
             on_change=_sync_bt_dist_from_val,
             help="Synced with Tab 2 strike slider.",
         )
-        st.session_state["bt_dist_slider"] = float(val_dist_pct)
+        # Do not assign st.session_state["bt_dist_slider"] here (widget-key rule); sync is via on_change.
     with vc2:
         val_capital_pct = st.slider(
             "Capital %", 1, 7, 3, key="val_cap_pct",
