@@ -709,17 +709,70 @@ def _kite_secret_str(v):
     return str(v).strip()
 
 
-def val_kite_live_configured():
+def val_kite_live_status():
+    """
+    Returns (ready, user_hint). user_hint is empty when ready; otherwise explains the fix
+    (missing [kite], wrong nesting, enable_live off, empty keys).
+    """
     try:
-        k = st.secrets.get("kite", {})
-        en = k.get("enable_live")
-        if isinstance(en, str):
-            en = en.strip().lower() in ("1", "true", "yes", "on")
-        ak = _kite_secret_str(k.get("api_key"))
-        at = _kite_secret_str(k.get("access_token"))
-        return bool(en and ak and at)
-    except Exception:
-        return False
+        _ = st.secrets
+    except Exception as e:
+        return False, (
+            f"Secrets are not available (`{e}`). "
+            "**Streamlit Cloud:** App → Settings → Secrets. "
+            "**Local run:** create `.streamlit/secrets.toml` in the project folder (gitignored)."
+        )
+
+    if "kite" not in st.secrets:
+        misplaced = ""
+        try:
+            if _kite_secret_str(st.secrets.get("api_key")) or _kite_secret_str(
+                st.secrets.get("access_token")
+            ):
+                misplaced = (
+                    " You have **`api_key` / `access_token` at the top level of Secrets**, "
+                    "but this app only reads them **inside `[kite]`** — move them under that header."
+                )
+        except Exception:
+            pass
+        return False, (
+            "No **`[kite]`** section in Secrets." + misplaced
+            + " Use the template below (exact header + three keys)."
+        )
+
+    try:
+        k = st.secrets["kite"]
+    except Exception as e:
+        return False, f"Cannot read `st.secrets['kite']`: `{e}`"
+
+    en = k.get("enable_live")
+    if isinstance(en, str):
+        en_on = en.strip().lower() in ("1", "true", "yes", "on")
+    else:
+        en_on = bool(en)
+    ak = _kite_secret_str(k.get("api_key"))
+    at = _kite_secret_str(k.get("access_token"))
+
+    missing = []
+    if not en_on:
+        missing.append(
+            "**`enable_live`** is missing or not true — add `enable_live = true` under `[kite]` "
+            "(this flag is required so orders never fire by accident)."
+        )
+    if not ak:
+        missing.append("**`api_key`** is missing or blank under `[kite]`.")
+    if not at:
+        missing.append("**`access_token`** is missing or blank under `[kite]`.")
+
+    if missing:
+        return False, " ".join(missing)
+
+    return True, ""
+
+
+def val_kite_live_configured():
+    ok, _ = val_kite_live_status()
+    return ok
 
 
 def _kite_inst_expiry_date(exp):
@@ -779,10 +832,12 @@ def val_kite_try_place_orders(order_records, val_exp_date):
     Place NRML MARKET orders on NFO. Requires `kiteconnect`, Secrets `[kite]`:
     enable_live, api_key, access_token. Resolves `tradingsymbol` via Kite instrument master.
     """
-    if not val_kite_live_configured():
+    _k_ok, _k_hint = val_kite_live_status()
+    if not _k_ok:
         return False, (
-            "Live API off: in Secrets add `[kite]` with `enable_live = true`, `api_key`, `access_token`. "
-            "Redeploy after adding `kiteconnect` to requirements.txt."
+            _k_hint
+            + " After editing Secrets, **Save** and **Reboot** the app. "
+            "`kiteconnect` must be in **requirements.txt** on Cloud (already in repo — redeploy if needed)."
         )
     try:
         from kiteconnect import KiteConnect
@@ -2050,7 +2105,22 @@ with tab_val:
                         "variety": "regular",
                     })
                 kite_payload = {"orders": kite_api_rows, "remarks": "Verify tradingsymbol vs Kite instrument dump."}
-                _live = val_kite_live_configured()
+                _live, _live_hint = val_kite_live_status()
+                if not _live and _live_hint:
+                    st.warning(_live_hint)
+                    with st.expander("Copy-paste Secrets template (`[kite]` block)", expanded=True):
+                        st.code(
+                            "[kite]\n"
+                            "enable_live = true\n"
+                            'api_key = "paste_your_kite_connect_api_key"\n'
+                            'access_token = "paste_todays_access_token"\n',
+                            language="toml",
+                        )
+                        st.markdown(
+                            "- **Cloud:** App menu → Settings → Secrets → paste the block → Save → Reboot app.\n"
+                            "- **Local:** Save as `.streamlit/secrets.toml` next to `app.py` (do not commit).\n"
+                            "- Keys must sit **under** `[kite]` — not at the top of the file."
+                        )
                 c_yes, c_api = st.columns([2, 1])
                 with c_yes:
                     _kite_ok = st.checkbox(
@@ -2059,7 +2129,7 @@ with tab_val:
                         key="val_kite_user_confirm",
                     )
                 with c_api:
-                    st.caption("**Live API**" + (" ✅ secrets" if _live else " ⛔ off"))
+                    st.caption("**Live API**" + (" ✅ ready" if _live else " ⛔ off"))
 
                 if st.button(
                         "Submit to Kite API",
