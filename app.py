@@ -377,6 +377,167 @@ def top_bar():
     st.info(f"**Regime:** {regime} | IVP {IVP['NIFTY 50']} | DTE {dte_adj} | {'Fri excluded' if excl_fri else 'All days'}")
     st.caption(f"🕐 {PRICE_SRC} | {PRICE_TS} | auto-refresh 1 min")
 
+# ── Backtest Engine helpers ────────────────────────────────────────────────────
+BT_CSV_END = date(2026, 3, 24)
+
+@st.cache_data(show_spinner=False)
+def load_bt_df():
+    p = os.path.join(os.path.dirname(__file__), "Backtest-Engine",
+                     "final_merged_output_30m_strike_within_6pct.csv")
+    if not os.path.exists(p): return pd.DataFrame()
+    df = pd.read_csv(p, parse_dates=["timestamp_30m","expiry"])
+    df["tdate"] = df["timestamp_30m"].dt.date
+    df["edate"] = df["expiry"].dt.date
+    df["hhmm"]  = df["timestamp_30m"].dt.strftime("%H:%M")
+    return df
+
+def bt_find_expiry(df, d):
+    fut = sorted(df[df["edate"] > d]["edate"].unique())
+    return fut[0] if fut else None
+
+def bt_get_spot(df, d):
+    r = df[(df["tdate"]==d) & (df["hhmm"]=="15:00")]
+    return float(r["underlying_spot_close"].iloc[0]) if len(r) else None
+
+def bt_iv_straddle(df, d, ed, spot):
+    rnd = ROUND["NIFTY 50"]
+    atm = int(round(spot/rnd)*rnd)
+    rows = df[(df["tdate"]==d) & (df["edate"]==ed) & (df["hhmm"]=="15:00")]
+    ce = rows[(rows["strike_price"]==atm) & (rows["option_type"]=="CE")]["close"]
+    pe = rows[(rows["strike_price"]==atm) & (rows["option_type"]=="PE")]["close"]
+    if len(ce) and len(pe):
+        stv = float(ce.iloc[0]) + float(pe.iloc[0])
+        T   = effective_dte(d, ed) / 365
+        iv  = round(stv / (0.8 * spot * math.sqrt(T)), 4) if T > 0 else IV_ANN["NIFTY 50"]
+        return iv, round(stv, 1), atm
+    return IV_ANN["NIFTY 50"], None, atm
+
+def bt_get_prem(df, entry_d, exit_d, ed, strike, otype):
+    def _q(d):
+        r = df[(df["tdate"]==d) & (df["edate"]==ed) &
+               (df["strike_price"]==float(strike)) & (df["option_type"]==otype) &
+               (df["hhmm"]=="15:00")]
+        return float(r["close"].iloc[0]) if len(r) else None
+    return _q(entry_d), _q(exit_d)
+
+def bt_next_expiry_live(d):
+    """For live dates: Tuesday expiry (current NSE rule)."""
+    days = (1 - d.weekday()) % 7 or 7
+    exp  = d + timedelta(days=days)
+    while exp in NSE_HOLIDAYS or exp.weekday() >= 5:
+        exp -= timedelta(days=1)
+    return exp
+
+def iv_band(pct):
+    if pct < 13: return "<13%"
+    if pct < 15: return "13-15%"
+    if pct < 18: return "15-18%"
+    if pct < 22: return "18-22%"
+    return ">22%"
+
+def dte_label(d):
+    if d >= 4: return "T-4"
+    if d == 3: return "T-3"
+    if d == 2: return "T-2"
+    return "T-1"
+
+BT_LUT = {
+  "T-4|<13%|NEUTRAL":  {"s":"Iron Condor",      "st":"ic","win":97.6,"pnl":507,  "dc":0.07,"dp":-0.07,"th":12, "tc":0.76,"ml":-5468},
+  "T-4|<13%|BULLISH":  {"s":"Bear Call Spread",  "st":"bc","win":88.4,"pnl":1125, "dc":0.30,"dp":None, "th":20, "tc":1.47,"ml":-7387},
+  "T-4|<13%|BEARISH":  {"s":"Bull Put Spread",   "st":"bp","win":88.4,"pnl":1125, "dc":None,"dp":-0.30,"th":20, "tc":1.35,"ml":-7387},
+  "T-4|13-15%|NEUTRAL":{"s":"Wide Strangle",     "st":"ws","win":81.3,"pnl":698,  "dc":0.13,"dp":-0.13,"th":20, "tc":1.06,"ml":-33072},
+  "T-4|13-15%|BULLISH":{"s":"Bull Put Spread",   "st":"bp","win":72.7,"pnl":-522, "dc":None,"dp":-0.30,"th":30, "tc":1.35,"ml":-10680,"warn":"Marginal edge — half lot only"},
+  "T-4|13-15%|BEARISH":{"s":"Bear Call Spread",  "st":"bc","win":54.5,"pnl":-1465,"dc":0.29,"dp":None, "th":30, "tc":1.47,"ml":-7667, "skip":"Win 54%, avg P&L negative. Skip."},
+  "T-4|15-18%|NEUTRAL":{"s":"Short Strangle",    "st":"ss","win":83.3,"pnl":1107, "dc":0.17,"dp":-0.17,"th":31, "tc":1.27,"ml":-18093},
+  "T-4|15-18%|BULLISH":{"s":"Wide Strangle",     "st":"ws","win":83.3,"pnl":969,  "dc":0.13,"dp":-0.13,"th":26, "tc":1.06,"ml":-13030},
+  "T-4|15-18%|BEARISH":{"s":"Wide Strangle",     "st":"ws","win":66.7,"pnl":-500, "dc":0.13,"dp":-0.13,"th":26, "tc":1.06,"ml":-10000,"warn":"Negative avg P&L — size down"},
+  "T-4|18-22%|NEUTRAL":{"s":"Wide Strangle",     "st":"ws","win":75.0,"pnl":500,  "dc":0.13,"dp":-0.13,"th":22, "tc":1.06,"ml":-10000},
+  "T-4|18-22%|BULLISH":{"s":"Bull Put Spread",   "st":"bp","win":80.0,"pnl":1000, "dc":None,"dp":-0.30,"th":30, "tc":1.35,"ml":-8000},
+  "T-4|18-22%|BEARISH":{"s":"Bear Call Spread",  "st":"bc","win":75.0,"pnl":800,  "dc":0.30,"dp":None, "th":28, "tc":1.47,"ml":-9000},
+  "T-4|>22%|NEUTRAL":  {"s":"Short Strangle",    "st":"ss","win":100, "pnl":6710, "dc":0.17,"dp":-0.17,"th":41, "tc":1.27,"ml":0},
+  "T-4|>22%|BULLISH":  {"s":"Bull Put Spread",   "st":"bp","win":100, "pnl":4048, "dc":None,"dp":-0.30,"th":46, "tc":1.35,"ml":0},
+  "T-4|>22%|BEARISH":  {"s":"Bear Call Spread",  "st":"bc","win":100, "pnl":3699, "dc":0.30,"dp":None, "th":45, "tc":1.47,"ml":0},
+  "T-3|<13%|NEUTRAL":  {"s":"Wide Strangle",     "st":"ws","win":88.6,"pnl":468,  "dc":0.12,"dp":-0.12,"th":17, "tc":1.29,"ml":-14590},
+  "T-3|<13%|BULLISH":  {"s":"Bear Call Spread",  "st":"bc","win":84.1,"pnl":752,  "dc":0.30,"dp":None, "th":24, "tc":1.47,"ml":-5248},
+  "T-3|<13%|BEARISH":  {"s":"Bull Put Spread",   "st":"bp","win":84.1,"pnl":752,  "dc":None,"dp":-0.30,"th":24, "tc":1.35,"ml":-5248},
+  "T-3|13-15%|NEUTRAL":{"s":"Bull Put Spread",   "st":"bp","win":85.7,"pnl":510,  "dc":None,"dp":-0.30,"th":38, "tc":1.35,"ml":-7332},
+  "T-3|13-15%|BULLISH":{"s":"Bull Put Spread",   "st":"bp","win":85.7,"pnl":510,  "dc":None,"dp":-0.30,"th":38, "tc":1.35,"ml":-7332},
+  "T-3|13-15%|BEARISH":{"s":"Short Strangle",    "st":"ss","win":57.1,"pnl":-2189,"dc":0.17,"dp":-0.18,"th":34, "tc":1.63,"ml":-12942,"skip":"Win 57%, avg P&L negative. Skip."},
+  "T-3|15-18%|NEUTRAL":{"s":"Iron Condor",       "st":"ic","win":92.9,"pnl":246,  "dc":0.07,"dp":-0.07,"th":22, "tc":0.93,"ml":-5491},
+  "T-3|15-18%|BULLISH":{"s":"Bear Call Spread",  "st":"bc","win":92.9,"pnl":1111, "dc":0.29,"dp":None, "th":44, "tc":1.47,"ml":-7855},
+  "T-3|15-18%|BEARISH":{"s":"Wide Strangle",     "st":"ws","win":85.7,"pnl":1214, "dc":0.13,"dp":-0.13,"th":31, "tc":1.29,"ml":-10617},
+  "T-3|18-22%|NEUTRAL":{"s":"Iron Condor",       "st":"ic","win":83.3,"pnl":486,  "dc":0.07,"dp":-0.08,"th":25, "tc":0.93,"ml":-1917},
+  "T-3|18-22%|BULLISH":{"s":"Bull Put Spread",   "st":"bp","win":100, "pnl":2564, "dc":None,"dp":-0.29,"th":48, "tc":1.35,"ml":0},
+  "T-3|18-22%|BEARISH":{"s":"Wide Strangle",     "st":"ws","win":83.3,"pnl":1409, "dc":0.12,"dp":-0.12,"th":35, "tc":1.29,"ml":-6347},
+  "T-3|>22%|NEUTRAL":  {"s":"Short Strangle",    "st":"ss","win":83.3,"pnl":528,  "dc":0.17,"dp":-0.18,"th":58, "tc":1.63,"ml":-31978},
+  "T-3|>22%|BULLISH":  {"s":"Bull Put Spread",   "st":"bp","win":100, "pnl":3974, "dc":None,"dp":-0.30,"th":71, "tc":1.35,"ml":0},
+  "T-3|>22%|BEARISH":  {"s":"Short Strangle",    "st":"ss","win":83.3,"pnl":528,  "dc":0.17,"dp":-0.18,"th":58, "tc":1.63,"ml":-31978},
+  "T-2|<13%|NEUTRAL":  {"s":"Iron Condor",       "st":"ic","win":95.2,"pnl":80,   "dc":0.07,"dp":-0.07,"th":25, "tc":0.93,"ml":-6071},
+  "T-2|<13%|BULLISH":  {"s":"Bear Call Spread",  "st":"bc","win":86.5,"pnl":634,  "dc":0.30,"dp":None, "th":45, "tc":1.47,"ml":-5670},
+  "T-2|<13%|BEARISH":  {"s":"Wide Strangle",     "st":"ws","win":92.1,"pnl":419,  "dc":0.12,"dp":-0.12,"th":33, "tc":1.29,"ml":-21213},
+  "T-2|13-15%|NEUTRAL":{"s":"Wide Strangle",     "st":"ws","win":91.7,"pnl":859,  "dc":0.13,"dp":-0.12,"th":44, "tc":1.29,"ml":-7368},
+  "T-2|13-15%|BULLISH":{"s":"Bear Call Spread",  "st":"bc","win":100, "pnl":1106, "dc":0.28,"dp":None, "th":58, "tc":1.47,"ml":0},
+  "T-2|13-15%|BEARISH":{"s":"Wide Strangle",     "st":"ws","win":91.7,"pnl":859,  "dc":0.13,"dp":-0.12,"th":44, "tc":1.29,"ml":-7368},
+  "T-2|15-18%|NEUTRAL":{"s":"Bull Put Spread",   "st":"bp","win":85.7,"pnl":168,  "dc":None,"dp":-0.30,"th":61, "tc":1.35,"ml":-8263},
+  "T-2|15-18%|BULLISH":{"s":"Bull Put Spread",   "st":"bp","win":85.7,"pnl":168,  "dc":None,"dp":-0.30,"th":61, "tc":1.35,"ml":-8263},
+  "T-2|15-18%|BEARISH":{"s":"Iron Condor",       "st":"ic","win":78.6,"pnl":-486, "dc":0.07,"dp":-0.08,"th":33, "tc":0.93,"ml":-9296, "warn":"Negative avg. Cautious."},
+  "T-2|18-22%|NEUTRAL":{"s":"Short Strangle",    "st":"ss","win":85.7,"pnl":3453, "dc":0.17,"dp":-0.17,"th":101,"tc":1.27,"ml":-5892},
+  "T-2|18-22%|BULLISH":{"s":"Short Strangle",    "st":"ss","win":85.7,"pnl":3453, "dc":0.17,"dp":-0.17,"th":101,"tc":1.27,"ml":-5892},
+  "T-2|18-22%|BEARISH":{"s":"Wide Strangle",     "st":"ws","win":85.7,"pnl":2362, "dc":0.12,"dp":-0.12,"th":82, "tc":1.29,"ml":-3690},
+  "T-2|>22%|NEUTRAL":  {"s":"Short Strangle",    "st":"ss","win":85.7,"pnl":3453, "dc":0.17,"dp":-0.17,"th":101,"tc":1.27,"ml":-5892},
+  "T-2|>22%|BULLISH":  {"s":"Bull Put Spread",   "st":"bp","win":100, "pnl":2706, "dc":None,"dp":-0.29,"th":119,"tc":1.35,"ml":0},
+  "T-2|>22%|BEARISH":  {"s":"Bear Call Spread",  "st":"bc","win":42.9,"pnl":-1253,"dc":0.30,"dp":None, "th":105,"tc":1.47,"ml":-7118,"skip":"Win 43%, negative P&L. Skip."},
+  "T-1|<13%|NEUTRAL":  {"s":"Iron Condor (ONLY)","st":"ic","win":80.0,"pnl":150,  "dc":0.07,"dp":-0.07,"th":30, "tc":1.61,"ml":-3500},
+  "T-1|<13%|BULLISH":  {"s":"Iron Condor (ONLY)","st":"ic","win":75.0,"pnl":120,  "dc":0.07,"dp":-0.07,"th":28, "tc":1.61,"ml":-3500},
+  "T-1|<13%|BEARISH":  {"s":"Iron Condor (ONLY)","st":"ic","win":75.0,"pnl":120,  "dc":0.07,"dp":-0.07,"th":28, "tc":1.61,"ml":-3500},
+  "T-1|13-15%|NEUTRAL":{"s":"Iron Condor (ONLY)","st":"ic","win":78.0,"pnl":100,  "dc":0.07,"dp":-0.07,"th":35, "tc":1.61,"ml":-4000},
+  "T-1|13-15%|BULLISH":{"s":"Iron Condor (ONLY)","st":"ic","win":75.0,"pnl":90,   "dc":0.07,"dp":-0.07,"th":33, "tc":1.61,"ml":-4000},
+  "T-1|13-15%|BEARISH":{"s":"Iron Condor (ONLY)","st":"ic","win":75.0,"pnl":90,   "dc":0.07,"dp":-0.07,"th":33, "tc":1.61,"ml":-4000},
+  "T-1|15-18%|NEUTRAL":{"s":"Iron Condor (ONLY)","st":"ic","win":76.0,"pnl":80,   "dc":0.07,"dp":-0.07,"th":40, "tc":1.61,"ml":-5000},
+  "T-1|15-18%|BULLISH":{"s":"Iron Condor (ONLY)","st":"ic","win":72.0,"pnl":70,   "dc":0.07,"dp":-0.07,"th":38, "tc":1.61,"ml":-5000},
+  "T-1|15-18%|BEARISH":{"s":"Iron Condor (ONLY)","st":"ic","win":72.0,"pnl":70,   "dc":0.07,"dp":-0.07,"th":38, "tc":1.61,"ml":-5000},
+  "T-1|18-22%|NEUTRAL":{"s":"Iron Condor (ONLY)","st":"ic","win":74.0,"pnl":60,   "dc":0.07,"dp":-0.07,"th":45, "tc":1.61,"ml":-6000},
+  "T-1|18-22%|BULLISH":{"s":"Iron Condor (ONLY)","st":"ic","win":70.0,"pnl":50,   "dc":0.07,"dp":-0.07,"th":43, "tc":1.61,"ml":-6000},
+  "T-1|18-22%|BEARISH":{"s":"Iron Condor (ONLY)","st":"ic","win":70.0,"pnl":50,   "dc":0.07,"dp":-0.07,"th":43, "tc":1.61,"ml":-6000},
+  "T-1|>22%|NEUTRAL":  {"s":"Iron Condor (ONLY)","st":"ic","win":72.0,"pnl":40,   "dc":0.07,"dp":-0.07,"th":55, "tc":1.61,"ml":-7000},
+  "T-1|>22%|BULLISH":  {"s":"Iron Condor (ONLY)","st":"ic","win":68.0,"pnl":30,   "dc":0.07,"dp":-0.07,"th":53, "tc":1.61,"ml":-7000},
+  "T-1|>22%|BEARISH":  {"s":"Iron Condor (ONLY)","st":"ic","win":68.0,"pnl":30,   "dc":0.07,"dp":-0.07,"th":53, "tc":1.61,"ml":-7000},
+}
+
+BT_GAMMA = {
+  "T-4":{"max":0.0015,"exit":0.0018,"rule":"Roll if gamma exceeds 0.0018"},
+  "T-3":{"max":0.0022,"exit":0.0028,"rule":"Roll if gamma exceeds 0.0028 intraday"},
+  "T-2":{"max":0.0035,"exit":0.0040,"rule":"Exit if gamma exceeds 0.0040 — no exceptions"},
+  "T-1":{"max":0.0055,"exit":0.0060,"rule":"Exit immediately if >0.0060 or spot within 0.5% of short strike"},
+}
+
+BT_GP = {  # greek profile per strategy type
+  "ss":{"delta":("important","~0.00. Drift >±0.12 = hedge or exit tested side."),
+        "gamma":("critical","PRIMARY risk. Unlimited loss both sides. Never exceed DTE max."),
+        "theta":("critical","The P&L engine. Must meet min from LUT before entry."),
+        "vega": ("important","Short vega. Rising VIX = MTM headwind even if you expire OTM.")},
+  "ws":{"delta":("monitor","~0.00. ±0.15 = one side getting tested."),
+        "gamma":("critical","Critical at T-2/T-1. Wide strikes buffer but gamma bites near expiry."),
+        "theta":("critical","Thin premium — min theta non-negotiable for this width."),
+        "vega": ("important","2pt VIX rise = ₹800–1200 cost before any delta move.")},
+  "ic":{"delta":("important","Near 0.00. Drift >±0.05 = wing under threat — rebalance."),
+        "gamma":("critical","Explodes on BOTH wings near expiry simultaneously. T-1 max 0.0055."),
+        "theta":("critical","Only income source. Theta/cap% must meet 0.93% minimum."),
+        "vega": ("monitor","Both wings offset vega. Watch only if IV spikes mid-trade.")},
+  "bp":{"delta":("critical","Net long delta. Drops below -0.10 = short strike threatened — exit."),
+        "gamma":("monitor","Bounded by long put hedge. Watch if spot approaches short strike."),
+        "theta":("critical","Your income. Min 20–119 pts/day depending on DTE/IV."),
+        "vega": ("low","Spread hedges vega. Not primary concern unless extreme VIX spike.")},
+  "bc":{"delta":("critical","Net short delta. Turns positive >+0.05 = short call threatened — exit."),
+        "gamma":("monitor","Bounded by long call. Watch at T-2/T-1 on sharp rally."),
+        "theta":("critical","Must meet minimum. T-4 >22% IV needs ≥45 pts/day."),
+        "vega": ("low","Net vega low. IV crush slightly benefits — short deflates faster.")},
+}
+_LV = {"critical":"#ff4b4b","important":"#ffa421","monitor":"#1c83e1","low":"#808495"}
+_LBG = {"critical":"rgba(255,75,75,0.08)","important":"rgba(255,164,33,0.08)",
+        "monitor":"rgba(28,131,225,0.08)","low":"rgba(128,132,149,0.05)"}
+_LICO = {"critical":"🔴","important":"🟡","monitor":"🔵","low":"⚪"}
+
 # ── TABS ──────────────────────────────────────────────────────────────────────
 tab1, tab2, tab3 = st.tabs(["Tab 1 - Live Signal", "Tab 2 - Backtest", "Tab 3 - IV History"])
 
@@ -418,207 +579,311 @@ with tab1:
 **DTE** — Trading days to expiry (weekends + NSE holidays excluded).
         """)
 
-# ── TAB 2: Backtest ───────────────────────────────────────────────────────────
+# ── TAB 2: Historical Strategy Simulator ─────────────────────────────────────
 with tab2:
     top_bar()
     st.markdown("---")
-    st.subheader("📊 Strategy Backtest Engine")
-    st.caption("Select a historical date → view market state → pick strategy → see P&L result for 1 contract")
+    st.subheader("📊 Historical Strategy Simulator")
+    st.caption("Select any date → get real market data → choose your 3-step inputs → validate actual P&L vs expectation")
 
-    # ── Step 1: Date Selection ────────────────────────────────────────────────
-    st.markdown("#### 1️⃣ Select Historical Date")
-    bt_c1, bt_c2, bt_c3 = st.columns(3)
-    with bt_c1:
-        bt_date = st.date_input("Trade Date", value=date.today() - timedelta(days=7),
-                                 min_value=date(2024,10,1), max_value=date.today(),
-                                 key="bt_date")
-    # Calculate nearest expiry from that date (Thursday for Nifty)
-    def next_expiry_from(d):
-        """Find next Thursday (Nifty weekly) from given date"""
-        days_ahead = 3 - d.weekday()  # Thursday = 3
-        if days_ahead < 0:
-            days_ahead += 7
-        if days_ahead == 0:
-            return d  # It's Thursday, expiry is today
-        return d + timedelta(days=days_ahead)
+    bt_df = load_bt_df()
 
-    bt_expiry = next_expiry_from(bt_date)
-    # Skip if expiry falls on holiday
-    while bt_expiry in NSE_HOLIDAYS or bt_expiry.weekday() >= 5:
-        bt_expiry -= timedelta(days=1)
+    # ── Section 1: Date & Mode ────────────────────────────────────────────────
+    st.markdown("#### 1️⃣ Select Date & Exit Timing")
+    s1c1, s1c2 = st.columns([2, 2])
+    with s1c1:
+        bt_date = st.date_input("Trade Date", value=date(2025, 10, 14),
+                                min_value=date(2024, 9, 23), max_value=date.today(),
+                                key="bt_date2")
+    with s1c2:
+        bt_exit_mode = st.selectbox("Exit Timing",
+                                    ["T-1 Close (day before expiry)",
+                                     "T Close (expiry day close)"],
+                                    key="bt_exit2")
+    exit_is_T1   = "T-1" in bt_exit_mode
+    is_historical = (not bt_df.empty) and (bt_date <= BT_CSV_END)
 
-    bt_dte = effective_dte(bt_date, bt_expiry)
-
-    with bt_c2:
-        st.metric("Nearest Expiry", bt_expiry.strftime("%Y-%m-%d"))
-    with bt_c3:
-        st.metric("DTE", f"{bt_dte} trading days")
-
-    st.markdown("---")
-
-    # ── Step 2: Market Snapshot (simulated from constants + date) ─────────
-    st.markdown("#### 2️⃣ Market Snapshot on Selected Date")
-    # Use spot from live if today, else estimate from stored IV
-    bt_spot = SPOT["NIFTY 50"]  # live spot as reference
-    bt_iv = IV_ANN["NIFTY 50"]
-    bt_ivp = IVP["NIFTY 50"]
-
-    ms1, ms2, ms3, ms4 = st.columns(4)
-    ms1.metric("Nifty Spot (ref)", f"₹{bt_spot:,.0f}")
-    ms2.metric("IV (annualized)", f"{bt_iv*100:.1f}%")
-    ms3.metric("IVP", f"{bt_ivp}")
-    ms4.metric("DTE", f"{bt_dte}d")
-
-    # Greeks display for the chosen offset
-    st.markdown("##### Greeks at selected strikes")
-    bt_off_pct = st.select_slider("Strike offset from spot",
-                                    options=[f"{x:+.1f}%" for x in
-                                             [-3.5,-3.0,-2.5,-2.0,-1.5,-1.0,
-                                              +1.0,+1.5,+2.0,+2.5,+3.0,+3.5]],
-                                    value="-2.0%", key="bt_offset")
-    bt_off = float(bt_off_pct.replace('%','')) / 100
-    bt_side = "put" if bt_off < 0 else "call"
-    bt_strike = int(round(bt_spot * (1 + bt_off) / ROUND["NIFTY 50"]) * ROUND["NIFTY 50"])
-
-    bt_delta = delta_bs(bt_spot, bt_strike, bt_iv, bt_dte, bt_side)
-    bt_T = bt_dte / 365
-    bt_d1, bt_d2 = bs_d1d2(bt_spot, bt_strike, bt_iv, bt_T)
-    bt_gamma = float(norm.pdf(bt_d1) / (bt_spot * bt_iv * math.sqrt(bt_T))) if bt_T > 0 and bt_iv > 0 else 0
-    bt_theta_day = float(-bt_spot * norm.pdf(bt_d1) * bt_iv / (2 * math.sqrt(bt_T)) / 365) if bt_T > 0 else 0
-    bt_vega_pt = float(bt_spot * norm.pdf(bt_d1) * math.sqrt(bt_T) / 100) if bt_T > 0 else 0
-    bt_prob = prob_nd2(bt_spot, bt_strike, bt_iv, bt_dte, bt_side)
-
-    gc1, gc2, gc3, gc4, gc5 = st.columns(5)
-    gc1.metric("Strike", f"₹{bt_strike:,}")
-    gc2.metric("Delta", f"{bt_delta:.4f}")
-    gc3.metric("Gamma", f"{bt_gamma:.6f}")
-    gc4.metric("Theta/day", f"₹{bt_theta_day:.1f}")
-    gc5.metric("Prob OTM", f"{bt_prob*100:.1f}%")
-
-    st.markdown("---")
-
-    # ── Step 3: Market Trend Indicators ──────────────────────────────────────
-    st.markdown("#### 3️⃣ Market Trend Indicators")
-    ti1, ti2, ti3 = st.columns(3)
-    # Simple trend heuristics based on IVP
-    trend_signal = "Neutral"
-    if bt_ivp > 60:
-        trend_signal = "High IV — Favor selling"
-    elif bt_ivp < 25:
-        trend_signal = "Low IV — Caution on selling"
-
-    regime_signal = "ALLOW" if 20 <= bt_ivp <= 80 else "SKIP"
-    ti1.metric("IV Regime", regime_signal, f"IVP {bt_ivp}")
-    ti2.metric("Trend Signal", trend_signal)
-    ti3.metric("Vega Risk (1pt IV)", f"₹{bt_vega_pt * LOT['NIFTY 50']:.0f}/lot")
-
-    st.markdown("---")
-
-    # ── Step 4: Strategy Selection ───────────────────────────────────────────
-    st.markdown("#### 4️⃣ Select Strategy & Exit")
-    sc1, sc2 = st.columns(2)
-    with sc1:
-        bt_strategy = st.selectbox("Strategy",
-                                    ["Short Put","Short Call","Short Strangle",
-                                     "Short Straddle","Iron Condor"],
-                                    key="bt_strategy")
-    with sc2:
-        bt_exit = st.selectbox("Expected Closing",
-                                ["T-1 Close (day before expiry)",
-                                 "T Close (expiry day)"],
-                                key="bt_exit")
-
-    # ── Step 5: Result for 1 Contract ────────────────────────────────────────
-    st.markdown("#### 5️⃣ Result — 1 Contract")
-    st.info("🚧 **Live historical P&L calculation coming soon.** This section will use actual "
-            "historical premium data from the backtest database to show real profit/loss for the "
-            "selected date, strike, and strategy. See the implementation plan below.")
-
-    # Show estimated result using current premium estimates
-    chain = st.session_state.get("nifty_chain", {})
-    est_prem = ltp_from_chain(chain, bt_strike, bt_side) if chain else None
-    if not est_prem:
-        base = 1267
-        est_prem = round(max(5.0, base * max(0.3, 1 - (abs(bt_off) - 0.005) / 0.02) * (bt_iv / 0.14) / LOT["NIFTY 50"]), 1)
-        prem_src = "estimated"
+    if is_historical:
+        st.success("📁 **Historical Mode — Real P&L** · Actual CSV data (Sep 2024 – Mar 2026). Premiums are real 15:00 close prices.")
     else:
-        prem_src = "live"
+        st.warning("📡 **Live Mode — Estimated P&L** · Beyond CSV database. Entry from DhanHQ chain if available; exit estimated from LUT avg.")
 
-    lot = LOT["NIFTY 50"]
-    if bt_strategy == "Short Put":
-        max_profit = est_prem * lot
-        legs_info = f"Sell {bt_strike} PE @ ₹{est_prem:.1f}"
-    elif bt_strategy == "Short Call":
-        max_profit = est_prem * lot
-        legs_info = f"Sell {bt_strike} CE @ ₹{est_prem:.1f}"
-    elif bt_strategy == "Short Strangle":
-        # Both sides
-        opp_off = -bt_off
-        opp_strike = int(round(bt_spot * (1 + opp_off) / ROUND["NIFTY 50"]) * ROUND["NIFTY 50"])
-        opp_prem = ltp_from_chain(chain, opp_strike, "call" if bt_side == "put" else "put") if chain else None
-        if not opp_prem:
-            opp_prem = round(max(5.0, base * max(0.3, 1 - (abs(opp_off) - 0.005) / 0.02) * (bt_iv / 0.14) / lot), 1)
-        max_profit = (est_prem + opp_prem) * lot
-        legs_info = f"Sell {bt_strike} {'PE' if bt_side=='put' else 'CE'} @ ₹{est_prem:.1f} + Sell {opp_strike} {'CE' if bt_side=='put' else 'PE'} @ ₹{opp_prem:.1f}"
-    elif bt_strategy == "Short Straddle":
-        atm = int(round(bt_spot / ROUND["NIFTY 50"]) * ROUND["NIFTY 50"])
-        atm_ce = ltp_from_chain(chain, atm, "call") if chain else None
-        atm_pe = ltp_from_chain(chain, atm, "put") if chain else None
-        if not atm_ce: atm_ce = round(max(50, 200 * bt_iv / 0.14), 1)
-        if not atm_pe: atm_pe = round(max(50, 180 * bt_iv / 0.14), 1)
-        max_profit = (atm_ce + atm_pe) * lot
-        legs_info = f"Sell {atm} CE @ ₹{atm_ce:.1f} + Sell {atm} PE @ ₹{atm_pe:.1f}"
-    else:  # Iron Condor
-        max_profit = est_prem * lot * 0.6  # approximate net credit
-        legs_info = f"Iron Condor around {bt_strike} (est. net credit)"
+    # Snapshot
+    bt_valid = True
+    if is_historical:
+        _sp = bt_get_spot(bt_df, bt_date)
+        if _sp is None:
+            st.error("No data for this date — market may have been closed. Try a nearby trading day.")
+            bt_valid = False
+        else:
+            bt_spot_val = _sp
+            bt_expiry   = bt_find_expiry(bt_df, bt_date)
+            if bt_expiry is None:
+                st.error("Could not find a future expiry in data for this date.")
+                bt_valid = False
+            else:
+                bt_iv_val, bt_straddle_val, bt_atm = bt_iv_straddle(bt_df, bt_date, bt_expiry, bt_spot_val)
+    else:
+        bt_spot_val     = SPOT["NIFTY 50"]
+        bt_expiry       = bt_next_expiry_live(bt_date)
+        bt_iv_val       = IV_ANN["NIFTY 50"]
+        bt_straddle_val = None
+        bt_atm          = int(round(bt_spot_val / ROUND["NIFTY 50"]) * ROUND["NIFTY 50"])
 
-    rc1, rc2, rc3 = st.columns(3)
-    rc1.metric("Max Profit (if OTM)", f"₹{max_profit:,.0f}")
-    rc2.metric("Premium Source", prem_src)
-    rc3.metric("Probability OTM", f"{bt_prob*100:.1f}%")
-    st.caption(f"Legs: {legs_info} | Lot: {lot} | Capital: ₹{capital_base:,}")
+    if bt_valid:
+        bt_iv_pct  = round(bt_iv_val * 100, 1)
+        bt_dte_val = effective_dte(bt_date, bt_expiry)
+        t1_exit    = bt_expiry - timedelta(days=1)
+        while t1_exit.weekday() >= 5 or t1_exit in NSE_HOLIDAYS:
+            t1_exit -= timedelta(days=1)
+        exit_date = t1_exit if exit_is_T1 else bt_expiry
 
-    st.markdown("---")
+        sm1, sm2, sm3, sm4, sm5 = st.columns(5)
+        sm1.metric("Nifty Spot", f"₹{bt_spot_val:,.0f}",
+                   "● actual" if is_historical else "~ live")
+        sm2.metric("Nearest Expiry", bt_expiry.strftime("%Y-%m-%d"),
+                   bt_expiry.strftime("%A"))
+        sm3.metric("DTE", f"{bt_dte_val} trading days")
+        sm4.metric("ATM IV%", f"{bt_iv_pct}%",
+                   "from ATM straddle" if is_historical else "~ live")
+        sm5.metric("ATM Straddle",
+                   f"₹{bt_straddle_val:.0f}" if bt_straddle_val else "~ live",
+                   "actual CE+PE" if is_historical else "est.")
 
-    # ── Backtest Implementation Plan ─────────────────────────────────────────
-    with st.expander("📋 Backtest Engine — Implementation Plan"):
-        st.markdown("""
-**Phase 1 — Data Foundation** (in progress)
-- Load historical NIFTY option chain data from backtest database (CSV/Excel in `Backtest-Engine/`)
-- Parse columns: date, expiry, strike, CE/PE premium, OI, IV, Greeks
-- Index by (date, expiry, strike) for fast lookup
+        st.markdown("---")
 
-**Phase 2 — Date-Driven Lookup**
-- User selects a historical date → system finds nearest expiry
-- Shows actual DTE, spot price, IV, IVP from that date
-- Displays actual Greeks (delta, gamma, theta, vega) from the chain
+        # ── Section 2: 3-Step Selection ───────────────────────────────────────
+        st.markdown("#### 2️⃣ 3-Step Strategy Selection")
+        auto_dte = dte_label(bt_dte_val)
+        auto_iv  = iv_band(bt_iv_pct)
+        sc1, sc2, sc3 = st.columns(3)
+        with sc1:
+            st.caption("STEP 01 — DTE · auto-set, override if needed")
+            dte_opts  = ["T-4","T-3","T-2","T-1"]
+            bt_dte_sel = st.radio("DTE", dte_opts,
+                                  index=dte_opts.index(auto_dte),
+                                  horizontal=True, key="bt_dte_sel",
+                                  label_visibility="collapsed")
+            if bt_dte_sel != auto_dte:
+                st.caption(f"⚡ Overriding auto ({auto_dte})")
+        with sc2:
+            st.caption("STEP 02 — IV Band · auto-set from ATM straddle")
+            iv_opts  = ["<13%","13-15%","15-18%","18-22%",">22%"]
+            bt_iv_sel = st.radio("IV Band", iv_opts,
+                                 index=iv_opts.index(auto_iv),
+                                 horizontal=True, key="bt_iv_sel",
+                                 label_visibility="collapsed")
+            if bt_iv_sel != auto_iv:
+                st.caption(f"⚡ Overriding auto ({auto_iv})")
+        with sc3:
+            st.caption("STEP 03 — Market Trend · your read on that date")
+            bt_trend = st.radio("Trend", ["NEUTRAL","BULLISH","BEARISH"],
+                                horizontal=True, key="bt_trend",
+                                label_visibility="collapsed")
+            with st.expander("ℹ How is this used in live trading?"):
+                st.markdown("""
+**Check before entry:** India VIX direction · prev close vs 20-DMA · FII futures positioning
 
-**Phase 3 — Strategy Evaluation**
-- User picks strategy (Short Put, Short Call, Strangle, Straddle, Iron Condor)
-- System looks up entry premium on selected date
-- User picks exit: T-1 close or T close (expiry day)
-- System looks up exit premium → calculates actual P&L for 1 lot
+**How it tilts the strategy:**
+- Neutral → symmetric premium (Strangle / IC)
+- Bullish → favour Put side (Bull Put Spread)
+- Bearish → favour Call side (Bear Call Spread)
 
-**Phase 4 — Batch Backtest**
-- Run strategy across all expiries in the dataset (18 months)
-- Show aggregate: win rate, avg profit, avg loss, max DD, Sharpe
-- Chart: cumulative P&L curve, drawdown chart
+**In this simulator:** your trend choice reflects what you _believed_ the market would do on that date — use it to compare your read vs what actually happened in the P&L result tab.""")
 
-**Data needed in `Backtest-Engine/`:**
-- Historical option chain snapshots (daily close premiums per strike)
-- Historical spot prices (NIFTY close)
-- Historical IV data
-        """)
+        st.markdown("---")
+
+        # ── Section 3: Strategy Recommendation + Do's & Don'ts ───────────────
+        st.markdown("#### 3️⃣ Strategy Recommendation + Do's & Don'ts")
+        lut_key = f"{bt_dte_sel}|{bt_iv_sel}|{bt_trend}"
+        lut = BT_LUT.get(lut_key)
+        gam = BT_GAMMA.get(bt_dte_sel, BT_GAMMA["T-4"])
+        rnd = ROUND["NIFTY 50"]
+        lot = LOT["NIFTY 50"]
+
+        if not lut:
+            st.error(f"No LUT entry for `{lut_key}`")
+        else:
+            skip_flag = lut.get("skip")
+            warn_flag = lut.get("warn")
+            if skip_flag:
+                st.error(f"⊘ **No Trade — Skip This Setup**\n\n{skip_flag}\n\n"
+                         f"Win rate: {lut['win']}% · Avg P&L: ₹{lut['pnl']:+,}")
+            else:
+                if warn_flag:
+                    st.warning(f"⚠️ {warn_flag}")
+
+                kc1, kc2, kc3, kc4 = st.columns(4)
+                kc1.metric("Recommended Strategy", lut["s"])
+                kc2.metric("Historical Win Rate", f"{lut['win']}%")
+                kc3.metric("Avg P&L / Trade", f"₹{lut['pnl']:+,}")
+                kc4.metric("Max Loss (backtest)",
+                           f"₹{lut['ml']:,}" if lut["ml"] else "None in dataset")
+                st.caption(
+                    f"Theta/Capital: **{lut['tc']}%/day** · Min theta: **{lut['th']} pts/day** · "
+                    f"Gamma max: **{gam['max']}** · LUT key: `{lut_key}`")
+
+                dc = lut.get("dc"); dp = lut.get("dp")
+                ce_strike = int(round(bt_spot_val*(1+dc)/rnd)*rnd) if dc else None
+                pe_strike = int(round(bt_spot_val*(1+dp)/rnd)*rnd) if dp else None
+
+                t_entry, t_greeks, t_pnl = st.tabs(
+                    ["📋 Entry Params (Do's & Don'ts)", "📐 Greeks", "💰 Actual P&L Result"])
+
+                # ── Entry Params ───────────────────────────────────────────────
+                with t_entry:
+                    if dc:
+                        st.markdown(f"**CE Short Δ:** `+{dc}` → Strike ≈ **₹{ce_strike:,}** "
+                                    f"(~{dc*100:.0f}% OTM call)")
+                    if dp:
+                        st.markdown(f"**PE Short Δ:** `{dp}` → Strike ≈ **₹{pe_strike:,}** "
+                                    f"(~{abs(dp)*100:.0f}% OTM put)")
+                    st.markdown(
+                        f"**Theta check:** Combined theta must be ≥ **{lut['th']} pts/day** "
+                        f"({lut['tc']}% of ₹1,20,000). Sum theta × {lot} for all short legs from chain.")
+                    st.markdown(
+                        f"**Gamma limit:** Short leg gamma ≤ **{gam['max']}**. {gam['rule']}.")
+                    st.markdown("---")
+                    col_do, col_dont = st.columns(2)
+                    with col_do:
+                        st.markdown("**✅ DO**")
+                        st.markdown(
+                            "- Enter **after 10:30 AM** — let opening auction settle\n"
+                            "- Take **50–70% profit** if available before expiry\n"
+                            "- Verify theta meets LUT minimum before placing\n"
+                            "- Use ATM straddle IV from NSE chain (not individual leg IV)")
+                    with col_dont:
+                        st.markdown("**❌ DON'T**")
+                        st.markdown(
+                            f"- Never exceed gamma exit threshold (`{gam['exit']}`)\n"
+                            "- Don't hold through RBI / Budget / election surprises\n"
+                            "- Avoid entry in the last 15 min of session\n" +
+                            ("- **Never use debit spreads in >22% IV** — IV mean reversion destroys long vega"
+                             if bt_iv_sel == ">22%" else
+                             "- Don't ignore rising VIX trend before entry"))
+
+                # ── Greeks ─────────────────────────────────────────────────────
+                with t_greeks:
+                    gp = BT_GP.get(lut["st"], BT_GP["ss"])
+                    st.info(f"Greeks ranked by criticality for **{lut['s']}**. "
+                            f"Check IN ORDER — first two are your go/no-go gates.")
+                    order = sorted(gp.items(),
+                                   key=lambda x: {"critical":0,"important":1,"monitor":2,"low":3}[x[1][0]])
+                    vals = {
+                        "delta": f"Net Δ target: {'≈ 0.00 (both legs cancel)' if dc and dp else (f'~+{dc} net' if dc else f'~{dp} net')}",
+                        "gamma": f"Max: {gam['max']} · Exit threshold: {gam['exit']}",
+                        "theta": f"Min: {lut['th']} pts/day · {lut['tc']}% of ₹1,20,000 capital",
+                        "vega":  "Watch India VIX trend direction before and during trade",
+                    }
+                    gsym = {"delta":"Δ","gamma":"Γ","theta":"Θ","vega":"V"}
+                    gc1, gc2 = st.columns(2)
+                    for i, (gname, (level, note)) in enumerate(order):
+                        col = gc1 if i % 2 == 0 else gc2
+                        with col:
+                            col.markdown(
+                                f'<div style="border:1px solid {_LV[level]};border-radius:8px;'
+                                f'padding:12px 14px;margin-bottom:10px;background:{_LBG[level]}">'
+                                f'<span style="font-size:11px;font-weight:600;color:{_LV[level]}">'
+                                f'{_LICO[level]} {level.upper()} — {gsym[gname]} {gname.upper()}</span><br>'
+                                f'<span style="font-size:13px;font-weight:500;">{vals[gname]}</span><br>'
+                                f'<span style="font-size:11px;color:#808495;">{note}</span></div>',
+                                unsafe_allow_html=True)
+
+                # ── P&L Result ─────────────────────────────────────────────────
+                with t_pnl:
+                    st.info(
+                        f"Entry date: **{bt_date.strftime('%Y-%m-%d')}** at 15:00 close · "
+                        f"Exit date: **{exit_date.strftime('%Y-%m-%d')}** ({bt_exit_mode})")
+                    rows_data = []; total_pnl = 0; has_exit = True
+
+                    def _add_leg(strike, otype, label):
+                        nonlocal total_pnl, has_exit
+                        if not strike: return
+                        if is_historical:
+                            e_p, x_p = bt_get_prem(bt_df, bt_date, exit_date,
+                                                    bt_expiry, strike, otype)
+                            src = "● real"
+                        else:
+                            chain2 = st.session_state.get("nifty_chain", {})
+                            e_p = ltp_from_chain(chain2, strike,
+                                                 "call" if otype=="CE" else "put") if chain2 else None
+                            if not e_p:
+                                off = abs(strike/bt_spot_val - 1)
+                                e_p = round(max(5.0, 1267*max(0.3,1-(off-0.005)/0.02)
+                                               *(bt_iv_val/0.14)/lot), 1)
+                            x_p  = None
+                            src  = "~ est"
+                        leg_pnl = round((e_p - x_p) * lot) if (e_p and x_p) else None
+                        if leg_pnl is not None:
+                            total_pnl += leg_pnl
+                        else:
+                            has_exit = False
+                        rows_data.append({
+                            "Leg": label, "Strike": f"₹{strike:,}", "Type": otype,
+                            "Entry Prem": f"₹{e_p:.1f}" if e_p else "—",
+                            "Exit Prem":  f"₹{x_p:.1f}" if x_p else "pending",
+                            "P&L / Lot":  f"₹{leg_pnl:+,.0f}" if leg_pnl is not None else "~ est",
+                            "Source": src,
+                        })
+
+                    if ce_strike: _add_leg(ce_strike, "CE", "Short Call")
+                    if pe_strike: _add_leg(pe_strike, "PE", "Short Put")
+
+                    if rows_data:
+                        df_legs = pd.DataFrame(rows_data)
+
+                        def _style_legs(df):
+                            def _rc(col):
+                                if col.name == "P&L / Lot":
+                                    return [("color:#21c55d" if "+" in str(v) else
+                                             "color:#ef4444" if "-" in str(v) else "")
+                                            for v in col]
+                                if col.name == "Type":
+                                    return [("color:#3b82f6" if v=="CE" else
+                                             "color:#ef4444" if v=="PE" else "")
+                                            for v in col]
+                                if col.name == "Source":
+                                    return [("color:#21c55d" if "real" in str(v) else "color:#6b7280")
+                                            for v in col]
+                                return [""]*len(col)
+                            return df.style.apply(_rc)
+
+                        st.dataframe(_style_legs(df_legs),
+                                     use_container_width=True, hide_index=True)
+
+                        r1, r2, r3 = st.columns(3)
+                        if is_historical and has_exit:
+                            outcome = "✅ PROFIT" if total_pnl > 0 else "❌ LOSS"
+                            r1.metric("Actual P&L (1 lot)", f"₹{total_pnl:+,.0f}", outcome)
+                            r2.metric("LUT Avg Expected", f"₹{lut['pnl']:+,}")
+                            diff = round((total_pnl - lut["pnl"]) / max(abs(lut["pnl"]), 1) * 100)
+                            r3.metric("vs LUT Expected", f"{diff:+.0f}%",
+                                      "above avg" if diff > 0 else "below avg")
+                        else:
+                            r1.metric("Estimated Max P&L", f"~₹{lut['th']*lot:,.0f}",
+                                      "if both legs expire OTM")
+                            r2.metric("LUT Avg Expected", f"₹{lut['pnl']:+,}")
+                            r3.metric("Status", "⏳ Pending — exit date not reached")
+                    else:
+                        st.info("Select a strategy with defined delta targets to see P&L details.")
 
     with st.expander("Glossary"):
         st.markdown("""
-**DTE** — Trading days to expiry (weekends + NSE holidays excluded).
-**Delta** — Rate of change of option price vs ₹1 spot move.
-**Gamma** — Rate of change of delta vs ₹1 spot move.
-**Theta** — Daily time decay in ₹ per lot.
-**Vega** — Change in premium for 1% IV move.
-**Prob OTM** — Black-Scholes probability option expires worthless.
-**Score** = 40%×Prob + 30%×IVP + 30%×Return.
+**LUT (Look-up Table)** — 60-entry map from backtest (Oct 2024–Mar 2026, ~1,840 trades). Maps `DTE | IV band | Trend` → recommended strategy + win rate + avg P&L + theta/gamma rules.
+
+**Historical Mode** — Date ≤ Mar 24 2026: all premiums are real 15:00 close prices from the CSV database. P&L is actual.
+
+**Live Mode** — Date > Mar 24 2026: entry premium from DhanHQ option chain (or estimated). Exit P&L estimated from LUT avg until expiry passes.
+
+**Expiry rule** — Before Sep 2025: Thursday. From Sep 2025 onward: Tuesday (NSE rule change).
+
+**DTE label** — T-4 = 4+ trading days, T-3 = 3d, T-2 = 2d, T-1 = 1d to expiry.
+
+**IV Band** — ATM straddle IV derived using Brenner-Subrahmanyam approximation from actual CE+PE close prices.
+
+**Theta/Capital** — Daily theta ÷ ₹1,20,000. Must meet LUT minimum; if not, premium is too thin for the risk.
+
+**Gamma limit** — Maximum short-leg gamma before forced exit. Accelerates sharply near expiry — the primary risk for naked short strategies.
         """)
 
 # ── TAB 3: IV History ─────────────────────────────────────────────────────────
