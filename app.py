@@ -69,60 +69,60 @@ h3 {{ font-size: {18 if not _IS_MOBILE else 17}px !important; }}
     [data-testid="stSidebar"] {{ min-width: 280px !important; }}
     [data-testid="column"] {{ min-width: 140px !important; }}
 }}
-:root {
+:root {{
     --bg-main: #0D0D0D; --bg-card: #1A1A1A; --bg-border: #2A2A2A;
     --text-pri: #F0F0F0; --text-sec: #A0A0A0;
     --accent-pos: #00C896; --accent-neg: #FF4D4D; --accent-neu: #7B8CDE;
-}
-.stApp { background-color: var(--bg-main) !important; color: var(--text-pri) !important; }
-.stApp > header { background-color: var(--bg-main) !important; }
-section[data-testid="stSidebar"] {
+}}
+.stApp {{ background-color: var(--bg-main) !important; color: var(--text-pri) !important; }}
+.stApp > header {{ background-color: var(--bg-main) !important; }}
+section[data-testid="stSidebar"] {{
     background-color: var(--bg-card) !important;
     border-right: 1px solid var(--bg-border) !important;
-}
-section[data-testid="stSidebar"] * { color: var(--text-pri) !important; }
-[data-testid="stMetric"] {
+}}
+section[data-testid="stSidebar"] * {{ color: var(--text-pri) !important; }}
+[data-testid="stMetric"] {{
     background-color: var(--bg-card) !important;
     border: 1px solid var(--bg-border) !important;
     border-radius: 8px !important; padding: 10px 14px !important;
-}
-[data-testid="stMetricLabel"] { color: var(--text-sec) !important; }
-[data-testid="stMetricValue"] { color: var(--text-pri) !important; }
-[data-testid="stMetricDelta"] { color: var(--accent-pos) !important; }
-.stTabs [data-baseweb="tab-list"] {
+}}
+[data-testid="stMetricLabel"] {{ color: var(--text-sec) !important; }}
+[data-testid="stMetricValue"] {{ color: var(--text-pri) !important; }}
+[data-testid="stMetricDelta"] {{ color: var(--accent-pos) !important; }}
+.stTabs [data-baseweb="tab-list"] {{
     background-color: var(--bg-card) !important;
     border-bottom: 2px solid var(--bg-border) !important;
-}
-.stTabs [data-baseweb="tab"] { color: var(--text-sec) !important; background: transparent !important; }
-.stTabs [aria-selected="true"] {
+}}
+.stTabs [data-baseweb="tab"] {{ color: var(--text-sec) !important; background: transparent !important; }}
+.stTabs [aria-selected="true"] {{
     color: var(--accent-neu) !important;
     border-bottom: 2px solid var(--accent-neu) !important;
-}
-div[data-baseweb="select"] > div, div[data-baseweb="input"] > div {
+}}
+div[data-baseweb="select"] > div, div[data-baseweb="input"] > div {{
     background-color: var(--bg-card) !important;
     border-color: var(--bg-border) !important; color: var(--text-pri) !important;
-}
-.stDataFrame { border: 1px solid var(--bg-border) !important; border-radius: 6px; }
-.stDataFrame th {
+}}
+.stDataFrame {{ border: 1px solid var(--bg-border) !important; border-radius: 6px; }}
+.stDataFrame th {{
     font-weight: 700 !important; background-color: #1E1E2E !important;
     color: var(--text-pri) !important; border-bottom: 2px solid var(--bg-border) !important;
-}
-.stDataFrame td { color: var(--text-pri) !important; border-bottom: 1px solid var(--bg-border) !important; }
-div[data-testid="stAlert"] { background-color: var(--bg-card) !important; border-left-width: 4px !important; }
-div[data-testid="stAlert"] p { color: var(--text-pri) !important; }
-.stButton > button {
+}}
+.stDataFrame td {{ color: var(--text-pri) !important; border-bottom: 1px solid var(--bg-border) !important; }}
+div[data-testid="stAlert"] {{ background-color: var(--bg-card) !important; border-left-width: 4px !important; }}
+div[data-testid="stAlert"] p {{ color: var(--text-pri) !important; }}
+.stButton > button {{
     background-color: var(--bg-card) !important;
     color: var(--text-pri) !important; border: 1px solid var(--bg-border) !important;
-}
-.stButton > button:hover { border-color: var(--accent-neu) !important; color: var(--accent-neu) !important; }
-.stButton > button[kind="primary"] {
+}}
+.stButton > button:hover {{ border-color: var(--accent-neu) !important; color: var(--accent-neu) !important; }}
+.stButton > button[kind="primary"] {{
     background-color: #1A2A4A !important; border-color: var(--accent-neu) !important;
     color: var(--accent-neu) !important;
-}
-details { background-color: var(--bg-card) !important; border: 1px solid var(--bg-border) !important; border-radius: 8px !important; }
-summary { color: var(--text-pri) !important; }
-.stCaption { color: var(--text-sec) !important; }
-hr { border-color: var(--bg-border) !important; }
+}}
+details {{ background-color: var(--bg-card) !important; border: 1px solid var(--bg-border) !important; border-radius: 8px !important; }}
+summary {{ color: var(--text-pri) !important; }}
+.stCaption {{ color: var(--text-sec) !important; }}
+hr {{ border-color: var(--bg-border) !important; }}
 </style>
 """, unsafe_allow_html=True)
 
