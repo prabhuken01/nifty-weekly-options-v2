@@ -33,12 +33,12 @@ def _is_mobile_client():
 _IS_MOBILE = _is_mobile_client()
 
 # ── Mobile-friendly CSS (desktop vs phone font scale) ────────────────────────
-_desktop_fs = 16
+_desktop_fs = 18
 _mobile_fs = 18
-_df_fs = 15 if not _IS_MOBILE else 16
-_sub = 20 if not _IS_MOBILE else 22
-_h1 = 26 if not _IS_MOBILE else 24
-_h2 = 21 if not _IS_MOBILE else 20
+_df_fs = 17 if not _IS_MOBILE else 16
+_sub = 22 if not _IS_MOBILE else 22
+_h1 = 28 if not _IS_MOBILE else 24
+_h2 = 22 if not _IS_MOBILE else 20
 
 st.markdown(f"""
 <style>
@@ -54,11 +54,17 @@ st.markdown(f"""
 .stDataFrame td, .stDataFrame th {{
     padding: {"10px 12px" if not _IS_MOBILE else "8px 10px"} !important;
 }}
-[data-testid="stMetricLabel"] {{ font-size: {14 if not _IS_MOBILE else 15}px !important; }}
-[data-testid="stMetricValue"] {{ font-size: {22 if not _IS_MOBILE else 24}px !important; font-weight: 700 !important; }}
+[data-testid="stMetricLabel"] {{ font-size: {15 if not _IS_MOBILE else 15}px !important; }}
+[data-testid="stMetricValue"] {{ font-size: {26 if not _IS_MOBILE else 24}px !important; font-weight: 700 !important; }}
+div[data-testid="stDataFrame"] div[data-testid="stMarkdownContainer"] p {{
+    font-size: {_df_fs}px !important;
+}}
+[data-testid="stVerticalBlock"] > div .stMarkdown p {{
+    font-size: {0.95 * (_desktop_fs if not _IS_MOBILE else _mobile_fs):.0f}px !important;
+}}
 h1 {{ font-size: {_h1}px !important; }}
 h2, .stSubheader {{ font-size: {_sub}px !important; }}
-h3 {{ font-size: {18 if not _IS_MOBILE else 17}px !important; }}
+h3 {{ font-size: {20 if not _IS_MOBILE else 17}px !important; }}
 .stCaption {{ font-size: {13 if not _IS_MOBILE else 14}px !important; }}
 
 @media (max-width: 768px) {{
@@ -127,7 +133,31 @@ hr {{ border-color: var(--bg-border) !important; }}
 """, unsafe_allow_html=True)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
+# DhanHQ: lengthen cache vs default 60s — override with env (seconds). Token refresh is separate from TTL.
+DHAN_LTP_TTL   = max(60, int(os.environ.get("DHAN_LTP_TTL_SECONDS", "900")))      # default 15 min
+DHAN_MISC_TTL  = max(120, int(os.environ.get("DHAN_MISC_TTL_SECONDS", "1800")))   # funds / expiry list
 DHAN_CLIENT_ID  = "1109450231"
+
+# Tab 2 ↔ Validation Explorer: same five cores, same ranking order (first wins ties)
+BT_CORE_STYPES = ("ss", "ws", "ic", "bp", "bc")
+BT_STYPE_LABELS = {
+    "ss": "Short Strangle", "ws": "Wide Strangle", "ic": "Iron Condor",
+    "bp": "Bull Put Spread", "bc": "Bear Call Spread",
+}
+
+
+def _detail_popover(title: str, body_md: str):
+    """Mobile: short on-screen text + ℹ️ popover. Desktop: caption (full width)."""
+    if _IS_MOBILE:
+        pop = getattr(st, "popover", None)
+        if pop:
+            with st.popover(f"ℹ️ {title}"):
+                st.markdown(body_md)
+        else:
+            with st.expander(f"ℹ️ {title}", expanded=False):
+                st.markdown(body_md)
+    else:
+        st.caption(body_md)
 NIFTY_SCRIP_ID  = 13
 SENSEX_SCRIP_ID = 51
 IDX_SEG         = "IDX_I"
@@ -202,7 +232,7 @@ def lut_strategy_base(lut_entry):
 # ── Dhan API ──────────────────────────────────────────────────────────────────
 def _hdr(tok): return {"Content-Type":"application/json","client-id":DHAN_CLIENT_ID,"access-token":tok}
 
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=DHAN_LTP_TTL, show_spinner=False)
 def fetch_ltp(tok):
     try:
         r = requests.post("https://api.dhan.co/v2/marketfeed/ltp",
@@ -215,7 +245,7 @@ def fetch_ltp(tok):
     except: pass
     return None
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=DHAN_MISC_TTL, show_spinner=False)
 def fetch_funds(tok):
     try:
         r = requests.get("https://api.dhan.co/v2/fundlimit", headers=_hdr(tok), timeout=8)
@@ -223,7 +253,7 @@ def fetch_funds(tok):
         return {"available":d.get("availabelBalance",0),"used":d.get("utilizedAmount",0),"total":d.get("sodLimit",0)}
     except: return None
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=DHAN_MISC_TTL, show_spinner=False)
 def fetch_expiry_list(scrip_id, tok):
     try:
         r = requests.post("https://api.dhan.co/v2/optionchain/expirylist",
@@ -309,6 +339,9 @@ with st.sidebar:
     dte_adj = effective_dte(date.today(), parse_exp(sel_n_exp))
     st.caption(f"DTE: **{dte_adj}** trading days to {sel_n_exp} (weekends + holidays excluded)")
 
+    st.caption(
+        f"⏱️ **Dhan cache:** LTP **{DHAN_LTP_TTL // 60}m** · funds/expiry list **{DHAN_MISC_TTL // 60}m** "
+        f"(env `DHAN_LTP_TTL_SECONDS`, `DHAN_MISC_TTL_SECONDS`). **Chains** refresh each **Fetch** click.")
     # Fetch button
     fetch_btn = st.button("📡 Fetch Live Chain", type="primary", disabled=not has_tok,
                           use_container_width=True, key="fetch_live_btn")
@@ -428,7 +461,14 @@ def render_index(idx):
     if not ivp_ok:
         st.error(f"REGIME: SKIP — IVP={ivp_val} outside {ivp_range[0]}-{ivp_range[1]}%")
     else:
-        st.success(f"REGIME: ALLOW | IVP={ivp_val} | DTE={dte_adj}d | {src_lbl}")
+        if _IS_MOBILE:
+            st.success("✅ **REGIME: ALLOW**")
+            _detail_popover(
+                "Regime details",
+                f"**IVP** = {ivp_val} (your band {ivp_range[0]}–{ivp_range[1]}%). "
+                f"**DTE** = **{dte_adj}** trading days to selected expiry. **Data:** {src_lbl}.")
+        else:
+            st.success(f"REGIME: ALLOW | IVP={ivp_val} | DTE={dte_adj}d | {src_lbl}")
         if chain:
             st.caption(f"Spot: ₹{spot:,.1f} | Expiry: {exp_used} | Rounding: ₹{ROUND[idx]}")
 
@@ -561,6 +601,25 @@ def bt_gross_pnl_for_legs(bt_df, is_historical, bt_date, exit_date, bt_expiry,
         else:
             ok = False
     return total, ok
+
+
+def bt_pick_best_stype_net(bt_df, is_historical, bt_date, exit_date, bt_expiry,
+                           bt_entry_hhmm, bt_exit_hhmm, spot, dist_pct, lot, rnd,
+                           chain2, iv_val):
+    """Pick core strategy with highest net P&L (after ₹40×legs), same exit rules as Tab 2."""
+    best_st, best_net = None, None
+    for stp in BT_CORE_STYPES:
+        legs = bt_build_legs(spot, dist_pct, stp, rnd)
+        g, ok = bt_gross_pnl_for_legs(
+            bt_df, is_historical, bt_date, exit_date, bt_expiry,
+            bt_entry_hhmm, bt_exit_hhmm, legs, lot, spot, chain2, iv_val)
+        if not ok:
+            continue
+        net = g - round(40 * len(legs), 0)
+        if best_net is None or net > best_net:
+            best_net = net
+            best_st = stp
+    return best_st, best_net
 
 
 def bt_default_dist_pct(dte_sel):
@@ -880,9 +939,17 @@ with tab2:
             )
 
     if is_historical:
-        st.success("📁 **Historical Mode — Real P&L** · CSV premiums at **entry** bar + **15:00** on exit date.")
+        st.success("📁 **Historical — real P&L** (CSV)")
+        _detail_popover(
+            "Historical mode",
+            "Premiums from the backtest CSV at your **entry bar** (10:00 / 14:00 / 15:00) and **exit at 15:00** "
+            "on the chosen exit date (T close or T-1). **Brokerage** in Tab 2 / Validation = **₹40 × leg count**.")
     else:
-        st.warning("📡 **Live Mode — Estimated P&L** · Beyond CSV database. Entry from DhanHQ chain if available; exit estimated from LUT avg.")
+        st.warning("📡 **Live — estimated P&L**")
+        _detail_popover(
+            "Live mode",
+            "Trade date is **after** the CSV window. Entry from **Dhan chain** (or model estimate); exit is not fully "
+            "priced from history — treat numbers as indicative.")
 
     # Snapshot
     bt_valid = True
@@ -1020,20 +1087,13 @@ with tab2:
 
                 _strat_display = lut_strategy_display(lut)
                 _strat_base    = lut_strategy_base(lut)
-                kc1, kc2, kc3, kc4 = st.columns(4)
-                kc1.metric("Recommended Strategy", _strat_display)
-                kc2.metric("Historical Win Rate", f"{lut['win']}%")
-                kc3.metric("Avg P&L / Trade (LUT)", f"₹{lut['pnl']:+,}")
-                kc4.metric("Max Loss (backtest)",
-                           f"₹{lut['ml']:,}" if lut["ml"] else "None in dataset")
-                st.caption(
-                    f"Theta/Capital: **{lut['tc']}%/day** (per ₹1,25,000 short leg) · "
-                    f"Min theta: **{lut['th']} pts/day** · Gamma max: **{gam['max']}** · LUT: `{lut_key}` "
-                    f"(step DTE **{bt_dte_sel}** → bucket `{bt_lut_dte_key(bt_dte_sel)}`)")
+                lut_st = lut["st"]
 
                 ddef = bt_default_dist_pct(bt_dte_sel)
-                _prev_sl = st.session_state.get("bt_dist_slider")
-                if _prev_sl is not None and not (1.0 <= float(_prev_sl) <= 7.0):
+                if "bt_dist_slider" not in st.session_state:
+                    st.session_state["bt_dist_slider"] = float(ddef)
+                _ps = float(st.session_state["bt_dist_slider"])
+                if not (1.0 <= _ps <= 7.0):
                     st.session_state["bt_dist_slider"] = float(ddef)
 
                 st.markdown(
@@ -1054,13 +1114,51 @@ div[data-testid="stSlider"] [role="slider"] {
                 dist_pct = st.slider(
                     "Strike distance from spot (% OTM) — shorts symmetric; "
                     "spreads / IC add **+1%** buffer between short & long",
-                    1.0, 7.0, float(ddef), 0.5, key="bt_dist_slider",
+                    min_value=1.0, max_value=7.0, step=0.5, key="bt_dist_slider",
                     on_change=_sync_val_dist_from_bt2,
-                    help="Range 1–7%. Default: T / T-1 → 2% · T-2 → 3.5% · T-3 → 5% · T-4 / T-5 → 6%")
-                # Do not assign st.session_state["bt_dist_slider"] here — Streamlit forbids
-                # mutating a widget key after the widget is instantiated (same run).
+                    help="Synced with Validation Explorer. Same session key `bt_dist_slider`. "
+                         "Defaults: T / T-1 → 2% · T-2 → 3.5% · T-3 → 5% · T-4 / T-5 → 6% (first visit only).")
+                # Do not assign st.session_state["bt_dist_slider"] after the widget (Streamlit rule).
 
-                stype = lut["st"]
+                chain2_bt = st.session_state.get("nifty_chain", {})
+                if is_historical:
+                    best_st, _best_net = bt_pick_best_stype_net(
+                        bt_df, True, bt_date, exit_date, bt_expiry,
+                        bt_entry_hhmm, bt_exit_hhmm, bt_spot_val, dist_pct, lot, rnd,
+                        chain2_bt, bt_iv_val)
+                    stype = best_st if best_st else lut_st
+                else:
+                    stype = lut_st
+
+                _sim_lbl = BT_STYPE_LABELS.get(stype, stype.upper())
+                kc1, kc2, kc3, kc4 = st.columns(4)
+                kc1.metric(
+                    "P&L simulates",
+                    _sim_lbl,
+                    "↔ Validation best-net" if stype == lut_st else f"LUT: {_strat_display}",
+                )
+                kc2.metric("LUT win rate", f"{lut['win']}%", "for this bucket")
+                kc3.metric("LUT avg P&L", f"₹{lut['pnl']:+,}", "historical table")
+                kc4.metric("LUT max loss",
+                           f"₹{lut['ml']:,}" if lut["ml"] else "None in dataset")
+                if is_historical and stype != lut_st:
+                    if _IS_MOBILE:
+                        st.success("🎯 **Simulator = Validation best-net** at this % OTM")
+                    else:
+                        st.success(
+                            f"🎯 **Aligned with Validation Explorer:** highest **net** P&L at **{dist_pct:.1f}%** OTM "
+                            f"is **{_sim_lbl}** (Tab 2 exit rules). LUT still suggests **{_strat_display}**.")
+                    _detail_popover(
+                        "LUT vs simulator vs Validation",
+                        f"**This run:** best **net** P&L at **{dist_pct:.1f}%** OTM → **{_sim_lbl}**; LUT row → **{_strat_display}**.\n\n"
+                        "**LUT** = map from DTE × IV band × trend (sample stats).\n\n"
+                        "**Tab 2 rank** = same CSV + **your exit timing** (T or T-1 close).\n\n"
+                        "**Validation table** = exit **15:00 on expiry** for every leg — can differ slightly from Tab 2 "
+                        "if you use **T-1 exit** here.")
+                st.caption(
+                    f"Theta/Capital: **{lut['tc']}%/day** (per ₹1,25,000 short leg) · "
+                    f"Min theta: **{lut['th']} pts/day** · Gamma max: **{gam['max']}** · LUT key `{lut_key}` "
+                    f"(step DTE **{bt_dte_sel}** → bucket `{bt_lut_dte_key(bt_dte_sel)}`)")
                 legs_spec = bt_build_legs(bt_spot_val, dist_pct, stype, rnd)
                 dc, dp = lut.get("dc"), lut.get("dp")
                 if stype == "ss":
@@ -1338,8 +1436,10 @@ div[data-testid="stSlider"] [role="slider"] {
 
                 # ── Greeks (expander) ──────────────────────────────────────────
                 with st.expander("📐 Greeks — ranked by criticality", expanded=False):
-                    gp = BT_GP.get(lut["st"], BT_GP["ss"])
-                    st.info(f"Greeks for **{_strat_display}**. Check IN ORDER — first two are go/no-go gates.")
+                    gp = BT_GP.get(stype, BT_GP["ss"])
+                    st.info(
+                        f"Greeks for **{BT_STYPE_LABELS.get(stype, stype)}** (structure used in P&L). "
+                        f"Check IN ORDER — first two are go/no-go gates.")
                     order = sorted(gp.items(),
                                    key=lambda x: {"critical": 0, "important": 1, "monitor": 2, "low": 3}[x[1][0]])
                     vals = {
@@ -1391,8 +1491,8 @@ with tab_val:
     st.markdown("---")
     st.subheader("🔬 Validation Explorer")
     st.caption(
-        "Five core strategies at one **% OTM** (slider synced with Tab 2). "
-        "Brokerage = ₹40 × leg count.")
+        "Five core strategies at one **% OTM** — slider uses session key **`bt_dist_slider`** (same as Tab 2). "
+        "Exit here: **15:00 on expiry** for all legs. **Brokerage** = ₹40 × leg count.")
 
     if "val_date" not in st.session_state:
         st.session_state["val_date"] = st.session_state.get("bt_date2", date(2025, 10, 14))
@@ -1401,8 +1501,6 @@ with tab_val:
     if "val_dist_slider" not in st.session_state:
         st.session_state["val_dist_slider"] = float(
             st.session_state.get("bt_dist_slider", 3.5))
-    st.session_state["val_dist_slider"] = float(
-        st.session_state.get("bt_dist_slider", st.session_state.get("val_dist_slider", 3.5)))
 
     def _sync_bt_date_from_val():
         st.session_state["bt_date2"] = st.session_state["val_date"]
