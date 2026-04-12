@@ -1511,14 +1511,25 @@ with tab_val:
     def _sync_bt_dist_from_val():
         st.session_state["bt_dist_slider"] = float(st.session_state["val_dist_slider"])
 
+    _val_date_min = date(2024, 9, 23)
+    _val_date_max = date.today()
+    _vd = st.session_state.get("val_date")
+    if isinstance(_vd, date):
+        if _vd < _val_date_min:
+            st.session_state["val_date"] = _val_date_min
+        elif _vd > _val_date_max:
+            st.session_state["val_date"] = _val_date_max
+
     _val_bt_df = load_bt_df()
 
     vc1, vc2, vc3 = st.columns([2, 1, 1])
     with vc1:
         val_date = st.date_input(
             "Entry Date",
-            min_value=date(2024, 9, 23), max_value=BT_CSV_END,
-            key="val_date", on_change=_sync_bt_date_from_val)
+            min_value=_val_date_min,
+            max_value=_val_date_max,
+            key="val_date", on_change=_sync_bt_date_from_val,
+            help=f"Same range as Tab 2. CSV history ends **{BT_CSV_END}** — after that, spot/IV may be unavailable.")
         _val_bar_opts = ["14:00", "10:00", "15:00"]
         _ve0 = st.session_state.get("val_entry_hhmm", "14:00")
         if _ve0 not in _val_bar_opts:
@@ -1558,6 +1569,11 @@ with tab_val:
 
     show_profitable_only = st.toggle(
         "Show profitable strategies only", value=False, key="val_profitable_only")
+
+    if val_date > BT_CSV_END:
+        st.info(
+            f"📅 **Entry date after CSV end ({BT_CSV_END})** — Validation uses historical file through that date only; "
+            f"expect “no data” below unless the feed is extended.")
 
     if _val_bt_df.empty:
         st.warning("No historical CSV data. Validation Explorer requires the backtest CSV.")
