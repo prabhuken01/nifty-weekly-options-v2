@@ -225,14 +225,11 @@ with st.sidebar:
                f"Call: +{dist_pct:.1f}% to +{dist_pct+4*step_pct:.1f}%")
     st.markdown("---")
 
-    # ── SECTION 2: Live signal filters (Tab 1 only; Tab 2 has its own controls) ─
-    st.markdown("### 2️⃣ Live Signal Filters")
-    sig_thresh = st.number_input("Score threshold", 50, 90, 65, key="sig_thresh",
-                                 help="Used in Tab 1 — composite score SELL / MONITOR / AVOID")
-    ivp_range  = st.slider("IVP regime (%)", 0, 100, (20,80), key="ivp",
-                           help="Tab 1 regime filter on mock IVP")
-    excl_fri = st.toggle("Excl. Friday (caption)", value=True, key="excl_fri",
-                         help="Shown in Tab 1 top bar caption only")
+# ── Tab 1 live-signal filter defaults (widgets live inside Tab 1; tabs 2–3 reuse state)
+_ivp_st = st.session_state.get("ivp", (20, 80))
+ivp_range = tuple(_ivp_st) if isinstance(_ivp_st, (list, tuple)) else (20, 80)
+sig_thresh = int(st.session_state.get("sig_thresh", 65))
+excl_fri = bool(st.session_state.get("excl_fri", True))
 
 # ── Live data ─────────────────────────────────────────────────────────────────
 _ltp   = fetch_ltp(tok)   if tok else None
@@ -254,8 +251,6 @@ else:
 # Dynamic strike offsets
 PUT_OFFSETS  = [-(dist_pct/100 + i*(step_pct/100)) for i in range(5)]
 CALL_OFFSETS = [+(dist_pct/100 + i*(step_pct/100)) for i in range(5)]
-
-ivp_ok = ivp_range[0] <= IVP["NIFTY 50"] <= ivp_range[1]
 
 # ── Handle fetch button ───────────────────────────────────────────────────────
 # Auto-fetch on first load if token available but no chain cached yet
@@ -386,7 +381,8 @@ def load_bt_df():
     return df
 
 def bt_find_expiry(df, d):
-    fut = sorted(df[df["edate"] > d]["edate"].unique())
+    """Nearest expiry on or after trade date (includes same-day expiry sessions)."""
+    fut = sorted(df[df["edate"] >= d]["edate"].unique())
     return fut[0] if fut else None
 
 def bt_get_spot_at(df, d, hhmm):
@@ -423,10 +419,24 @@ def bt_get_prem(df, entry_d, exit_d, ed, strike, otype, entry_hhmm="15:00", exit
     return bt_prem_at(df, entry_d, ed, strike, otype, entry_hhmm), bt_prem_at(df, exit_d, ed, strike, otype, exit_hhmm)
 
 def bt_default_dist_pct(dte_sel):
-    return {"T-1": 2.0, "T-2": 3.5, "T-3": 5.0, "T-4": 6.0}.get(dte_sel, 5.0)
+    return {"T": 2.0, "T-1": 2.0, "T-2": 3.5, "T-3": 5.0, "T-4": 6.0, "T-5": 6.0}.get(dte_sel, 5.0)
 
-def bt_dist_slider_bounds(dte_sel):
-    return {"T-1": (1.0, 4.0), "T-2": (2.0, 6.0), "T-3": (3.0, 8.0), "T-4": (4.0, 10.0)}.get(dte_sel, (3.0, 8.0))
+
+def bt_lut_dte_key(dte_sel):
+    """LUT only defines T-4…T-1; T and T-5 map to nearest bucket."""
+    if dte_sel == "T":
+        return "T-1"
+    if dte_sel == "T-5":
+        return "T-4"
+    return dte_sel
+
+
+def bt_gamma_dte_key(dte_sel):
+    if dte_sel in ("T", "T-1"):
+        return "T-1"
+    if dte_sel == "T-5":
+        return "T-4"
+    return dte_sel
 
 def bt_build_legs(spot, dist_pct, stype, rnd):
     """dist_pct as percent (e.g. 5.0 for 5%). 1% buffer between short/long for spreads & IC."""
@@ -436,8 +446,10 @@ def bt_build_legs(spot, dist_pct, stype, rnd):
     ce_s = int(round(spot*(1+X)/rnd)*rnd)
     pe_l = int(round(spot*(1-X-buf)/rnd)*rnd)
     ce_l = int(round(spot*(1+X+buf)/rnd)*rnd)
-    if stype in ("ss", "ws"):
+    if stype == "ss":
         return [("Short Put", pe_s, "PE", "short"), ("Short Call", ce_s, "CE", "short")]
+    if stype == "ws":
+        return [("Long Put", pe_s, "PE", "long"), ("Long Call", ce_s, "CE", "long")]
     if stype == "ic":
         return [("Short Put", pe_s, "PE", "short"), ("Long Put", pe_l, "PE", "long"),
                 ("Short Call", ce_s, "CE", "short"), ("Long Call", ce_l, "CE", "long")]
@@ -462,10 +474,18 @@ def iv_band(pct):
     if pct < 22: return "18-22%"
     return ">22%"
 
-def dte_label(d):
-    if d >= 4: return "T-4"
-    if d == 3: return "T-3"
-    if d == 2: return "T-2"
+def dte_label(trade_d, expiry_d, dte_days):
+    """STEP 01 default from calendar + trading days to Nearest Expiry."""
+    if trade_d == expiry_d:
+        return "T"
+    if dte_days >= 5:
+        return "T-5"
+    if dte_days >= 4:
+        return "T-4"
+    if dte_days == 3:
+        return "T-3"
+    if dte_days == 2:
+        return "T-2"
     return "T-1"
 
 BT_LUT = {
@@ -570,6 +590,21 @@ tab1, tab2, tab3 = st.tabs(["Tab 1 - Live Signal", "Tab 2 - Backtest", "Tab 3 - 
 
 # ── TAB 1: Live Signal ────────────────────────────────────────────────────────
 with tab1:
+    st.markdown("##### Live signal filters")
+    _lf1, _lf2, _lf3 = st.columns(3)
+    with _lf1:
+        sig_thresh = st.number_input(
+            "Score threshold", 50, 90, 65, key="sig_thresh",
+            help="Composite score SELL / MONITOR / AVOID")
+    with _lf2:
+        ivp_range = st.slider(
+            "IVP regime (%)", 0, 100, (20, 80), key="ivp",
+            help="Regime filter on mock IVP (Tab 1)")
+    with _lf3:
+        excl_fri = st.toggle(
+            "Excl. Friday (caption)", value=True, key="excl_fri",
+            help="Shown in the status bar caption only")
+    ivp_ok = ivp_range[0] <= IVP["NIFTY 50"] <= ivp_range[1]
     top_bar()
     st.markdown("---")
     st.subheader("NIFTY 50 — Weekly Options Signal")
@@ -684,7 +719,10 @@ with tab2:
                    f"● {bt_entry_hhmm}" if is_historical else "~ live")
         sm2.metric("Nearest Expiry", bt_expiry.strftime("%Y-%m-%d"),
                    bt_expiry.strftime("%A"))
-        sm3.metric("DTE", f"{bt_dte_val} trading days")
+        _dte_caption = (
+            "same calendar day as expiry (0DTE session)" if bt_date == bt_expiry
+            else f"{bt_dte_val} trading days to expiry")
+        sm3.metric("DTE", _dte_caption)
         sm4.metric("ATM IV%", f"{bt_iv_pct}%",
                    "from ATM straddle" if is_historical else "~ live")
         sm5.metric("ATM Straddle",
@@ -695,25 +733,38 @@ with tab2:
 
         # ── Section 2: 3-Step Selection ───────────────────────────────────────
         st.markdown("#### 2️⃣ 3-Step Strategy Selection")
-        auto_dte = dte_label(bt_dte_val)
+        auto_dte = dte_label(bt_date, bt_expiry, bt_dte_val)
         auto_iv  = iv_band(bt_iv_pct)
+        _sync_sig = (str(bt_date), str(bt_expiry), auto_dte, auto_iv)
+        if st.session_state.get("bt_step_sync_sig") != _sync_sig:
+            st.session_state["bt_step_sync_sig"] = _sync_sig
+            st.session_state["bt_dte_sel"] = auto_dte
+            st.session_state["bt_iv_sel"] = auto_iv
+
         sc1, sc2, sc3 = st.columns(3)
         with sc1:
-            st.caption("STEP 01 — DTE · auto-set, override if needed")
-            dte_opts  = ["T-4","T-3","T-2","T-1"]
-            bt_dte_sel = st.radio("DTE", dte_opts,
-                                  index=dte_opts.index(auto_dte),
-                                  horizontal=True, key="bt_dte_sel",
-                                  label_visibility="collapsed")
+            st.caption("STEP 01 — DTE · auto from **Nearest Expiry** + calendar")
+            dte_opts = ["T-5", "T-4", "T-3", "T-2", "T-1", "T"]
+            st.caption(
+                "**T** = trade date **is** expiry · **T-5** = 5+ trading days out · "
+                "**T-1**…**T-4** = buckets toward expiry")
+            _dte_cur = st.session_state.get("bt_dte_sel", auto_dte)
+            if _dte_cur not in dte_opts:
+                _dte_cur = auto_dte
+            bt_dte_sel = st.radio(
+                "DTE", dte_opts, index=dte_opts.index(_dte_cur),
+                horizontal=True, key="bt_dte_sel", label_visibility="collapsed")
             if bt_dte_sel != auto_dte:
                 st.caption(f"⚡ Overriding auto ({auto_dte})")
         with sc2:
-            st.caption("STEP 02 — IV Band · auto-set from ATM straddle")
+            st.caption("STEP 02 — IV Band · auto-set from **ATM IV %** above")
             iv_opts  = ["<13%","13-15%","15-18%","18-22%",">22%"]
-            bt_iv_sel = st.radio("IV Band", iv_opts,
-                                 index=iv_opts.index(auto_iv),
-                                 horizontal=True, key="bt_iv_sel",
-                                 label_visibility="collapsed")
+            _iv_cur = st.session_state.get("bt_iv_sel", auto_iv)
+            if _iv_cur not in iv_opts:
+                _iv_cur = auto_iv
+            bt_iv_sel = st.radio(
+                "IV Band", iv_opts, index=iv_opts.index(_iv_cur),
+                horizontal=True, key="bt_iv_sel", label_visibility="collapsed")
             if bt_iv_sel != auto_iv:
                 st.caption(f"⚡ Overriding auto ({auto_iv})")
         with sc3:
@@ -736,9 +787,9 @@ with tab2:
 
         # ── Section 3: Strategy + dynamic strikes + P&L (v3) ───────────────────
         st.markdown("#### 3️⃣ Strategy Recommendation & P&L")
-        lut_key = f"{bt_dte_sel}|{bt_iv_sel}|{bt_trend}"
+        lut_key = f"{bt_lut_dte_key(bt_dte_sel)}|{bt_iv_sel}|{bt_trend}"
         lut = BT_LUT.get(lut_key)
-        gam = BT_GAMMA.get(bt_dte_sel, BT_GAMMA["T-4"])
+        gam = BT_GAMMA.get(bt_gamma_dte_key(bt_dte_sel), BT_GAMMA["T-4"])
         rnd = ROUND["NIFTY 50"]
         lot = LOT["NIFTY 50"]
         cap_leg = CAP["NIFTY 50"]  # ₹1,25,000 per short leg
@@ -763,22 +814,44 @@ with tab2:
                            f"₹{lut['ml']:,}" if lut["ml"] else "None in dataset")
                 st.caption(
                     f"Theta/Capital: **{lut['tc']}%/day** (per ₹1,25,000 short leg) · "
-                    f"Min theta: **{lut['th']} pts/day** · Gamma max: **{gam['max']}** · LUT: `{lut_key}`")
+                    f"Min theta: **{lut['th']} pts/day** · Gamma max: **{gam['max']}** · LUT: `{lut_key}` "
+                    f"(step DTE **{bt_dte_sel}** → bucket `{bt_lut_dte_key(bt_dte_sel)}`)")
 
-                lo, hi = bt_dist_slider_bounds(bt_dte_sel)
                 ddef = bt_default_dist_pct(bt_dte_sel)
+                _prev_sl = st.session_state.get("bt_dist_slider")
+                if _prev_sl is not None and not (1.0 <= float(_prev_sl) <= 7.0):
+                    st.session_state["bt_dist_slider"] = float(ddef)
+
+                st.markdown(
+                    """
+<style>
+/* Prominent strike-% slider (Tab 2) */
+div[data-testid="stSlider"] { padding: 14px 8px 22px !important; }
+div[data-testid="stSlider"] label p {
+  font-size: 1.05rem !important; font-weight: 600 !important; line-height: 1.35 !important;
+}
+div[data-testid="stSlider"] [data-baseweb="slider"] { height: 10px !important; }
+div[data-testid="stSlider"] [role="slider"] {
+  width: 22px !important; height: 22px !important; box-shadow: 0 0 0 3px rgba(255,75,75,0.35);
+}
+</style>
+""",
+                    unsafe_allow_html=True)
                 dist_pct = st.slider(
-                    f"Strike distance from spot (% OTM — symmetric shorts; "
-                    f"spreads/IC add **+1%** buffer between short & long)",
-                    float(lo), float(hi), float(ddef), 0.5, key="bt_dist_slider",
-                    help="T-1 default 2% · T-2 → 3.5% · T-3 → 5% · T-4 → 6%")
+                    "Strike distance from spot (% OTM) — shorts symmetric; "
+                    "spreads / IC add **+1%** buffer between short & long",
+                    1.0, 7.0, float(ddef), 0.5, key="bt_dist_slider",
+                    help="Range 1–7%. Default: T / T-1 → 2% · T-2 → 3.5% · T-3 → 5% · T-4 / T-5 → 6%")
 
                 stype = lut["st"]
                 legs_spec = bt_build_legs(bt_spot_val, dist_pct, stype, rnd)
                 dc, dp = lut.get("dc"), lut.get("dp")
-                if stype in ("ss", "ws"):
-                    strike_note = (f"Short Strangle / Wide: PUT −{dist_pct:.1f}% / CALL +{dist_pct:.1f}% "
+                if stype == "ss":
+                    strike_note = (f"Short Strangle: short PUT −{dist_pct:.1f}% / short CALL +{dist_pct:.1f}% "
                                    f"(LUT ref Δ PE {dp} / CE {dc})")
+                elif stype == "ws":
+                    strike_note = (f"Long Strangle (wide): long PUT −{dist_pct:.1f}% / long CALL +{dist_pct:.1f}% "
+                                   f"(LUT ref short-Δ targets PE {dp} / CE {dc} — debit strategy)")
                 elif stype == "ic":
                     strike_note = (f"Iron Condor: shorts ±{dist_pct:.1f}%, longs ±{dist_pct+1:.1f}% "
                                    f"(1% buffer) · LUT ref Δ PE {dp} / CE {dc}")
@@ -798,9 +871,8 @@ with tab2:
                     f"Entry **{bt_date}** `{bt_entry_hhmm}` · Exit **{exit_date}** `{bt_exit_hhmm}` · "
                     f"{bt_exit_mode}")
                 rows_data = []
-                _s = {"pnl": 0, "has_exit": True}
+                _s = {"pnl": 0, "has_exit": True, "entry_debit": 0.0}
                 n_short = sum(1 for t in legs_spec if t[3] == "short")
-                total_cap = cap_leg * n_short
 
                 for label, strike, otype, side in legs_spec:
                     if is_historical:
@@ -826,7 +898,9 @@ with tab2:
                     else:
                         leg_pnl = None
                         _s["has_exit"] = False
-                    cap_show = f"₹{cap_leg:,}" if side == "short" else "—"
+                    if e_p is not None and side == "long":
+                        _s["entry_debit"] += e_p * lot
+                    cap_show = f"₹{cap_leg:,}" if side == "short" else ("debit" if side == "long" else "—")
                     rows_data.append({
                         "Leg": label, "Strike": f"₹{strike:,}", "Type": otype, "Side": side[:1].upper(),
                         "Entry Prem": f"₹{e_p:.1f}" if e_p else "—",
@@ -838,6 +912,9 @@ with tab2:
 
                 total_pnl = _s["pnl"]
                 has_exit = _s["has_exit"]
+                entry_debit = _s["entry_debit"]
+                total_cap = cap_leg * n_short if n_short else entry_debit
+                cap_basis_lbl = "Total short margin (1.25L × shorts)" if n_short else "Premium paid (long legs × lot)"
                 ret_pct = (total_pnl / total_cap * 100) if total_cap and has_exit else None
 
                 if rows_data:
@@ -865,15 +942,15 @@ with tab2:
                     if is_historical and has_exit:
                         outcome = "✅ PROFIT" if total_pnl > 0 else "❌ LOSS"
                         r1.metric("Actual P&L (1 lot)", f"₹{total_pnl:+,.0f}", outcome)
-                        r2.metric("Total capital (short legs)", f"₹{total_cap:,}",
-                                  f"{n_short} × ₹1,25,000")
+                        r2.metric("Basis for return %", f"₹{total_cap:,.0f}",
+                                  cap_basis_lbl if n_short else "sum of entry premium × lot")
                         r3.metric("Return on capital", f"{ret_pct:+.2f}%" if ret_pct is not None else "—")
                         diff = round((total_pnl - lut["pnl"]) / max(abs(lut["pnl"]), 1) * 100)
                         r4.metric("vs LUT avg", f"{diff:+.0f}%",
                                   "above avg" if diff > 0 else "below avg")
                     else:
                         r1.metric("Estimated P&L", "~ pending" if not has_exit else f"₹{total_pnl:+,.0f}")
-                        r2.metric("Total capital (short legs)", f"₹{total_cap:,}")
+                        r2.metric("Basis for return %", f"₹{total_cap:,.0f}" if total_cap else "—")
                         r3.metric("Return %", "—" if not has_exit else f"{ret_pct:+.2f}%")
                         r4.metric("LUT Avg", f"₹{lut['pnl']:+,}")
                 else:
@@ -881,12 +958,14 @@ with tab2:
 
                 # ── Entry params (expander) ────────────────────────────────────
                 with st.expander("📋 Entry Params (Do's & Don'ts)", expanded=False):
-                    ce_ref = int(round(bt_spot_val * (1 + dc) / rnd) * rnd) if dc else None
-                    pe_ref = int(round(bt_spot_val * (1 + dp) / rnd) * rnd) if dp else None
-                    if dc:
-                        st.markdown(f"**LUT CE short Δ ref:** `+{dc}` → ≈ **₹{ce_ref:,}**")
-                    if dp:
-                        st.markdown(f"**LUT PE short Δ ref:** `{dp}` → ≈ **₹{pe_ref:,}**")
+                    st.markdown(
+                        "LUT fields **`dc` / `dp`** are **option delta targets** (roughly −0.30…+0.30), "
+                        "**not** % away from spot. Pick strikes on the live chain whose delta is near those values; "
+                        "the **P&L table above** uses the **% OTM slider** vs spot, not these deltas.")
+                    if dc is not None:
+                        st.markdown(f"**LUT call-side Δ ref (short-strangle context):** `{dc:+}`")
+                    if dp is not None:
+                        st.markdown(f"**LUT put-side Δ ref (short-strangle context):** `{dp:+}`")
                     st.markdown(
                         f"**Theta check:** Combined short-leg theta ≥ **{lut['th']} pts/day** "
                         f"({lut['tc']}% of **₹1,25,000 per short leg**). Sum theta × {lot} for each short.")
@@ -945,13 +1024,13 @@ with tab2:
 
 **Live Mode** — Date > Mar 24 2026: entry from DhanHQ chain (or estimated). Exit pending until expiry.
 
-**Strike distance** — Slider default: T-1 → 2%, T-2 → 3.5%, T-3 → 5%, T-4 → 6%. Spreads & Iron Condor use **+1%** further OTM for long legs.
+**Strike distance** — Slider **1–7%** OTM; defaults: T / T-1 → 2%, T-2 → 3.5%, T-3 → 5%, T-4 / T-5 → 6%. Spreads & Iron Condor use **+1%** further OTM for long legs.
 
 **Capital** — **₹1,25,000 per short leg** (NIFTY). Strangle/IC (2 shorts) = ₹2,50,000. Bull put / Bear call (1 short) = ₹1,25,000. Return % = P&L ÷ total short capital.
 
 **Expiry rule** — Before Sep 2025: Thursday. From Sep 2025 onward: Tuesday (NSE rule change).
 
-**DTE label** — T-4 = 4+ trading days, T-3 = 3d, T-2 = 2d, T-1 = 1d to expiry.
+**DTE label (STEP 01)** — **T** = trade date equals **Nearest Expiry** (0DTE). **T-5** = 5+ trading days. **T-4** = 4d, **T-3** = 3d, **T-2** = 2d, **T-1** = 1d. LUT rows use T-4…T-1 only; **T** / **T-5** map to **T-1** / **T-4** buckets for win rate & P&L lookup.
 
 **IV Band** — ATM straddle IV derived using Brenner-Subrahmanyam approximation from actual CE+PE close prices.
 
