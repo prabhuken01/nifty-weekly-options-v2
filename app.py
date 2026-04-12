@@ -794,10 +794,10 @@ with tab2:
                     st.info(
                         f"Entry date: **{bt_date.strftime('%Y-%m-%d')}** at 15:00 close · "
                         f"Exit date: **{exit_date.strftime('%Y-%m-%d')}** ({bt_exit_mode})")
-                    rows_data = []; total_pnl = 0; has_exit = True
+                    rows_data = []
+                    _s = {"pnl": 0, "has_exit": True}  # mutable state for leg accumulator
 
                     def _add_leg(strike, otype, label):
-                        nonlocal total_pnl, has_exit
                         if not strike: return
                         if is_historical:
                             e_p, x_p = bt_get_prem(bt_df, bt_date, exit_date,
@@ -815,9 +815,9 @@ with tab2:
                             src  = "~ est"
                         leg_pnl = round((e_p - x_p) * lot) if (e_p and x_p) else None
                         if leg_pnl is not None:
-                            total_pnl += leg_pnl
+                            _s["pnl"] += leg_pnl
                         else:
-                            has_exit = False
+                            _s["has_exit"] = False
                         rows_data.append({
                             "Leg": label, "Strike": f"₹{strike:,}", "Type": otype,
                             "Entry Prem": f"₹{e_p:.1f}" if e_p else "—",
@@ -828,6 +828,7 @@ with tab2:
 
                     if ce_strike: _add_leg(ce_strike, "CE", "Short Call")
                     if pe_strike: _add_leg(pe_strike, "PE", "Short Put")
+                    total_pnl = _s["pnl"]; has_exit = _s["has_exit"]
 
                     if rows_data:
                         df_legs = pd.DataFrame(rows_data)
