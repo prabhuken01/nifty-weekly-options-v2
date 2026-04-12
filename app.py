@@ -952,13 +952,15 @@ div[data-testid="stSlider"] [role="slider"] {
                         _s["has_exit"] = False
                     if e_p is not None and side == "long":
                         _s["entry_debit"] += e_p * lot
-                    cap_show = f"₹{cap_leg:,}" if side == "short" else ("debit" if side == "long" else "—")
                     rows_data.append({
-                        "Leg": label, "Strike": f"₹{strike:,}", "Type": otype, "Side": side[:1].upper(),
-                        "Entry Prem": f"₹{e_p:.1f}" if e_p else "—",
-                        "Exit Prem": f"₹{x_p:.1f}" if x_p else "pending",
-                        "P&L / Lot": f"₹{leg_pnl:+,.0f}" if leg_pnl is not None else "~ est",
-                        "Cap / leg": cap_show,
+                        "Leg": label,
+                        "Strike": int(strike),
+                        "Type": otype,
+                        "Side": side[:1].upper(),
+                        "Entry Prem": float(e_p) if e_p is not None else np.nan,
+                        "Exit Prem": float(x_p) if x_p is not None else np.nan,
+                        "P&L / Lot": float(leg_pnl) if leg_pnl is not None else np.nan,
+                        "Cap / leg": float(cap_leg) if side == "short" else np.nan,
                         "Src": src,
                     })
 
@@ -971,22 +973,11 @@ div[data-testid="stSlider"] [role="slider"] {
 
                 if rows_data:
                     df_legs = pd.DataFrame(rows_data)
-
-                    def _style_legs(df):
-                        def _rc(col):
-                            if col.name == "P&L / Lot":
-                                return [("color:#21c55d" if "+" in str(v) else
-                                         "color:#ef4444" if "-" in str(v) else "")
-                                        for v in col]
-                            if col.name == "Type":
-                                return [("color:#3b82f6" if v == "CE" else
-                                         "color:#ef4444" if v == "PE" else "")
-                                        for v in col]
-                            if col.name == "Src":
-                                return [("color:#21c55d" if "real" in str(v) else "color:#6b7280")
-                                        for v in col]
-                            return [""] * len(col)
-                        return df.style.apply(_rc)
+                    _leg_cols = [
+                        "Leg", "Strike", "Type", "Side",
+                        "Entry Prem", "Exit Prem", "P&L / Lot", "Cap / leg", "Src",
+                    ]
+                    df_legs = df_legs[_leg_cols]
 
                     if stype == "ic":
                         st.caption(
@@ -995,7 +986,85 @@ div[data-testid="stSlider"] [role="slider"] {
                             "typically **higher** than the wing. Puts: inner strike **above** wing strike — same idea. "
                             "Premiums are from the CSV at your entry/exit timestamps."
                         )
-                    st.dataframe(_style_legs(df_legs), use_container_width=True, hide_index=True)
+
+                    def _style_bt_legs(df):
+                        """Dark table + accent colors (matches earlier Tab 2 look)."""
+                        tbl = [
+                            dict(selector="", props=[
+                                ("background-color", "#0d1117"),
+                                ("color", "#e6edf3"),
+                            ]),
+                            dict(selector="thead th", props=[
+                                ("background-color", "#1e2a3d"),
+                                ("color", "#f0f6fc"),
+                                ("font-weight", "600"),
+                                ("padding", "10px 12px"),
+                                ("border-bottom", "2px solid #30363d"),
+                            ]),
+                            dict(selector="tbody td", props=[
+                                ("color", "#e6edf3"),
+                                ("padding", "8px 12px"),
+                                ("border-bottom", "1px solid #21262d"),
+                            ]),
+                            dict(selector="tbody tr:nth-child(even) td", props=[
+                                ("background-color", "#121922"),
+                            ]),
+                            dict(selector="tbody tr:nth-child(odd) td", props=[
+                                ("background-color", "#0d1117"),
+                            ]),
+                        ]
+
+                        def _cell_colors(col):
+                            if col.name == "P&L / Lot":
+                                out = []
+                                for v in col:
+                                    if pd.isna(v):
+                                        out.append("")
+                                    elif v > 0:
+                                        out.append("color: #21c55d; font-weight: 600")
+                                    elif v < 0:
+                                        out.append("color: #ef4444; font-weight: 600")
+                                    else:
+                                        out.append("color: #e6edf3")
+                                return out
+                            if col.name == "Type":
+                                return [
+                                    "color: #3b82f6; font-weight: 600" if v == "CE" else
+                                    "color: #ef4444; font-weight: 600" if v == "PE" else ""
+                                    for v in col
+                                ]
+                            if col.name == "Src":
+                                return [
+                                    "color: #21c55d" if "real" in str(v) else "color: #6b7280"
+                                    for v in col
+                                ]
+                            return [""] * len(col)
+
+                        fmt = {
+                            "Strike": lambda v: f"₹{int(v):,}" if pd.notna(v) else "—",
+                            "Entry Prem": lambda v: f"₹{v:.1f}" if pd.notna(v) else "—",
+                            "Exit Prem": lambda v: f"₹{v:.1f}" if pd.notna(v) else "—",
+                            "P&L / Lot": lambda v: f"₹{v:+,.0f}" if pd.notna(v) else "—",
+                            "Cap / leg": lambda v: f"₹{v:,.0f}" if pd.notna(v) else "—",
+                        }
+                        return (
+                            df.style
+                            .set_table_styles(tbl)
+                            .apply(_cell_colors, axis=0)
+                            .format(fmt, na_rep="—")
+                        )
+
+                    with st.container(border=True):
+                        st.caption(
+                            f"Leg breakdown · entry `{bt_entry_hhmm}` · exit `{bt_exit_hhmm}` · × {lot} qty/lot"
+                        )
+                        st.dataframe(
+                            _style_bt_legs(df_legs),
+                            hide_index=True,
+                            use_container_width=True,
+                            height=min(420, 72 + len(df_legs) * 36),
+                            column_order=_leg_cols,
+                        )
 
                     r1, r2, r3, r4 = st.columns(4)
                     if is_historical and has_exit:
