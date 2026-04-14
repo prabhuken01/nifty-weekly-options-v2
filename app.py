@@ -497,7 +497,9 @@ if (fetch_btn or _auto_fetch) and has_tok:
 def make_leg(offsets, side, idx):
     spot       = st.session_state.get("nifty_spot_live" if idx=="NIFTY 50" else "sensex_spot_live", SPOT[idx])
     chain      = st.session_state.get("nifty_chain"     if idx=="NIFTY 50" else "sensex_chain",     {})
-    iv         = live_iv_from_chain(chain, spot, idx, dte_adj)  # Dynamic IV from live chain, or fallback to IV_ANN
+    _exp_key = "nifty_exp_used" if idx=="NIFTY 50" else "sensex_exp_used"
+    _cal_dte = max((parse_exp(st.session_state.get(_exp_key, sel_n_exp if idx=="NIFTY 50" else sel_s_exp)) - date.today()).days, 1)
+    iv         = live_iv_from_chain(chain, spot, idx, _cal_dte)  # Calendar DTE for Black-Scholes
     lot        = LOT[idx];    rnd = ROUND[idx]
     cap        = capital_base  # same for both (1.25L default or Dhan total)
     rows = []
@@ -598,8 +600,11 @@ def top_bar():
         SPOT["SENSEX"]
     )
 
-    nifty_iv = live_iv_from_chain(nifty_chain, nifty_spot, "NIFTY 50", dte_adj)
-    sensex_iv = live_iv_from_chain(sensex_chain, sensex_spot, "SENSEX", dte_adj)
+    # Use calendar days for IV formula (Black-Scholes convention), not trading days
+    nifty_cal_dte = max((parse_exp(st.session_state.get("nifty_exp_used", sel_n_exp)) - date.today()).days, 1)
+    sensex_cal_dte = max((parse_exp(st.session_state.get("sensex_exp_used", sel_s_exp)) - date.today()).days, 1)
+    nifty_iv = live_iv_from_chain(nifty_chain, nifty_spot, "NIFTY 50", nifty_cal_dte)
+    sensex_iv = live_iv_from_chain(sensex_chain, sensex_spot, "SENSEX", sensex_cal_dte)
 
     # Show data freshness indicator
     ltp_age_mins = (datetime.now().timestamp() - st.session_state.get("ltp_refresh_ts", 0)) / 60
@@ -678,13 +683,21 @@ def live_iv_from_chain(chain, spot, idx, dte_days):
     atm = int(round(spot/rnd)*rnd)
 
     # Find prices from chain for ATM calls and puts
+    # Use fuzzy key matching (Dhan returns float keys like "23900.0", not "23900")
     oc = chain.get("oc", {})
-    atm_str = str(atm)
+    atm_data = None
+    for k, v in oc.items():
+        try:
+            if abs(float(k) - atm) < 1:
+                atm_data = v
+                break
+        except (ValueError, TypeError):
+            continue
 
-    if atm_str not in oc: return IV_ANN[idx]
+    if atm_data is None: return IV_ANN[idx]
 
-    ce_ltp = oc[atm_str].get("ce", {}).get("last_price")
-    pe_ltp = oc[atm_str].get("pe", {}).get("last_price")
+    ce_ltp = atm_data.get("ce", {}).get("last_price")
+    pe_ltp = atm_data.get("pe", {}).get("last_price")
 
     if not ce_ltp or not pe_ltp: return IV_ANN[idx]
 
