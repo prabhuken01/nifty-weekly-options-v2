@@ -171,6 +171,8 @@ NSE_HOLIDAYS = {
 LOT   = {"NIFTY 50": 65,      "SENSEX": 20}
 CAP   = {"NIFTY 50": 125_000, "SENSEX": 125_000}   # both default 1.25L
 ROUND = {"NIFTY 50": 50,      "SENSEX": 100}
+# Fallback IV values used when live option chain data is unavailable
+# In normal operation, IV is calculated dynamically from ATM straddle (DTE≥2 rule)
 IV_ANN= {"NIFTY 50": 0.142,   "SENSEX": 0.138}
 
 # ── Helper functions ──────────────────────────────────────────────────────────
@@ -668,7 +670,8 @@ def bt_get_spot(df, d):
     return None
 
 def live_iv_from_chain(chain, spot, idx, dte_days):
-    """Calculate IV from live option chain ATM straddle (same logic as backtest)."""
+    """Calculate IV from live option chain ATM straddle (DTE≥2 rule).
+    Falls back to IV_ANN if chain unavailable or insufficient data."""
     if not chain: return IV_ANN[idx]
 
     rnd = ROUND[idx]
@@ -2362,15 +2365,19 @@ with tab_iv_analysis:
 
             # Display latest metrics
             if comparison:
+                latest_date_str = comparison['latest_date']
                 c1, c2, c3, c4 = st.columns(4)
-                c1.metric("Latest IV", f"{comparison['latest_iv']:.1f}%",
-                         f"Date: {comparison['latest_date']}")
+                c1.metric("Backtest IV (Historical)", f"{comparison['latest_iv']:.1f}%",
+                         f"Date: {latest_date_str}")
                 c2.metric("14-Day Mean", f"{comparison['historical_mean']:.1f}%",
                          f"Median: {comparison['historical_median']:.1f}%")
                 c3.metric("Z-Score", f"{comparison['z_score']:.2f}σ",
                          f"Percentile: {comparison['percentile_rank']:.0f}%")
                 c4.metric("IV Band", comparison['iv_percentile_band'],
                          f"Spot: ₹{comparison['latest_spot']:,.1f}")
+
+                st.warning(f"⚠️ **Note:** This IV Analysis tab shows **historical backtest data from {latest_date_str}**, "
+                          f"not current live data. Compare with the live IV in the top bar (fetched from Dhan API).")
 
             # Charts: IV and IVP trend
             st.markdown("**IV & IVP Trend (14 days)**")
