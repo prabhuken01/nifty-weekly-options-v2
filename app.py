@@ -230,7 +230,9 @@ def lut_strategy_base(lut_entry):
 def _hdr(tok): return {"Content-Type":"application/json","client-id":DHAN_CLIENT_ID,"access-token":tok}
 
 @st.cache_data(ttl=DHAN_LTP_TTL, show_spinner=False)
-def fetch_ltp(tok):
+@st.cache_data(ttl=DHAN_LTP_TTL, show_spinner=False)
+def fetch_ltp_cached(tok):
+    """Cached LTP fetch (respects DHAN_LTP_TTL, default 15 min)."""
     try:
         r = requests.post("https://api.dhan.co/v2/marketfeed/ltp",
                           json={"IDX_I":[13,51]}, headers=_hdr(tok), timeout=8)
@@ -240,6 +242,29 @@ def fetch_ltp(tok):
         if n and s:
             return {"nifty":float(n),"sensex":float(s),"ts":datetime.now().strftime("%H:%M:%S")}
     except: pass
+    return None
+
+def fetch_ltp(tok):
+    """Non-cached LTP for session state updates (always tries fresh)."""
+    try:
+        r = requests.post("https://api.dhan.co/v2/marketfeed/ltp",
+                          json={"IDX_I":[13,51]}, headers=_hdr(tok), timeout=8)
+        resp_json = r.json()
+
+        if resp_json.get("status") == "failure":
+            st.warning(f"⚠️ LTP fetch failed: {resp_json.get('message','Unknown error')}")
+            return None
+
+        idx = resp_json.get("data",{}).get("IDX_I",{})
+        n = idx.get("13",{}).get("last_price")
+        s = idx.get("51",{}).get("last_price")
+
+        if n and s:
+            return {"nifty":float(n),"sensex":float(s),"ts":datetime.now().strftime("%H:%M:%S")}
+    except requests.Timeout:
+        st.warning("⚠️ LTP fetch timeout (API slow)")
+    except Exception as e:
+        st.warning(f"⚠️ LTP fetch error: {str(e)[:50]}")
     return None
 
 @st.cache_data(ttl=DHAN_MISC_TTL, show_spinner=False)
@@ -362,10 +387,16 @@ sig_thresh = int(st.session_state.get("sig_thresh", 65))
 _ltp   = fetch_ltp(tok)   if tok else None
 _funds = fetch_funds(tok) if tok else None
 
-# Use session state spot as primary source (from last successful fetch), fallback to _ltp, then defaults
+# Use session state spot as primary source (from chain fetch), fallback to session LTP, then _ltp, then defaults
 SPOT = {
-    "NIFTY 50": st.session_state.get("nifty_spot_live", _ltp["nifty"] if _ltp else 22700),
-    "SENSEX":   st.session_state.get("sensex_spot_live", _ltp["sensex"] if _ltp else 73320)
+    "NIFTY 50": st.session_state.get(
+        "nifty_spot_live",
+        st.session_state.get("nifty_ltp_live", _ltp["nifty"] if _ltp else 22700)
+    ),
+    "SENSEX": st.session_state.get(
+        "sensex_spot_live",
+        st.session_state.get("sensex_ltp_live", _ltp["sensex"] if _ltp else 73320)
+    )
 }
 PRICE_TS  = _ltp["ts"] if _ltp else "—"
 PRICE_SRC = "Dhan LTP" if _ltp else "Mock"
@@ -489,22 +520,39 @@ def render_index(idx):
     )
 
 def top_bar():
-    # Calculate dynamic IV from live chains (fallback to static if no chain data)
+    # Get freshest spot prices: chain (T-0 from fetch) > session LTP > SPOT
     nifty_chain = st.session_state.get("nifty_chain", {})
     sensex_chain = st.session_state.get("sensex_chain", {})
-    nifty_spot = st.session_state.get("nifty_spot_live", SPOT["NIFTY 50"])
-    sensex_spot = st.session_state.get("sensex_spot_live", SPOT["SENSEX"])
+
+    nifty_spot = (
+        st.session_state.get("nifty_spot_live") or  # From chain fetch (most recent)
+        st.session_state.get("nifty_ltp_live") or   # From manual/auto LTP refresh
+        SPOT["NIFTY 50"]  # Last known good value
+    )
+    sensex_spot = (
+        st.session_state.get("sensex_spot_live") or
+        st.session_state.get("sensex_ltp_live") or
+        SPOT["SENSEX"]
+    )
 
     nifty_iv = live_iv_from_chain(nifty_chain, nifty_spot, "NIFTY 50", dte_adj)
     sensex_iv = live_iv_from_chain(sensex_chain, sensex_spot, "SENSEX", dte_adj)
 
+    # Show data freshness indicator
+    ltp_age_mins = (datetime.now().timestamp() - st.session_state.get("ltp_refresh_ts", 0)) / 60
+    freshness_indicator = "🔴" if ltp_age_mins > 5 else "🟢"
+
     c1,c2,c3,c4 = st.columns(4)
-    c1.metric("NIFTY 50",  f"₹{SPOT['NIFTY 50']:,.0f}")
+    c1.metric("NIFTY 50",  f"₹{nifty_spot:,.0f}")
     c2.metric("NIFTY IV",  f"{nifty_iv*100:.1f}%")
-    c3.metric("SENSEX",    f"₹{SPOT['SENSEX']:,.0f}")
+    c3.metric("SENSEX",    f"₹{sensex_spot:,.0f}")
     c4.metric("SENSEX IV", f"{sensex_iv*100:.1f}%")
     st.info(f"**Markets ready** | DTE {dte_adj} trading days")
-    st.caption(f"🕐 {PRICE_SRC} | {PRICE_TS} | auto-refresh 1 min")
+
+    # Show data source and age
+    if st.session_state.get("nifty_ltp_live"):
+        ltp_ts_formatted = datetime.fromtimestamp(st.session_state.get("ltp_refresh_ts", 0)).strftime("%H:%M:%S")
+        st.caption(f"{freshness_indicator} LTP @ {ltp_ts_formatted} | Chains refreshed separately | Auto-refresh every 2 min")
 
 # ── Backtest Engine helpers ────────────────────────────────────────────────────
 BT_CSV_END = date(2026, 3, 24)
@@ -1095,6 +1143,31 @@ with tab1:
     sig_thresh = st.number_input(
         "Score threshold", 50, 90, 65, key="sig_thresh",
         help="Composite score SELL / MONITOR / AVOID")
+
+    # ── Auto-refresh LTP + manual refresh button ───────────────────────────────
+    if has_tok:
+        _refresh_col1, _refresh_col2 = st.columns([3, 1])
+        with _refresh_col2:
+            if st.button("🔄 Refresh LTP", use_container_width=True, key="refresh_ltp_btn"):
+                fresh_ltp = fetch_ltp(tok)
+                if fresh_ltp:
+                    st.session_state["nifty_ltp_live"] = fresh_ltp["nifty"]
+                    st.session_state["sensex_ltp_live"] = fresh_ltp["sensex"]
+                    st.session_state["ltp_refresh_ts"] = datetime.now().timestamp()
+                    st.success(f"✓ LTP updated at {fresh_ltp['ts']}")
+                    st.rerun()
+                else:
+                    st.error("✗ Failed to refresh LTP")
+
+        # Auto-refresh on first load or if data is older than 2 minutes
+        _ltp_age = (datetime.now().timestamp() - st.session_state.get("ltp_refresh_ts", 0)) / 60
+        if st.session_state.get("nifty_ltp_live") is None or _ltp_age > 2:
+            fresh_ltp = fetch_ltp(tok)
+            if fresh_ltp:
+                st.session_state["nifty_ltp_live"] = fresh_ltp["nifty"]
+                st.session_state["sensex_ltp_live"] = fresh_ltp["sensex"]
+                st.session_state["ltp_refresh_ts"] = datetime.now().timestamp()
+
     top_bar()
     st.markdown("---")
     st.subheader("NIFTY 50 — Weekly Options Signal")
