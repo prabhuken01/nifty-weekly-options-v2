@@ -172,7 +172,6 @@ LOT   = {"NIFTY 50": 65,      "SENSEX": 20}
 CAP   = {"NIFTY 50": 125_000, "SENSEX": 125_000}   # both default 1.25L
 ROUND = {"NIFTY 50": 50,      "SENSEX": 100}
 IV_ANN= {"NIFTY 50": 0.142,   "SENSEX": 0.138}
-IVP   = {"NIFTY 50": 42,      "SENSEX": 38}
 
 # ── Helper functions ──────────────────────────────────────────────────────────
 def effective_dte(from_date, expiry):
@@ -204,13 +203,11 @@ def delta_bs(spot, strike, iv, dte_days, side):
     nd1 = float(norm.cdf(d1))
     return round(nd1 - 1, 3) if side == "put" else round(nd1, 3)
 
-def ivp_quality(ivp): return min(100, ivp * 1.25)
-def comp_score(prob, ivp, ret_pct=0):
-    """Score = 40% × Prob(OTM) + 30% × IVP quality + 30% × Return attractiveness"""
-    prob_component = prob * 100 * 0.40
-    ivp_component  = ivp_quality(ivp) * 0.30
-    ret_component  = min(100, ret_pct * 25) * 0.30   # 4% ret = 100 score
-    return round(prob_component + ivp_component + ret_component)
+def comp_score(prob, ret_pct=0):
+    """Score = 60% × Prob(OTM) + 40% × Return attractiveness"""
+    prob_component = prob * 100 * 0.60
+    ret_component  = min(100, ret_pct * 25) * 0.40   # 4% ret = 100 score
+    return round(prob_component + ret_component)
 def sig_label(sc, thr=65): return "SELL" if sc>=thr else ("MONITOR" if sc>=50 else "AVOID")
 def sig_color(lbl): return {"SELL":"#C6EFCE","MONITOR":"#FFEB9C","AVOID":"#FFC7CE"}[lbl]
 
@@ -359,17 +356,17 @@ with st.sidebar:
     st.markdown("---")
 
 # ── Tab 1 live-signal filter defaults (widgets live inside Tab 1; tabs 2–3 reuse state)
-_ivp_st = st.session_state.get("ivp", (20, 80))
-ivp_range = tuple(_ivp_st) if isinstance(_ivp_st, (list, tuple)) else (20, 80)
 sig_thresh = int(st.session_state.get("sig_thresh", 65))
-excl_fri = bool(st.session_state.get("excl_fri", True))
 
 # ── Live data ─────────────────────────────────────────────────────────────────
 _ltp   = fetch_ltp(tok)   if tok else None
 _funds = fetch_funds(tok) if tok else None
 
-SPOT = {"NIFTY 50": _ltp["nifty"]  if _ltp else 22700,
-        "SENSEX":   _ltp["sensex"] if _ltp else 73320}
+# Use session state spot as primary source (from last successful fetch), fallback to _ltp, then defaults
+SPOT = {
+    "NIFTY 50": st.session_state.get("nifty_spot_live", _ltp["nifty"] if _ltp else 22700),
+    "SENSEX":   st.session_state.get("sensex_spot_live", _ltp["sensex"] if _ltp else 73320)
+}
 PRICE_TS  = _ltp["ts"] if _ltp else "—"
 PRICE_SRC = "Dhan LTP" if _ltp else "Mock"
 
@@ -406,7 +403,7 @@ if (fetch_btn or _auto_fetch) and has_tok:
 def make_leg(offsets, side, idx):
     spot       = st.session_state.get("nifty_spot_live" if idx=="NIFTY 50" else "sensex_spot_live", SPOT[idx])
     chain      = st.session_state.get("nifty_chain"     if idx=="NIFTY 50" else "sensex_chain",     {})
-    iv         = IV_ANN[idx]; ivp_val = IVP[idx]
+    iv         = IV_ANN[idx]
     lot        = LOT[idx];    rnd = ROUND[idx]
     cap        = capital_base  # same for both (1.25L default or Dhan total)
     rows = []
@@ -426,7 +423,7 @@ def make_leg(offsets, side, idx):
         theta   = round(prem*lot/dte_adj, 1)
         vega    = round(-prem*lot*0.15, 1)
         cushion = round(theta/abs(vega), 1) if vega else 0
-        score   = comp_score(prob, ivp_val, ret)
+        score   = comp_score(prob, ret)
         action  = sig_label(score, sig_thresh)
         # Ext.loss: loss if spot moves 0.5% beyond strike
         ext     = round(abs(abs(off)+0.005)*lot*strike, 0)
@@ -456,21 +453,16 @@ def render_index(idx):
     spot      = st.session_state.get("nifty_spot_live" if idx=="NIFTY 50" else "sensex_spot_live",SPOT[idx])
     ts        = st.session_state.get("chain_ts","")
     src_lbl   = f"Dhan (fetched {ts})" if chain else "Formula estimate"
-    ivp_val   = IVP[idx]
 
-    if not ivp_ok:
-        st.error(f"REGIME: SKIP — IVP={ivp_val} outside {ivp_range[0]}-{ivp_range[1]}%")
+    if _IS_MOBILE:
+        st.success("✅ **Ready to trade**")
+        _detail_popover(
+            "Trade details",
+            f"**DTE** = **{dte_adj}** trading days to selected expiry. **Data:** {src_lbl}.")
     else:
-        if _IS_MOBILE:
-            st.success("✅ **REGIME: ALLOW**")
-            _detail_popover(
-                "Regime details",
-                f"**IVP** = {ivp_val} (your band {ivp_range[0]}–{ivp_range[1]}%). "
-                f"**DTE** = **{dte_adj}** trading days to selected expiry. **Data:** {src_lbl}.")
-        else:
-            st.success(f"REGIME: ALLOW | IVP={ivp_val} | DTE={dte_adj}d | {src_lbl}")
-        if chain:
-            st.caption(f"Spot: ₹{spot:,.1f} | Expiry: {exp_used} | Rounding: ₹{ROUND[idx]}")
+        st.success(f"Ready to trade | DTE={dte_adj}d | {src_lbl}")
+    if chain:
+        st.caption(f"Spot: ₹{spot:,.1f} | Expiry: {exp_used} | Rounding: ₹{ROUND[idx]}")
 
     put_df  = make_leg(PUT_OFFSETS,  "put",  idx)
     call_df = make_leg(CALL_OFFSETS, "call", idx)
@@ -499,11 +491,10 @@ def render_index(idx):
 def top_bar():
     c1,c2,c3,c4 = st.columns(4)
     c1.metric("NIFTY 50",  f"₹{SPOT['NIFTY 50']:,.0f}")
-    c2.metric("NIFTY IV",  f"{IV_ANN['NIFTY 50']*100:.1f}%", f"IVP {IVP['NIFTY 50']}")
+    c2.metric("NIFTY IV",  f"{IV_ANN['NIFTY 50']*100:.1f}%")
     c3.metric("SENSEX",    f"₹{SPOT['SENSEX']:,.0f}")
-    c4.metric("SENSEX IV", f"{IV_ANN['SENSEX']*100:.1f}%",   f"IVP {IVP['SENSEX']}")
-    regime = "ALLOW" if ivp_ok else "SKIP"
-    st.info(f"**Regime:** {regime} | IVP {IVP['NIFTY 50']} | DTE {dte_adj} | {'Fri excluded' if excl_fri else 'All days'}")
+    c4.metric("SENSEX IV", f"{IV_ANN['SENSEX']*100:.1f}%")
+    st.info(f"**Markets ready** | DTE {dte_adj} trading days")
     st.caption(f"🕐 {PRICE_SRC} | {PRICE_TS} | auto-refresh 1 min")
 
 # ── Backtest Engine helpers ────────────────────────────────────────────────────
@@ -1055,20 +1046,9 @@ tab1, tab2, tab_val, tab3 = st.tabs(["Tab 1 - Live Signal", "Tab 2 - Backtest", 
 # ── TAB 1: Live Signal ────────────────────────────────────────────────────────
 with tab1:
     st.markdown("##### Live signal filters")
-    _lf1, _lf2, _lf3 = st.columns(3)
-    with _lf1:
-        sig_thresh = st.number_input(
-            "Score threshold", 50, 90, 65, key="sig_thresh",
-            help="Composite score SELL / MONITOR / AVOID")
-    with _lf2:
-        ivp_range = st.slider(
-            "IVP regime (%)", 0, 100, (20, 80), key="ivp",
-            help="Regime filter on mock IVP (Tab 1)")
-    with _lf3:
-        excl_fri = st.toggle(
-            "Excl. Friday (caption)", value=True, key="excl_fri",
-            help="Shown in the status bar caption only")
-    ivp_ok = ivp_range[0] <= IVP["NIFTY 50"] <= ivp_range[1]
+    sig_thresh = st.number_input(
+        "Score threshold", 50, 90, 65, key="sig_thresh",
+        help="Composite score SELL / MONITOR / AVOID")
     top_bar()
     st.markdown("---")
     st.subheader("NIFTY 50 — Weekly Options Signal")
@@ -1090,7 +1070,7 @@ with tab1:
 
     with st.expander("Glossary"):
         st.markdown("""
-**Score** = 40% × Prob N(d2) + 30% × min(IVP×1.25, 100) + 30% × min(Return%×25, 100). SELL ≥ threshold, MONITOR ≥50, else AVOID.
+**Score** = 60% × Prob N(d2) + 40% × min(Return%×25, 100). SELL ≥ threshold, MONITOR ≥50, else AVOID.
 
 **Prob N(d2)** — BS probability option expires worthless. Inputs: spot, strike, IV, r=6.5%, DTE (holidays excluded).
 
