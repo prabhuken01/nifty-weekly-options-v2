@@ -244,27 +244,70 @@ def fetch_ltp_cached(tok):
     except: pass
     return None
 
+def fetch_ltp_kite(kite_api_key, kite_access_token):
+    """Fetch LTP from Kite Connect (fallback when Dhan fails)."""
+    try:
+        from kiteconnect import KiteConnect
+        kite = KiteConnect(api_key=kite_api_key)
+        kite.access_token = kite_access_token
+
+        # Fetch quotes for NIFTY (256265) and SENSEX (265)
+        quotes = kite.quote(["NSE:NIFTY50", "BSE:SENSEX"])
+
+        n = quotes.get("NSE:NIFTY50", {}).get("last_price", 0)
+        s = quotes.get("BSE:SENSEX", {}).get("last_price", 0)
+
+        if n and s:
+            return {"nifty":float(n),"sensex":float(s),"ts":datetime.now().strftime("%H:%M:%S"), "source":"Kite"}
+    except ImportError:
+        pass  # KiteConnect not installed
+    except Exception:
+        pass  # Kite fetch failed
+    return None
+
 def fetch_ltp(tok):
-    """Non-cached LTP for session state updates (always tries fresh)."""
+    """Non-cached LTP for session state updates (Dhan → Kite fallback → None)."""
+    # Try Dhan first
     try:
         r = requests.post("https://api.dhan.co/v2/marketfeed/ltp",
                           json={"IDX_I":[13,51]}, headers=_hdr(tok), timeout=8)
         resp_json = r.json()
 
         if resp_json.get("status") == "failure":
-            st.warning(f"⚠️ LTP fetch failed: {resp_json.get('message','Unknown error')}")
-            return None
+            dhan_msg = resp_json.get('message','Unknown error')
+            if "401" in str(resp_json) or "Unauthorized" in dhan_msg:
+                # Token expired
+                st.warning(f"🔴 **Dhan token expired** — Paste new token below")
+            else:
+                st.warning(f"⚠️ Dhan LTP failed: {dhan_msg[:40]}")
+            dhan_success = False
+        else:
+            idx = resp_json.get("data",{}).get("IDX_I",{})
+            n = idx.get("13",{}).get("last_price")
+            s = idx.get("51",{}).get("last_price")
+            if n and s:
+                return {"nifty":float(n),"sensex":float(s),"ts":datetime.now().strftime("%H:%M:%S"), "source":"Dhan"}
+            dhan_success = False
 
-        idx = resp_json.get("data",{}).get("IDX_I",{})
-        n = idx.get("13",{}).get("last_price")
-        s = idx.get("51",{}).get("last_price")
-
-        if n and s:
-            return {"nifty":float(n),"sensex":float(s),"ts":datetime.now().strftime("%H:%M:%S")}
     except requests.Timeout:
-        st.warning("⚠️ LTP fetch timeout (API slow)")
+        st.warning("⚠️ Dhan timeout — trying Kite fallback")
+        dhan_success = False
     except Exception as e:
-        st.warning(f"⚠️ LTP fetch error: {str(e)[:50]}")
+        st.warning(f"⚠️ Dhan error — trying Kite fallback")
+        dhan_success = False
+
+    # Try Kite fallback if Dhan failed
+    try:
+        kite_key = st.secrets.get("kite", {}).get("api_key")
+        kite_token = st.secrets.get("kite", {}).get("access_token")
+        if kite_key and kite_token:
+            kite_ltp = fetch_ltp_kite(kite_key, kite_token)
+            if kite_ltp:
+                st.info(f"✓ Using Kite LTP (Dhan unavailable)")
+                return kite_ltp
+    except:
+        pass
+
     return None
 
 @st.cache_data(ttl=DHAN_MISC_TTL, show_spinner=False)
@@ -303,11 +346,18 @@ def ltp_from_chain(chain, strike, side):
             return round(float(ltp),1) if ltp else None
     return None
 
-# ── Token: secrets → session ──────────────────────────────────────────────────
+# ── Token: secrets → session (Dhan + Kite) ───────────────────────────────────
 if not st.session_state.get("dhan_tok"):
     try:
         t = st.secrets["dhan"]["access_token"]
         if t: st.session_state["dhan_tok"] = t
+    except: pass
+
+if not st.session_state.get("kite_loaded"):
+    try:
+        kite_cfg = st.secrets.get("kite", {})
+        if kite_cfg.get("api_key") and kite_cfg.get("access_token"):
+            st.session_state["kite_loaded"] = True
     except: pass
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
@@ -322,24 +372,35 @@ with st.sidebar:
         st.session_state.get("dhan_tok") and
         not st.session_state.get("dhan_token")
     )
-    if st.session_state.get("dhan_tok"):
-        st.success("🔑 **Token active** — with **Secrets**, this works on **every device** automatically.")
-        with st.expander("Override token (this session only)"):
-            _ov = st.text_input("New token", type="password", key="dhan_token_override")
-            if _ov:
-                st.session_state["dhan_tok"] = _ov
+    st.markdown("**📊 Live Data Source**")
+    _tab_dhan, _tab_kite = st.tabs(["Dhan (Primary)", "Kite (Fallback)"])
+
+    with _tab_dhan:
+        if st.session_state.get("dhan_tok"):
+            st.success("✅ Dhan token active")
+            st.caption(f"⏰ Token expires in ~24h. When it expires, paste a new one below.")
+            with st.expander("Paste new token (when it expires)"):
+                _ov = st.text_input("New Dhan token", type="password", key="dhan_token_override")
+                if _ov:
+                    st.session_state["dhan_tok"] = _ov
+                    st.session_state["_tok_manually_set"] = True
+                    st.success("✓ Token updated (this session)")
+        else:
+            st.warning("No Dhan token — LTP will use cache + Kite fallback")
+            _inp = st.text_input("Dhan access token (24h expiry)", type="password", key="dhan_token")
+            if _inp:
+                st.session_state["dhan_tok"] = _inp
                 st.session_state["_tok_manually_set"] = True
-    else:
-        st.warning("⚠️ No token in Secrets — paste below to load live chains & LTP")
-        _inp = st.text_input("Dhan access token", type="password", key="dhan_token")
-        if _inp:
-            st.session_state["dhan_tok"] = _inp
-            st.session_state["_tok_manually_set"] = True
-        st.caption(
-            "📱 **Phone / tablet:** open this app here and paste the **same** token once per session. "
-            "Streamlit does not copy your desktop session to mobile — use **Secrets** (`dhan.access_token`) "
-            "for automatic market data on all devices.")
-        st.caption("☁️ **Streamlit Cloud:** Project Settings → Secrets → `dhan.access_token` = your token")
+                st.success("✓ Token loaded (this session)")
+            st.caption("Get token: https://web.dhan.co/ → Profile → Copy API Token")
+
+    with _tab_kite:
+        if st.session_state.get("kite_loaded"):
+            st.success("✅ Kite token configured")
+            st.caption("Kite is ready as fallback when Dhan unavailable")
+        else:
+            st.info("Kite provides fallback LTP when Dhan fails")
+            st.caption("Setup: Run `python kite_token_generator.py` then add to secrets.toml [kite] section")
 
     tok = st.session_state.get("dhan_tok","")
     has_tok = bool(tok)
