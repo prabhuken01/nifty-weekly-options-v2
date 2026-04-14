@@ -209,7 +209,7 @@ def comp_score(prob, ret_pct=0):
     ret_component  = min(100, ret_pct * 25) * 0.40   # 4% ret = 100 score
     return round(prob_component + ret_component)
 def sig_label(sc, thr=65): return "SELL" if sc>=thr else ("MONITOR" if sc>=50 else "AVOID")
-def sig_color(lbl): return {"SELL":"#C6EFCE","MONITOR":"#FFEB9C","AVOID":"#FFC7CE"}[lbl]
+def sig_color(lbl): return {"SELL":"#00AA55","MONITOR":"#FF9500","AVOID":"#DD3333"}[lbl]
 
 # ── Strategy name normalisation (BUG 1 + BUG 2) ──────────────────────────
 def norm_strategy_name(s):
@@ -403,7 +403,7 @@ if (fetch_btn or _auto_fetch) and has_tok:
 def make_leg(offsets, side, idx):
     spot       = st.session_state.get("nifty_spot_live" if idx=="NIFTY 50" else "sensex_spot_live", SPOT[idx])
     chain      = st.session_state.get("nifty_chain"     if idx=="NIFTY 50" else "sensex_chain",     {})
-    iv         = IV_ANN[idx]
+    iv         = live_iv_from_chain(chain, spot, idx, dte_adj)  # Dynamic IV from live chain, or fallback to IV_ANN
     lot        = LOT[idx];    rnd = ROUND[idx]
     cap        = capital_base  # same for both (1.25L default or Dhan total)
     rows = []
@@ -437,7 +437,7 @@ def make_leg(offsets, side, idx):
 def style_leg(df):
     def _apply(col):
         if col.name == "Action":
-            return [f"background-color:{sig_color(v)};color:{'black' if sig_color(v)=='#C6EFCE' else 'white'};font-weight:bold"
+            return [f"background-color:{sig_color(v)};color:white;font-weight:bold"
                     for v in col]
         if col.name == "Src":
             return ["color:#00cc88" if v=="live" else "color:#888" for v in col]
@@ -489,11 +489,20 @@ def render_index(idx):
     )
 
 def top_bar():
+    # Calculate dynamic IV from live chains (fallback to static if no chain data)
+    nifty_chain = st.session_state.get("nifty_chain", {})
+    sensex_chain = st.session_state.get("sensex_chain", {})
+    nifty_spot = st.session_state.get("nifty_spot_live", SPOT["NIFTY 50"])
+    sensex_spot = st.session_state.get("sensex_spot_live", SPOT["SENSEX"])
+
+    nifty_iv = live_iv_from_chain(nifty_chain, nifty_spot, "NIFTY 50", dte_adj)
+    sensex_iv = live_iv_from_chain(sensex_chain, sensex_spot, "SENSEX", dte_adj)
+
     c1,c2,c3,c4 = st.columns(4)
     c1.metric("NIFTY 50",  f"₹{SPOT['NIFTY 50']:,.0f}")
-    c2.metric("NIFTY IV",  f"{IV_ANN['NIFTY 50']*100:.1f}%")
+    c2.metric("NIFTY IV",  f"{nifty_iv*100:.1f}%")
     c3.metric("SENSEX",    f"₹{SPOT['SENSEX']:,.0f}")
-    c4.metric("SENSEX IV", f"{IV_ANN['SENSEX']*100:.1f}%")
+    c4.metric("SENSEX IV", f"{sensex_iv*100:.1f}%")
     st.info(f"**Markets ready** | DTE {dte_adj} trading days")
     st.caption(f"🕐 {PRICE_SRC} | {PRICE_TS} | auto-refresh 1 min")
 
@@ -502,10 +511,21 @@ BT_CSV_END = date(2026, 3, 24)
 
 @st.cache_data(show_spinner=False)
 def load_bt_df():
-    p = os.path.join(os.path.dirname(__file__), "Backtest-Engine",
-                     "final_merged_output_30m_strike_within_6pct.csv")
-    if not os.path.exists(p): return pd.DataFrame()
-    df = pd.read_csv(p, parse_dates=["timestamp_30m","expiry"])
+    bt_dir = os.path.join(os.path.dirname(__file__), "Backtest-Engine")
+    # Try parquet first (faster, smaller), fall back to CSV
+    p_parquet = os.path.join(bt_dir, "final_merged_output_30m_strike_within_6pct.parquet")
+    p_csv = os.path.join(bt_dir, "final_merged_output_30m_strike_within_6pct.csv")
+
+    if os.path.exists(p_parquet):
+        df = pd.read_parquet(p_parquet)
+        # Ensure date columns are parsed (parquet may preserve types)
+        df["timestamp_30m"] = pd.to_datetime(df["timestamp_30m"])
+        df["expiry"] = pd.to_datetime(df["expiry"])
+    elif os.path.exists(p_csv):
+        df = pd.read_csv(p_csv, parse_dates=["timestamp_30m","expiry"])
+    else:
+        return pd.DataFrame()
+
     df["tdate"] = df["timestamp_30m"].dt.date
     df["edate"] = df["expiry"].dt.date
     df["hhmm"]  = df["timestamp_30m"].dt.strftime("%H:%M")
@@ -537,6 +557,32 @@ def bt_get_spot(df, d):
         v = bt_get_spot_at(df, d, h)
         if v is not None: return v
     return None
+
+def live_iv_from_chain(chain, spot, idx, dte_days):
+    """Calculate IV from live option chain ATM straddle (same logic as backtest)."""
+    if not chain: return IV_ANN[idx]
+
+    rnd = ROUND[idx]
+    atm = int(round(spot/rnd)*rnd)
+
+    # Find prices from chain for ATM calls and puts
+    oc = chain.get("oc", {})
+    atm_str = str(atm)
+
+    if atm_str not in oc: return IV_ANN[idx]
+
+    ce_ltp = oc[atm_str].get("ce", {}).get("last_price")
+    pe_ltp = oc[atm_str].get("pe", {}).get("last_price")
+
+    if not ce_ltp or not pe_ltp: return IV_ANN[idx]
+
+    stv = float(ce_ltp) + float(pe_ltp)
+    T = dte_days / 365
+
+    if T > 0:
+        iv = round(stv / (0.8 * spot * math.sqrt(T)), 4)
+        return min(iv, 0.50)  # Cap at 50% for safety
+    return IV_ANN[idx]
 
 def bt_iv_straddle(df, d, ed, spot, hhmm="15:00"):
     rnd = ROUND["NIFTY 50"]
@@ -1093,6 +1139,11 @@ with tab2:
     st.caption("Entry bar + strike % slider · ₹1.25L per short leg · IC/spreads +1% long buffer · P&L first, details in expanders")
 
     bt_df = load_bt_df()
+
+    # Data source footnote
+    data_src_note = "**Data source:** 30-min OHLC for NIFTY options (Oct 2024–Mar 2026) | Strikes within 6% of spot | Contains: timestamp, strike, option type (CE/PE), OHLC prices, volume, OI, underlying spot"
+    with st.expander("ℹ️ About this backtest data", expanded=False):
+        st.caption(data_src_note)
 
     # ── Section 1: Date & Mode ────────────────────────────────────────────────
     st.markdown("#### 1️⃣ Select Date, Entry & Exit Timing")
