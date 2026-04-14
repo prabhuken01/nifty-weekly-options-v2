@@ -1,0 +1,411 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Tab 2 — Tier A vs Tier B table preview</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,600;0,9..40,700;1,9..40,400&family=Syne:wght@600;700;800&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --tier-a-bg: #0b0f14;
+      --tier-a-surface: #121922;
+      --tier-a-text: #e6edf3;
+      --tier-a-muted: #8b9cb3;
+      --tier-a-accent: #5eead4;
+      --tier-a-pos: #4ade80;
+      --tier-a-neg: #fb7185;
+      --tier-b-bg: #1a1423;
+      --tier-b-paper: #faf6f0;
+      --tier-b-ink: #1c1530;
+      --tier-b-rule: #c4b8a8;
+      --tier-b-rust: #b45309;
+      --tier-b-teal: #0d9488;
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: "DM Sans", system-ui, sans-serif;
+      background: linear-gradient(145deg, #06080c 0%, #151a24 50%, #0d1117 100%);
+      color: var(--tier-a-text);
+      padding: 2rem 1.25rem 3rem;
+    }
+
+    h1 {
+      font-family: "Syne", sans-serif;
+      font-weight: 800;
+      font-size: clamp(1.35rem, 4vw, 1.85rem);
+      letter-spacing: -0.02em;
+      margin: 0 0 0.35rem;
+      color: #fff;
+    }
+
+    .page-sub {
+      color: var(--tier-a-muted);
+      font-size: 0.95rem;
+      max-width: 52rem;
+      margin-bottom: 2rem;
+      line-height: 1.5;
+    }
+
+    .grid {
+      display: grid;
+      gap: 2rem;
+      max-width: 1200px;
+      margin: 0 auto;
+    }
+
+    @media (min-width: 960px) {
+      .grid { grid-template-columns: 1fr 1fr; align-items: start; }
+    }
+
+    .panel {
+      border-radius: 14px;
+      overflow: hidden;
+      box-shadow:
+        0 0 0 1px rgba(255,255,255,0.06),
+        0 24px 48px -12px rgba(0,0,0,0.55);
+    }
+
+    /* —— Tier A: Streamlit-style dark dataframe —— */
+    .tier-a {
+      background: var(--tier-a-bg);
+      border: 1px solid rgba(94, 234, 212, 0.2);
+    }
+
+    .tier-a .panel-head {
+      background: var(--tier-a-surface);
+      padding: 1rem 1.15rem;
+      border-bottom: 1px solid rgba(255,255,255,0.08);
+    }
+
+    .tier-a .badge {
+      display: inline-block;
+      font-size: 0.65rem;
+      font-weight: 700;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--tier-a-accent);
+      margin-bottom: 0.35rem;
+    }
+
+    .tier-a .panel-head h2 {
+      margin: 0;
+      font-family: "Syne", sans-serif;
+      font-size: 1.1rem;
+      font-weight: 700;
+      color: var(--tier-a-text);
+    }
+
+    .tier-a .panel-head p {
+      margin: 0.35rem 0 0;
+      font-size: 0.8rem;
+      color: var(--tier-a-muted);
+    }
+
+    .tier-a .table-wrap {
+      padding: 0.5rem 0 0.75rem;
+      overflow-x: auto;
+    }
+
+    .tier-a table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.82rem;
+    }
+
+    .tier-a thead th {
+      text-align: left;
+      padding: 0.65rem 0.85rem;
+      color: var(--tier-a-muted);
+      font-weight: 600;
+      font-size: 0.72rem;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      border-bottom: 1px solid rgba(255,255,255,0.1);
+      white-space: nowrap;
+    }
+
+    .tier-a thead th.num { text-align: right; }
+
+    .tier-a tbody td {
+      padding: 0.6rem 0.85rem;
+      border-bottom: 1px solid rgba(255,255,255,0.05);
+      color: var(--tier-a-text);
+    }
+
+    .tier-a tbody tr:nth-child(even) td {
+      background: rgba(255,255,255,0.02);
+    }
+
+    .tier-a tbody tr:hover td {
+      background: rgba(94, 234, 212, 0.06);
+    }
+
+    .tier-a td.num { text-align: right; font-variant-numeric: tabular-nums; }
+    .tier-a .type-ce { color: #7dd3fc; font-weight: 600; }
+    .tier-a .type-pe { color: #fca5a5; font-weight: 600; }
+    .tier-a .pnl-pos { color: var(--tier-a-pos); font-weight: 600; }
+    .tier-a .pnl-neg { color: var(--tier-a-neg); font-weight: 600; }
+    .tier-a .src { color: var(--tier-a-accent); font-size: 0.78rem; }
+
+    /* —— Tier B: Great Tables–style light “report” —— */
+    .tier-b {
+      background: var(--tier-b-paper);
+      border: 1px solid var(--tier-b-rule);
+    }
+
+    .tier-b .panel-head {
+      background: var(--tier-b-ink);
+      color: var(--tier-b-paper);
+      padding: 1.25rem 1.25rem 1.1rem;
+    }
+
+    .tier-b .badge {
+      display: inline-block;
+      font-size: 0.65rem;
+      font-weight: 700;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--tier-b-teal);
+      margin-bottom: 0.45rem;
+    }
+
+    .tier-b .panel-head h2 {
+      margin: 0;
+      font-family: "Syne", sans-serif;
+      font-size: 1.25rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+    }
+
+    .tier-b .panel-head .subtitle {
+      margin: 0.4rem 0 0;
+      font-size: 0.88rem;
+      opacity: 0.85;
+      font-weight: 400;
+    }
+
+    .tier-b .table-wrap {
+      padding: 1rem 1.25rem 1.35rem;
+      overflow-x: auto;
+    }
+
+    .tier-b table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.88rem;
+      color: var(--tier-b-ink);
+    }
+
+    .tier-b thead th {
+      text-align: left;
+      padding: 0.55rem 0.65rem;
+      font-weight: 700;
+      font-size: 0.72rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--tier-b-rust);
+      border-bottom: 2px solid var(--tier-b-ink);
+    }
+
+    .tier-b thead th.num { text-align: right; }
+
+    .tier-b tbody td {
+      padding: 0.65rem 0.65rem;
+      border-bottom: 1px solid var(--tier-b-rule);
+    }
+
+    .tier-b tbody tr:last-child td { border-bottom: none; }
+
+    .tier-b td.num {
+      text-align: right;
+      font-variant-numeric: tabular-nums;
+      font-feature-settings: "tnum" 1;
+    }
+
+    .tier-b .leg { font-weight: 600; }
+    .tier-b .type-ce { color: #0369a1; font-weight: 700; }
+    .tier-b .type-pe { color: #b91c1c; font-weight: 700; }
+    .tier-b .pnl-pos { color: #047857; font-weight: 700; }
+    .tier-b .pnl-neg { color: #be123c; font-weight: 700; }
+
+    .tier-b .footer-note {
+      padding: 0 1.25rem 1.15rem;
+      font-size: 0.78rem;
+      color: #57534e;
+      border-top: 1px dashed var(--tier-b-rule);
+      margin: 0 1.25rem;
+      padding-top: 0.75rem;
+    }
+
+    .open-hint {
+      text-align: center;
+      margin-top: 2rem;
+      font-size: 0.85rem;
+      color: var(--tier-a-muted);
+    }
+
+    .open-hint code {
+      background: rgba(255,255,255,0.06);
+      padding: 0.2rem 0.45rem;
+      border-radius: 6px;
+      color: var(--tier-a-accent);
+    }
+  </style>
+</head>
+<body>
+  <h1>Tab 2 table UI — Tier A vs Tier B (static preview)</h1>
+  <p class="page-sub">
+    Same sample iron-condor legs; left mimics <strong>Streamlit <code>st.dataframe</code> + <code>column_config</code></strong>
+    (dark, high-contrast). Right mimics <strong>Great Tables</strong> (light “report” on dark ink header).
+    Open this file in your browser — not wired to Python.
+  </p>
+
+  <div class="grid">
+    <!-- Tier A -->
+    <section class="panel tier-a" aria-label="Tier A preview">
+      <div class="panel-head">
+        <span class="badge">Tier A</span>
+        <h2>Actual P&L result</h2>
+        <p>Streamlit-style · column help + number formats · zebra rows</p>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Leg</th>
+              <th class="num">Strike</th>
+              <th>Type</th>
+              <th>Side</th>
+              <th class="num">Entry</th>
+              <th class="num">Exit</th>
+              <th class="num">P&L / lot</th>
+              <th class="num">Cap / leg</th>
+              <th>Src</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Short Put (inner)</td>
+              <td class="num">24,400</td>
+              <td class="type-pe">PE</td>
+              <td>S</td>
+              <td class="num">13.4</td>
+              <td class="num">12.9</td>
+              <td class="num pnl-pos">+32.5</td>
+              <td class="num">1,25,000</td>
+              <td class="src">● real</td>
+            </tr>
+            <tr>
+              <td>Short Call (inner)</td>
+              <td class="num">25,850</td>
+              <td class="type-ce">CE</td>
+              <td>S</td>
+              <td class="num">13.3</td>
+              <td class="num">11.3</td>
+              <td class="num pnl-pos">+130.0</td>
+              <td class="num">1,25,000</td>
+              <td class="src">● real</td>
+            </tr>
+            <tr>
+              <td>Long Put (wing)</td>
+              <td class="num">24,150</td>
+              <td class="type-pe">PE</td>
+              <td>L</td>
+              <td class="num">3.3</td>
+              <td class="num">2.3</td>
+              <td class="num pnl-neg">−65.0</td>
+              <td class="num">—</td>
+              <td class="src">● real</td>
+            </tr>
+            <tr>
+              <td>Long Call (wing)</td>
+              <td class="num">26,100</td>
+              <td class="type-ce">CE</td>
+              <td>L</td>
+              <td class="num">3.2</td>
+              <td class="num">2.4</td>
+              <td class="num pnl-neg">−52.0</td>
+              <td class="num">—</td>
+              <td class="src">● real</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- Tier B -->
+    <section class="panel tier-b" aria-label="Tier B preview">
+      <div class="panel-head">
+        <span class="badge">Tier B</span>
+        <h2>Actual P&L — sample legs</h2>
+        <p class="subtitle">Iron condor · 1 lot · Great Tables–style header + typographic table</p>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Leg</th>
+              <th class="num">Strike (₹)</th>
+              <th>Type</th>
+              <th>Side</th>
+              <th class="num">Entry (₹)</th>
+              <th class="num">Exit (₹)</th>
+              <th class="num">P&L (₹)</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td class="leg">Short Put (inner)</td>
+              <td class="num">24,400</td>
+              <td class="type-pe">PE</td>
+              <td>S</td>
+              <td class="num">13.4</td>
+              <td class="num">12.9</td>
+              <td class="num pnl-pos">+32.5</td>
+            </tr>
+            <tr>
+              <td class="leg">Short Call (inner)</td>
+              <td class="num">25,850</td>
+              <td class="type-ce">CE</td>
+              <td>S</td>
+              <td class="num">13.3</td>
+              <td class="num">11.3</td>
+              <td class="num pnl-pos">+130.0</td>
+            </tr>
+            <tr>
+              <td class="leg">Long Put (wing)</td>
+              <td class="num">24,150</td>
+              <td class="type-pe">PE</td>
+              <td>L</td>
+              <td class="num">3.3</td>
+              <td class="num">2.3</td>
+              <td class="num pnl-neg">−65.0</td>
+            </tr>
+            <tr>
+              <td class="leg">Long Call (wing)</td>
+              <td class="num">26,100</td>
+              <td class="type-ce">CE</td>
+              <td>L</td>
+              <td class="num">3.2</td>
+              <td class="num">2.4</td>
+              <td class="num pnl-neg">−52.0</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="footer-note">
+        Source: CSV premiums at entry/exit bars · Nifty lot = 65 — static mock only.
+      </p>
+    </section>
+  </div>
+
+  <p class="open-hint">
+    File: <code>Backtest-Engine/mockups/tier_ab_table_preview.html</code> — double-click or drag into Chrome/Edge.
+  </p>
+</body>
+</html>

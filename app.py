@@ -694,14 +694,34 @@ def live_iv_from_chain(chain, spot, idx, dte_days):
     return IV_ANN[idx]
 
 def bt_iv_straddle(df, d, ed, spot, hhmm="15:00"):
+    """
+    Calculate IV from ATM straddle using DTE>=2 rule for stability.
+    Falls back to nearest expiry if no valid DTE>=2 expiry found.
+    """
     rnd = ROUND["NIFTY 50"]
     atm = int(round(spot/rnd)*rnd)
-    rows = df[(df["tdate"]==d) & (df["edate"]==ed) & (df["hhmm"]==hhmm)]
+
+    # NEW: Find first expiry with DTE >= 2 (instead of using provided ed)
+    # Get all available expiries from this date
+    available_expiries = sorted(df[df["tdate"]==d]["edate"].unique())
+
+    best_ed = None
+    for candidate_ed in available_expiries:
+        dte = effective_dte(d, candidate_ed)
+        if dte >= 2:
+            best_ed = candidate_ed
+            break
+
+    # Fallback to provided expiry if DTE < 2
+    if best_ed is None:
+        best_ed = ed
+
+    rows = df[(df["tdate"]==d) & (df["edate"]==best_ed) & (df["hhmm"]==hhmm)]
     ce = rows[(rows["strike_price"]==atm) & (rows["option_type"]=="CE")]["close"]
     pe = rows[(rows["strike_price"]==atm) & (rows["option_type"]=="PE")]["close"]
     if len(ce) and len(pe):
         stv = float(ce.iloc[0]) + float(pe.iloc[0])
-        T   = effective_dte(d, ed) / 365
+        T   = effective_dte(d, best_ed) / 365
         iv  = round(stv / (0.8 * spot * math.sqrt(T)), 4) if T > 0 else IV_ANN["NIFTY 50"]
         return iv, round(stv, 1), atm
     return IV_ANN["NIFTY 50"], None, atm
@@ -1196,7 +1216,7 @@ _LBG = {"critical":"rgba(255,75,75,0.08)","important":"rgba(255,164,33,0.08)",
 _LICO = {"critical":"🔴","important":"🟡","monitor":"🔵","low":"⚪"}
 
 # ── TABS ──────────────────────────────────────────────────────────────────────
-tab1, tab2, tab_val, tab3 = st.tabs(["Tab 1 - Live Signal", "Tab 2 - Backtest", "🔬 Validation Explorer", "Tab 3 - IV History"])
+tab1, tab2, tab_val, tab_iv_analysis, tab3 = st.tabs(["Tab 1 - Live Signal", "Tab 2 - Backtest", "🔬 Validation Explorer", "📊 IV Analysis", "Tab 3 - IV History"])
 
 # ── TAB 1: Live Signal ────────────────────────────────────────────────────────
 with tab1:
@@ -2310,6 +2330,102 @@ with tab_val:
 
                 if st.button("Show JSON payload only (no API call)", key="val_kite_json_btn"):
                     st.code(json.dumps(kite_payload, indent=2), language="json")
+
+# ── IV ANALYSIS TAB ────────────────────────────────────────────────────────────
+with tab_iv_analysis:
+    top_bar()
+    st.markdown("---")
+    st.subheader("📊 IV & IVP Trend Analysis (DTE≥2 Rule)")
+
+    # Load 14-day IV series and IVP data
+    try:
+        bt_dir = os.path.join(os.path.dirname(__file__), "Backtest-Engine")
+        iv_csv_path = os.path.join(bt_dir, "iv_series_14day.csv")
+        iv_json_path = os.path.join(bt_dir, "iv_comparison_metrics.json")
+        ivp_csv_path = os.path.join(bt_dir, "iv_impact_analysis_with_ivp.csv")
+
+        if os.path.exists(iv_csv_path):
+            iv_series_df = pd.read_csv(iv_csv_path)
+            iv_series_df['date'] = pd.to_datetime(iv_series_df['date']).dt.date
+
+            # Load comparison metrics
+            comparison = {}
+            if os.path.exists(iv_json_path):
+                with open(iv_json_path, 'r') as f:
+                    comparison = json.load(f)
+
+            # Load IVP data (full history)
+            ivp_df = None
+            if os.path.exists(ivp_csv_path):
+                ivp_df = pd.read_csv(ivp_csv_path)
+                ivp_df['date'] = pd.to_datetime(ivp_df['date']).dt.date
+
+            # Display latest metrics
+            if comparison:
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Latest IV", f"{comparison['latest_iv']:.1f}%",
+                         f"Date: {comparison['latest_date']}")
+                c2.metric("14-Day Mean", f"{comparison['historical_mean']:.1f}%",
+                         f"Median: {comparison['historical_median']:.1f}%")
+                c3.metric("Z-Score", f"{comparison['z_score']:.2f}σ",
+                         f"Percentile: {comparison['percentile_rank']:.0f}%")
+                c4.metric("IV Band", comparison['iv_percentile_band'],
+                         f"Spot: ₹{comparison['latest_spot']:,.1f}")
+
+            # Charts: IV and IVP trend
+            st.markdown("**IV & IVP Trend (14 days)**")
+            col_iv, col_ivp = st.columns(2)
+
+            with col_iv:
+                st.markdown("**IV %**")
+                chart_df = iv_series_df.copy()
+                chart_df['date_str'] = chart_df['date'].astype(str)
+                st.line_chart(chart_df.set_index('date_str')[['iv']], use_container_width=True)
+
+            with col_ivp:
+                st.markdown("**IVP (252-day percentile)**")
+                if ivp_df is not None:
+                    recent_ivp = ivp_df.tail(14).copy()
+                    recent_ivp['date_str'] = recent_ivp['date'].astype(str)
+                    st.line_chart(recent_ivp.set_index('date_str')[['new_ivp']], use_container_width=True)
+
+            # Detail table: 14 days with IV + IVP
+            st.markdown("**Daily Breakdown (14 Days)**")
+            display_df = iv_series_df.copy()
+            display_df.columns = ['Date', 'IV %', 'Spot', 'ATM Strike', 'Expiry', 'DTE', 'Method']
+
+            # Add IVP from full history
+            if ivp_df is not None:
+                display_df['IVP'] = display_df['Date'].map(
+                    ivp_df.set_index('date')['new_ivp'].to_dict()
+                )
+                display_df['IVP Band'] = display_df['Date'].map(
+                    ivp_df.set_index('date')['new_ivp_band'].to_dict()
+                )
+                display_cols = ['Date', 'IV %', 'IVP', 'IVP Band', 'Spot', 'DTE']
+                display_df = display_df[display_cols]
+
+            st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+            # Summary stats
+            st.markdown("**Summary Statistics (14 Days)**")
+            col1, col2, col3, col4, col5 = st.columns(5)
+            col1.metric("Highest IV", f"{iv_series_df['iv'].max():.1f}%")
+            col2.metric("Lowest IV", f"{iv_series_df['iv'].min():.1f}%")
+            col3.metric("Range", f"{iv_series_df['iv'].max() - iv_series_df['iv'].min():.1f}%")
+            col4.metric("Days", len(iv_series_df))
+            col5.metric("Std Dev", f"{iv_series_df['iv'].std():.2f}%")
+
+            st.info(
+                "**Methodology:** IV from ATM straddle with **DTE≥2 rule** (skips 0DTE/T-1). "
+                "IVP is 252-day rolling percentile rank (0-100). "
+                "Formula: IV = Straddle / (0.8 × Spot × √(DTE/365))"
+            )
+        else:
+            st.warning("IV analysis data not available. Run BATCH 4 to generate.")
+
+    except Exception as e:
+        st.error(f"Error loading IV analysis: {e}")
 
 # ── TAB 3: IV History ─────────────────────────────────────────────────────────
 with tab3:
