@@ -427,9 +427,13 @@ with st.sidebar:
     st.caption(
         f"⏱️ **Dhan cache:** LTP **{DHAN_LTP_TTL // 60}m** · funds/expiry list **{DHAN_MISC_TTL // 60}m** "
         f"(env `DHAN_LTP_TTL_SECONDS`, `DHAN_MISC_TTL_SECONDS`). **Chains** refresh each **Fetch** click.")
-    # Fetch button
     fetch_btn = st.button("📡 Fetch Live Chain", type="primary", disabled=not has_tok,
                           use_container_width=True, key="fetch_live_btn")
+    if fetch_btn:
+        # Clear cached chain so auto-fetch runs fresh
+        for k in ["nifty_chain","sensex_chain","chain_ts","chain_ts_epoch",
+                  "nifty_spot_live","sensex_spot_live"]:
+            st.session_state.pop(k, None)
 
     # Strike parameters (below Fetch)
     _sc1, _sc2 = st.columns(2)
@@ -476,9 +480,21 @@ else:
 PUT_OFFSETS  = [-(dist_pct/100 + i*(step_pct/100)) for i in range(5)]
 CALL_OFFSETS = [+(dist_pct/100 + i*(step_pct/100)) for i in range(5)]
 
-# ── Handle fetch button ───────────────────────────────────────────────────────
-# Auto-fetch on first load if token available but no chain cached yet
-_auto_fetch = has_tok and "nifty_chain" not in st.session_state
+# ── Handle fetch button + auto-refresh logic ─────────────────────────────────
+_chain_age_mins = (datetime.now().timestamp() - st.session_state.get("chain_ts_epoch", 0)) / 60
+_expiry_changed = (st.session_state.get("nifty_exp_used") != sel_n_exp or
+                   st.session_state.get("sensex_exp_used") != sel_s_exp)
+
+# Auto-fetch conditions:
+# 1. First load (no chain in session)
+# 2. Chain is older than 5 minutes
+# 3. Selected expiry changed since last fetch
+_auto_fetch = has_tok and (
+    "nifty_chain" not in st.session_state or
+    _chain_age_mins > 5 or
+    _expiry_changed
+)
+
 if (fetch_btn or _auto_fetch) and has_tok:
     with st.spinner("Fetching Nifty & Sensex option chains…"):
         nc = fetch_chain(NIFTY_SCRIP_ID,  sel_n_exp, tok)
@@ -492,6 +508,7 @@ if (fetch_btn or _auto_fetch) and has_tok:
                                   "sensex_spot_live":sc.get("last_price",SPOT["SENSEX"])})
     if nc or sc:
         st.session_state["chain_ts"] = ts
+        st.session_state["chain_ts_epoch"] = datetime.now().timestamp()
 
 # ── Build leg table ───────────────────────────────────────────────────────────
 def make_leg(offsets, side, idx):
@@ -606,9 +623,10 @@ def top_bar():
     nifty_iv = live_iv_from_chain(nifty_chain, nifty_spot, "NIFTY 50", nifty_cal_dte)
     sensex_iv = live_iv_from_chain(sensex_chain, sensex_spot, "SENSEX", sensex_cal_dte)
 
-    # Show data freshness indicator
-    ltp_age_mins = (datetime.now().timestamp() - st.session_state.get("ltp_refresh_ts", 0)) / 60
-    freshness_indicator = "🔴" if ltp_age_mins > 5 else "🟢"
+    # Data freshness
+    chain_age_mins = (datetime.now().timestamp() - st.session_state.get("chain_ts_epoch", 0)) / 60
+    chain_ts_str   = st.session_state.get("chain_ts", "—")
+    freshness_indicator = "🔴" if chain_age_mins > 5 else "🟢"
 
     c1,c2,c3,c4 = st.columns(4)
     c1.metric("NIFTY 50",  f"₹{nifty_spot:,.0f}")
@@ -617,10 +635,20 @@ def top_bar():
     c4.metric("SENSEX IV", f"{sensex_iv*100:.1f}%")
     st.info(f"**Markets ready** | DTE {dte_adj} trading days")
 
-    # Show data source and age
-    if st.session_state.get("nifty_ltp_live"):
-        ltp_ts_formatted = datetime.fromtimestamp(st.session_state.get("ltp_refresh_ts", 0)).strftime("%H:%M:%S")
-        st.caption(f"{freshness_indicator} LTP @ {ltp_ts_formatted} | Chains refreshed separately | Auto-refresh every 2 min")
+    # Chain freshness + inline refresh button (visible on all devices including mobile)
+    _cb1, _cb2 = st.columns([5, 1])
+    with _cb1:
+        if chain_ts_str != "—":
+            _age_lbl = f"{chain_age_mins:.0f} min ago" if chain_age_mins >= 1 else "just now"
+            st.caption(f"{freshness_indicator} Chain @ {chain_ts_str} ({_age_lbl}) | Auto-refreshes every 5 min or on expiry change")
+        else:
+            st.caption("⏳ Fetching chain…")
+    with _cb2:
+        if st.button("🔄", key="top_bar_refresh_btn", help="Force refresh chain + IV"):
+            for k in ["nifty_chain","sensex_chain","nifty_spot_live","sensex_spot_live",
+                      "chain_ts","chain_ts_epoch","nifty_ltp_live","sensex_ltp_live"]:
+                st.session_state.pop(k, None)
+            st.rerun()
 
 # ── Backtest Engine helpers ────────────────────────────────────────────────────
 BT_CSV_END = date(2026, 3, 24)
