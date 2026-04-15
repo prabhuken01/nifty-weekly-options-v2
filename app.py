@@ -628,10 +628,12 @@ BT_CSV_END = date(2026, 3, 24)
 @st.cache_data(show_spinner=False)
 def load_bt_df():
     bt_dir = os.path.join(os.path.dirname(__file__), "Backtest-Engine")
-    p_csv = os.path.join(bt_dir, "final_merged_output_30m_strike_within_6pct.csv")
+    p_parquet = os.path.join(bt_dir, "final_merged_output_30m_strike_within_6pct.parquet")
 
-    if os.path.exists(p_csv):
-        df = pd.read_csv(p_csv, parse_dates=["timestamp_30m","expiry"])
+    if os.path.exists(p_parquet):
+        df = pd.read_parquet(p_parquet)
+        df["timestamp_30m"] = pd.to_datetime(df["timestamp_30m"])
+        df["expiry"] = pd.to_datetime(df["expiry"])
     else:
         return pd.DataFrame()
 
@@ -2385,7 +2387,7 @@ with tab_iv_analysis:
                                      value=_iv_default, key="iv_analysis_end_date",
                                      on_change=_sync_trade_date_from_iv)
     with _iv_col_days:
-        iv_window = st.number_input("Days", min_value=5, max_value=60, value=14,
+        iv_window = st.number_input("Days", min_value=5, max_value=90, value=30,
                                      step=1, key="iv_window")
 
     BT_DATA_END = date(2026, 3, 24)  # Last date in parquet
@@ -2487,12 +2489,21 @@ with tab_iv_analysis:
             m1.metric("Latest IV", f"{latest['iv']:.1f}%", f"{src_lbl}")
             m2.metric(f"{len(iv_combined)}-Day Mean", f"{_mean:.1f}%",
                       f"Median: {iv_combined['iv'].median():.1f}%")
-            m3.metric("Z-Score", f"{_zscore:.2f}σ", f"Pctile: {_pct_rank:.0f}%")
-            m4.metric("Range", f"{iv_combined['iv'].min():.1f}% – {iv_combined['iv'].max():.1f}%",
+            m3.metric("Z-Score ①", f"{_zscore:.2f}σ", f"Pctile: {_pct_rank:.0f}%")
+            m4.metric("Range ②", f"{iv_combined['iv'].min():.1f}% – {iv_combined['iv'].max():.1f}%",
                       f"Std: {_std:.2f}%")
 
+            st.caption(
+                "① **Z-Score** = (Latest IV − Mean) ÷ Std Dev over the window. "
+                "Interpretation: 0 = average | >+1σ = elevated | >+2σ = high | <−1σ = suppressed. "
+                "Useful to gauge if current IV is cheap or expensive vs recent history.  \n"
+                "② **Range** = Lowest to Highest IV seen in the window. "
+                "Wide range = volatile IV regime (e.g. event-driven spikes). "
+                "Narrow range = stable/low-vol environment."
+            )
+
             # ── Charts ────────────────────────────────────────────────────────────
-            st.markdown(f"**IV % Trend ({len(iv_combined)} days)**")
+            st.markdown(f"**IV % Trend — last {len(iv_combined)} trading days (DTE≥2 rule)**")
             chart_df = iv_combined.copy()
             chart_df["date_str"] = chart_df["date"].astype(str)
             st.line_chart(chart_df.set_index("date_str")[["iv"]], use_container_width=True)
