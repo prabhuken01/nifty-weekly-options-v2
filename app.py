@@ -628,16 +628,9 @@ BT_CSV_END = date(2026, 3, 24)
 @st.cache_data(show_spinner=False)
 def load_bt_df():
     bt_dir = os.path.join(os.path.dirname(__file__), "Backtest-Engine")
-    # Try parquet first (faster, smaller), fall back to CSV
-    p_parquet = os.path.join(bt_dir, "final_merged_output_30m_strike_within_6pct.parquet")
     p_csv = os.path.join(bt_dir, "final_merged_output_30m_strike_within_6pct.csv")
 
-    if os.path.exists(p_parquet):
-        df = pd.read_parquet(p_parquet)
-        # Ensure date columns are parsed (parquet may preserve types)
-        df["timestamp_30m"] = pd.to_datetime(df["timestamp_30m"])
-        df["expiry"] = pd.to_datetime(df["expiry"])
-    elif os.path.exists(p_csv):
+    if os.path.exists(p_csv):
         df = pd.read_csv(p_csv, parse_dates=["timestamp_30m","expiry"])
     else:
         return pd.DataFrame()
@@ -1328,6 +1321,7 @@ with tab2:
     st.markdown("#### 1️⃣ Select Date, Entry & Exit Timing")
     def _sync_val_date_from_bt2():
         st.session_state["val_date"] = st.session_state["bt_date2"]
+        st.session_state["iv_analysis_end_date"] = st.session_state["bt_date2"]
 
     def _sync_val_entry_from_bt2():
         st.session_state["val_entry_hhmm"] = st.session_state["bt_entry_hhmm"]
@@ -1342,8 +1336,9 @@ with tab2:
 
     s1c1, s1c2, s1c3 = st.columns(3)
     with s1c1:
+        _bt_default = st.session_state.get("bt_date2", date(2026, 3, 20))
         bt_date = st.date_input(
-            "Trade Date", value=date(2025, 10, 14),
+            "Trade Date", value=_bt_default,
             min_value=date(2024, 9, 23), max_value=date.today(),
             key="bt_date2", on_change=_sync_val_date_from_bt2)
     with s1c2:
@@ -1969,6 +1964,7 @@ with tab_val:
 
     def _sync_bt_date_from_val():
         st.session_state["bt_date2"] = st.session_state["val_date"]
+        st.session_state["iv_analysis_end_date"] = st.session_state["val_date"]
 
     def _sync_bt_entry_from_val():
         st.session_state["bt_entry_hhmm"] = st.session_state["val_entry_hhmm"]
@@ -2377,10 +2373,17 @@ with tab_iv_analysis:
     st.subheader("📊 IV & IVP Trend Analysis (DTE≥2 Rule)")
 
     # ── Date picker: default to today ──────────────────────────────────────────
+    def _sync_trade_date_from_iv():
+        st.session_state["bt_date2"] = st.session_state["iv_analysis_end_date"]
+        st.session_state["val_date"] = st.session_state["iv_analysis_end_date"]
+
     _iv_col_date, _iv_col_days, _ = st.columns([2, 1, 3])
     with _iv_col_date:
+        _iv_default = st.session_state.get("iv_analysis_end_date",
+                                            st.session_state.get("bt_date2", date(2026, 3, 20)))
         iv_end_date = st.date_input("End date (shows 14 days ending here)",
-                                     value=date.today(), key="iv_analysis_end_date")
+                                     value=_iv_default, key="iv_analysis_end_date",
+                                     on_change=_sync_trade_date_from_iv)
     with _iv_col_days:
         iv_window = st.number_input("Days", min_value=5, max_value=60, value=14,
                                      step=1, key="iv_window")
