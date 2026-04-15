@@ -348,7 +348,27 @@ def ltp_from_chain(chain, strike, side):
             return round(float(ltp),1) if ltp else None
     return None
 
-# ── Token: secrets → session (Dhan + Kite) ───────────────────────────────────
+# ── Dhan Partner OAuth constants ──────────────────────────────────────────────
+DHAN_PARTNER_KEY  = "12c0fd3e"
+DHAN_APP_URL      = "https://nifty-weekly-options-v2.streamlit.app/"
+DHAN_LOGIN_URL    = (f"https://web.dhan.co/login?"
+                     f"partnerId={DHAN_PARTNER_KEY}"
+                     f"&redirectUri={DHAN_APP_URL}")
+
+# ── Token: OAuth redirect → secrets → session (Dhan + Kite) ───────────────────
+# Check if Dhan redirected back with tokenId in URL (Partner OAuth flow)
+_qp = st.query_params
+_tok_from_url = _qp.get("tokenId", "")
+if _tok_from_url and _tok_from_url.strip():
+    st.session_state["dhan_tok"] = _tok_from_url.strip()
+    st.session_state["_tok_manually_set"] = True
+    st.session_state["_tok_from_oauth"] = True
+    # Clear the tokenId from URL to avoid re-processing on next render
+    try:
+        st.query_params.clear()
+    except Exception:
+        pass
+
 if not st.session_state.get("dhan_tok"):
     try:
         t = st.secrets["dhan"]["access_token"]
@@ -378,23 +398,55 @@ with st.sidebar:
     _tab_dhan, _tab_kite = st.tabs(["Dhan (Primary)", "Kite (Fallback)"])
 
     with _tab_dhan:
-        if st.session_state.get("dhan_tok"):
-            st.success("✅ Dhan token active")
-            st.caption(f"⏰ Token expires in ~24h. When it expires, paste a new one below.")
-            with st.expander("Paste new token (when it expires)"):
-                _ov = st.text_input("New Dhan token", type="password", key="dhan_token_override")
-                if _ov:
-                    st.session_state["dhan_tok"] = _ov.strip()
-                    st.session_state["_tok_manually_set"] = True
-                    st.success("✓ Token updated (this session)")
-        else:
-            st.warning("No Dhan token — LTP will use cache + Kite fallback")
-            _inp = st.text_input("Dhan access token (24h expiry)", type="password", key="dhan_token")
+        # ── Decode token expiry from JWT ──────────────────────────────────────
+        def _tok_expiry_info(tok_str):
+            """Return (expires_dt, hours_left) from JWT payload, or (None, None)."""
+            try:
+                import base64, json as _json
+                payload = _json.loads(base64.urlsafe_b64decode(tok_str.split('.')[1] + '=='))
+                exp_dt  = datetime.fromtimestamp(payload['exp'])
+                hrs     = (exp_dt - datetime.now()).total_seconds() / 3600
+                return exp_dt, hrs
+            except Exception:
+                return None, None
+
+        _cur_tok = st.session_state.get("dhan_tok", "")
+        _exp_dt, _hrs_left = _tok_expiry_info(_cur_tok) if _cur_tok else (None, None)
+
+        if _cur_tok:
+            if st.session_state.get("_tok_from_oauth"):
+                st.success("✅ Dhan connected via Partner login")
+                st.session_state.pop("_tok_from_oauth", None)
+            else:
+                st.success("✅ Dhan token active")
+
+            if _hrs_left is not None:
+                if _hrs_left < 1:
+                    st.error(f"🔴 Token expires in {_hrs_left*60:.0f} min — reconnect now!")
+                elif _hrs_left < 4:
+                    st.warning(f"⚠️ Token expires in {_hrs_left:.1f}h")
+                else:
+                    st.caption(f"⏰ Expires: {_exp_dt.strftime('%d %b %H:%M')} ({_hrs_left:.0f}h left)")
+
+        # ── One-click reconnect via Partner OAuth ─────────────────────────────
+        st.markdown(f"""
+<a href="{DHAN_LOGIN_URL}" target="_blank">
+  <button style="width:100%;padding:8px;background:#1f77b4;color:white;
+                 border:none;border-radius:6px;cursor:pointer;font-size:14px;">
+    🔗 {'Reconnect' if _cur_tok else 'Connect'} Dhan (1-click)
+  </button>
+</a>
+""", unsafe_allow_html=True)
+        st.caption("Clicking opens Dhan login → after login you're redirected back with token auto-loaded.")
+
+        # ── Manual fallback ───────────────────────────────────────────────────
+        with st.expander("Or paste token manually"):
+            _inp_key = "dhan_token_override" if _cur_tok else "dhan_token"
+            _inp = st.text_input("Dhan access token", type="password", key=_inp_key)
             if _inp:
                 st.session_state["dhan_tok"] = _inp.strip()
                 st.session_state["_tok_manually_set"] = True
-                st.success("✓ Token loaded (this session)")
-            st.caption("Get token: https://web.dhan.co/ → Profile → Copy API Token")
+                st.success("✓ Token loaded")
 
     with _tab_kite:
         if st.session_state.get("kite_loaded"):
