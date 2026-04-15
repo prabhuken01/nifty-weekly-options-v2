@@ -6,8 +6,14 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from scipy.stats import norm
-from datetime import date, timedelta, datetime
+from datetime import date, timedelta, datetime, timezone
 import math, requests, sys, os, re, json
+
+# ── IST helper ────────────────────────────────────────────────────────────────
+_IST = timezone(timedelta(hours=5, minutes=30))
+def now_ist():
+    """Return current datetime in IST (UTC+5:30)."""
+    return datetime.now(_IST).replace(tzinfo=None)
 
 for d in ['Live-Signal-Generator', 'Live-fetching']:
     p = os.path.join(os.path.dirname(__file__), d)
@@ -242,7 +248,7 @@ def fetch_ltp_cached(tok):
         n = idx.get("13",{}).get("last_price",0)
         s = idx.get("51",{}).get("last_price",0)
         if n and s:
-            return {"nifty":float(n),"sensex":float(s),"ts":datetime.now().strftime("%H:%M:%S")}
+            return {"nifty":float(n),"sensex":float(s),"ts":now_ist().strftime("%H:%M:%S")}
     except: pass
     return None
 
@@ -260,7 +266,7 @@ def fetch_ltp_kite(kite_api_key, kite_access_token):
         s = quotes.get("BSE:SENSEX", {}).get("last_price", 0)
 
         if n and s:
-            return {"nifty":float(n),"sensex":float(s),"ts":datetime.now().strftime("%H:%M:%S"), "source":"Kite"}
+            return {"nifty":float(n),"sensex":float(s),"ts":now_ist().strftime("%H:%M:%S"), "source":"Kite"}
     except ImportError:
         pass  # KiteConnect not installed
     except Exception:
@@ -288,7 +294,7 @@ def fetch_ltp(tok):
             n = idx.get("13",{}).get("last_price")
             s = idx.get("51",{}).get("last_price")
             if n and s:
-                return {"nifty":float(n),"sensex":float(s),"ts":datetime.now().strftime("%H:%M:%S"), "source":"Dhan"}
+                return {"nifty":float(n),"sensex":float(s),"ts":now_ist().strftime("%H:%M:%S"), "source":"Dhan"}
             dhan_success = False
 
     except requests.Timeout:
@@ -405,7 +411,7 @@ with st.sidebar:
                 import base64, json as _json
                 payload = _json.loads(base64.urlsafe_b64decode(tok_str.split('.')[1] + '=='))
                 exp_dt  = datetime.fromtimestamp(payload['exp'])
-                hrs     = (exp_dt - datetime.now()).total_seconds() / 3600
+                hrs     = (exp_dt - now_ist()).total_seconds() / 3600
                 return exp_dt, hrs
             except Exception:
                 return None, None
@@ -533,7 +539,7 @@ PUT_OFFSETS  = [-(dist_pct/100 + i*(step_pct/100)) for i in range(5)]
 CALL_OFFSETS = [+(dist_pct/100 + i*(step_pct/100)) for i in range(5)]
 
 # ── Handle fetch button + auto-refresh logic ─────────────────────────────────
-_chain_age_mins = (datetime.now().timestamp() - st.session_state.get("chain_ts_epoch", 0)) / 60
+_chain_age_mins = (now_ist().timestamp() - st.session_state.get("chain_ts_epoch", 0)) / 60
 _expiry_changed = (st.session_state.get("nifty_exp_used") != sel_n_exp or
                    st.session_state.get("sensex_exp_used") != sel_s_exp)
 
@@ -551,7 +557,7 @@ if (fetch_btn or _auto_fetch) and has_tok:
     with st.spinner("Fetching Nifty & Sensex option chains…"):
         nc = fetch_chain(NIFTY_SCRIP_ID,  sel_n_exp, tok)
         sc = fetch_chain(SENSEX_SCRIP_ID, sel_s_exp, tok)
-    ts = datetime.now().strftime("%H:%M:%S")
+    ts = now_ist().strftime("%H:%M:%S")
     if nc:
         st.session_state.update({"nifty_chain":nc,"nifty_exp_used":sel_n_exp,
                                   "nifty_spot_live":nc.get("last_price",SPOT["NIFTY 50"])})
@@ -560,7 +566,7 @@ if (fetch_btn or _auto_fetch) and has_tok:
                                   "sensex_spot_live":sc.get("last_price",SPOT["SENSEX"])})
     if nc or sc:
         st.session_state["chain_ts"] = ts
-        st.session_state["chain_ts_epoch"] = datetime.now().timestamp()
+        st.session_state["chain_ts_epoch"] = now_ist().timestamp()
 
 # ── Build leg table ───────────────────────────────────────────────────────────
 def make_leg(offsets, side, idx):
@@ -653,7 +659,7 @@ def render_index(idx):
         f"**Score** = 40%×Prob + 30%×IVP + 30%×Return. Threshold={sig_thresh}"
     )
 
-def top_bar():
+def top_bar(tab_id=""):
     # Get freshest spot prices: chain (T-0 from fetch) > session LTP > SPOT
     nifty_chain = st.session_state.get("nifty_chain", {})
     sensex_chain = st.session_state.get("sensex_chain", {})
@@ -676,7 +682,7 @@ def top_bar():
     sensex_iv = live_iv_from_chain(sensex_chain, sensex_spot, "SENSEX", sensex_cal_dte)
 
     # Data freshness
-    chain_age_mins = (datetime.now().timestamp() - st.session_state.get("chain_ts_epoch", 0)) / 60
+    chain_age_mins = (now_ist().timestamp() - st.session_state.get("chain_ts_epoch", 0)) / 60
     chain_ts_str   = st.session_state.get("chain_ts", "—")
     freshness_indicator = "🔴" if chain_age_mins > 5 else "🟢"
 
@@ -696,7 +702,7 @@ def top_bar():
         else:
             st.caption("⏳ Fetching chain…")
     with _cb2:
-        if st.button("🔄", key="top_bar_refresh_btn", help="Force refresh chain + IV"):
+        if st.button("🔄", key=f"top_bar_refresh_btn_{tab_id}", help="Force refresh chain + IV"):
             for k in ["nifty_chain","sensex_chain","nifty_spot_live","sensex_spot_live",
                       "chain_ts","chain_ts_epoch","nifty_ltp_live","sensex_ltp_live"]:
                 st.session_state.pop(k, None)
@@ -1316,7 +1322,13 @@ _LBG = {"critical":"rgba(255,75,75,0.08)","important":"rgba(255,164,33,0.08)",
 _LICO = {"critical":"🔴","important":"🟡","monitor":"🔵","low":"⚪"}
 
 # ── TABS ──────────────────────────────────────────────────────────────────────
-tab1, tab2, tab_val, tab_iv_analysis, tab3 = st.tabs(["Tab 1 - Live Signal", "Tab 2 - Backtest", "🔬 Validation Explorer", "📊 IV Analysis", "Tab 3 - IV History"])
+tab1, tab2, tab_val, tab_iv_analysis, tab3 = st.tabs([
+    "📡 Tab 1 — Live Signal",
+    "📈 Tab 2 — Backtest Engine",
+    "🔬 Tab 3 — Validation Explorer",
+    "📊 Tab 4 — IV Analysis",
+    "📜 Tab 5 — IV History",
+])
 
 # ── TAB 1: Live Signal ────────────────────────────────────────────────────────
 with tab1:
@@ -1334,22 +1346,22 @@ with tab1:
                 if fresh_ltp:
                     st.session_state["nifty_ltp_live"] = fresh_ltp["nifty"]
                     st.session_state["sensex_ltp_live"] = fresh_ltp["sensex"]
-                    st.session_state["ltp_refresh_ts"] = datetime.now().timestamp()
+                    st.session_state["ltp_refresh_ts"] = now_ist().timestamp()
                     st.success(f"✓ LTP updated at {fresh_ltp['ts']}")
                     st.rerun()
                 else:
                     st.error("✗ Failed to refresh LTP")
 
         # Auto-refresh on first load or if data is older than 2 minutes
-        _ltp_age = (datetime.now().timestamp() - st.session_state.get("ltp_refresh_ts", 0)) / 60
+        _ltp_age = (now_ist().timestamp() - st.session_state.get("ltp_refresh_ts", 0)) / 60
         if st.session_state.get("nifty_ltp_live") is None or _ltp_age > 2:
             fresh_ltp = fetch_ltp(tok)
             if fresh_ltp:
                 st.session_state["nifty_ltp_live"] = fresh_ltp["nifty"]
                 st.session_state["sensex_ltp_live"] = fresh_ltp["sensex"]
-                st.session_state["ltp_refresh_ts"] = datetime.now().timestamp()
+                st.session_state["ltp_refresh_ts"] = now_ist().timestamp()
 
-    top_bar()
+    top_bar(tab_id="t1")
     st.markdown("---")
     st.subheader("NIFTY 50 — Weekly Options Signal")
     render_index("NIFTY 50")
@@ -1387,7 +1399,7 @@ with tab1:
 
 # ── TAB 2: Historical Strategy Simulator ─────────────────────────────────────
 with tab2:
-    top_bar()
+    top_bar(tab_id="t2")
     st.markdown("---")
     st.subheader("📊 Historical Strategy Simulator (v3)")
     st.caption("Entry bar + strike % slider · ₹1.25L per short leg · IC/spreads +1% long buffer · P&L first, details in expanders")
@@ -2029,7 +2041,7 @@ div[data-testid="stSlider"] [role="slider"] {
 
 # ── TAB VAL: Validation Explorer ───────────────────────────────────────
 with tab_val:
-    top_bar()
+    top_bar(tab_id="t3")
     st.markdown("---")
     st.subheader("🔬 Validation Explorer")
     st.caption(
@@ -2450,7 +2462,7 @@ with tab_val:
 
 # ── IV ANALYSIS TAB ────────────────────────────────────────────────────────────
 with tab_iv_analysis:
-    top_bar()
+    top_bar(tab_id="t4")
     st.markdown("---")
     st.subheader("📊 IV & IVP Trend Analysis (DTE≥2 Rule)")
 
@@ -2620,7 +2632,7 @@ with tab_iv_analysis:
 
 # ── TAB 3: IV History ─────────────────────────────────────────────────────────
 with tab3:
-    top_bar()
+    top_bar(tab_id="t5")
     st.markdown("---")
     st.subheader("📊 IV & Option Chain — Expiry Wise")
     tok3 = st.session_state.get("dhan_tok","")
