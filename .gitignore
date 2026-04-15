@@ -3,6 +3,7 @@
 
 # Secrets — NEVER commit tokens
 .streamlit/secrets.toml
+.streamlit/_tok_cache.json
 
 # Python cache
 __pycache__/

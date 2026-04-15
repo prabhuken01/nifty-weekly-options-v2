@@ -361,25 +361,62 @@ DHAN_LOGIN_URL    = (f"https://web.dhan.co/login?"
                      f"partnerId={DHAN_PARTNER_KEY}"
                      f"&redirectUri={DHAN_APP_URL}")
 
-# ── Token: OAuth redirect → secrets → session (Dhan + Kite) ───────────────────
-# Check if Dhan redirected back with tokenId in URL (Partner OAuth flow)
+# ── Shared token cache (persists across sessions on same server instance) ──────
+_TOKEN_CACHE = os.path.join(os.path.dirname(__file__), ".streamlit", "_tok_cache.json")
+
+def _save_token_cache(tok: str):
+    """Write token to server-side cache so all sessions (incl. mobile) can load it."""
+    try:
+        os.makedirs(os.path.dirname(_TOKEN_CACHE), exist_ok=True)
+        with open(_TOKEN_CACHE, "w") as _f:
+            json.dump({"token": tok, "saved_at": now_ist().isoformat()}, _f)
+    except Exception:
+        pass
+
+def _load_token_cache() -> str:
+    """Read token from server-side cache. Returns '' if missing/expired."""
+    try:
+        with open(_TOKEN_CACHE) as _f:
+            data = json.load(_f)
+        tok = data.get("token", "")
+        if not tok:
+            return ""
+        # Validate JWT expiry before returning
+        import base64 as _b64
+        payload = json.loads(_b64.urlsafe_b64decode(tok.split('.')[1] + '=='))
+        if payload.get('exp', 0) > now_ist().timestamp():
+            return tok
+        return ""   # expired — don't use
+    except Exception:
+        return ""
+
+# ── Token: OAuth redirect → secrets → cache file → session ───────────────────
+# 1. Check if Dhan redirected back with tokenId in URL (Partner OAuth flow)
 _qp = st.query_params
 _tok_from_url = _qp.get("tokenId", "")
 if _tok_from_url and _tok_from_url.strip():
-    st.session_state["dhan_tok"] = _tok_from_url.strip()
+    _clean_tok = _tok_from_url.strip()
+    st.session_state["dhan_tok"] = _clean_tok
     st.session_state["_tok_manually_set"] = True
     st.session_state["_tok_from_oauth"] = True
-    # Clear the tokenId from URL to avoid re-processing on next render
+    _save_token_cache(_clean_tok)          # ← persist so mobile sessions pick it up
     try:
         st.query_params.clear()
     except Exception:
         pass
 
+# 2. Secrets (Streamlit Cloud configured token)
 if not st.session_state.get("dhan_tok"):
     try:
         t = st.secrets["dhan"]["access_token"]
         if t and t.strip(): st.session_state["dhan_tok"] = t.strip()
     except: pass
+
+# 3. Server-side cache file (written when any session completes OAuth)
+if not st.session_state.get("dhan_tok"):
+    _cached = _load_token_cache()
+    if _cached:
+        st.session_state["dhan_tok"] = _cached
 
 if not st.session_state.get("kite_loaded"):
     try:
@@ -450,9 +487,11 @@ with st.sidebar:
             _inp_key = "dhan_token_override" if _cur_tok else "dhan_token"
             _inp = st.text_input("Dhan access token", type="password", key=_inp_key)
             if _inp:
-                st.session_state["dhan_tok"] = _inp.strip()
+                _inp_clean = _inp.strip()
+                st.session_state["dhan_tok"] = _inp_clean
                 st.session_state["_tok_manually_set"] = True
-                st.success("✓ Token loaded")
+                _save_token_cache(_inp_clean)   # persist for other sessions
+                st.success("✓ Token loaded & shared with all sessions")
 
     with _tab_kite:
         if st.session_state.get("kite_loaded"):
