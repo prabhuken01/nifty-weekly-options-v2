@@ -292,10 +292,10 @@ def fetch_ltp(tok):
             dhan_success = False
 
     except requests.Timeout:
-        st.warning("⚠️ Dhan timeout — trying Kite fallback")
+        st.warning("⚠️ Dhan LTP timeout — trying Kite fallback")
         dhan_success = False
     except Exception as e:
-        st.warning(f"⚠️ Dhan error — trying Kite fallback")
+        st.warning(f"⚠️ Dhan LTP error ({type(e).__name__}): {str(e)[:80]} — trying Kite fallback")
         dhan_success = False
 
     # Try Kite fallback if Dhan failed
@@ -352,7 +352,7 @@ def ltp_from_chain(chain, strike, side):
 if not st.session_state.get("dhan_tok"):
     try:
         t = st.secrets["dhan"]["access_token"]
-        if t: st.session_state["dhan_tok"] = t
+        if t and t.strip(): st.session_state["dhan_tok"] = t.strip()
     except: pass
 
 if not st.session_state.get("kite_loaded"):
@@ -384,14 +384,14 @@ with st.sidebar:
             with st.expander("Paste new token (when it expires)"):
                 _ov = st.text_input("New Dhan token", type="password", key="dhan_token_override")
                 if _ov:
-                    st.session_state["dhan_tok"] = _ov
+                    st.session_state["dhan_tok"] = _ov.strip()
                     st.session_state["_tok_manually_set"] = True
                     st.success("✓ Token updated (this session)")
         else:
             st.warning("No Dhan token — LTP will use cache + Kite fallback")
             _inp = st.text_input("Dhan access token (24h expiry)", type="password", key="dhan_token")
             if _inp:
-                st.session_state["dhan_tok"] = _inp
+                st.session_state["dhan_tok"] = _inp.strip()
                 st.session_state["_tok_manually_set"] = True
                 st.success("✓ Token loaded (this session)")
             st.caption("Get token: https://web.dhan.co/ → Profile → Copy API Token")

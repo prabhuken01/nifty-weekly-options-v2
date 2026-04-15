@@ -1,1 +1,18 @@
-*.csv filter=lfs diff=lfs merge=lfs -text
+# Large data files
+*.csv
+
+# Secrets — NEVER commit tokens
+.streamlit/secrets.toml
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Excel temp files
+~$*.xlsx
+~$*.xls
+
+# OS
+.DS_Store
+Thumbs.db
