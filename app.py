@@ -741,7 +741,7 @@ def top_bar(tab_id=""):
         else:
             st.caption("⏳ Fetching chain…")
     with _cb2:
-        if st.button("🔄", key=f"top_bar_refresh_btn_{tab_id}", help="Force refresh chain + IV"):
+        if st.button("🔄 Refresh", key=f"top_bar_refresh_btn_{tab_id}", help="Force refresh chain + IV", type="primary"):
             for k in ["nifty_chain","sensex_chain","nifty_spot_live","sensex_spot_live",
                       "chain_ts","chain_ts_epoch","nifty_ltp_live","sensex_ltp_live"]:
                 st.session_state.pop(k, None)
@@ -1469,7 +1469,7 @@ with tab2:
 
     s1c1, s1c2, s1c3 = st.columns(3)
     with s1c1:
-        _bt_default = st.session_state.get("bt_date2", date(2026, 3, 20))
+        _bt_default = st.session_state.get("bt_date2", date.today())
         bt_date = st.date_input(
             "Trade Date", value=_bt_default,
             min_value=date(2024, 9, 23), max_value=date.today(),
@@ -2107,12 +2107,14 @@ with tab_val:
 
     _val_date_min = date(2024, 9, 23)
     _val_date_max = date.today()
-    _vd = st.session_state.get("val_date")
+    _vd = st.session_state.get("val_date", date.today())
     if isinstance(_vd, date):
         if _vd < _val_date_min:
             st.session_state["val_date"] = _val_date_min
         elif _vd > _val_date_max:
             st.session_state["val_date"] = _val_date_max
+    else:
+        st.session_state["val_date"] = date.today()
 
     _val_bt_df = load_bt_df()
 
@@ -2513,8 +2515,8 @@ with tab_iv_analysis:
     _iv_col_date, _iv_col_days, _ = st.columns([2, 1, 3])
     with _iv_col_date:
         _iv_default = st.session_state.get("iv_analysis_end_date",
-                                            st.session_state.get("bt_date2", date(2026, 3, 20)))
-        iv_end_date = st.date_input("End date (shows 14 days ending here)",
+                                            st.session_state.get("bt_date2", date.today()))
+        iv_end_date = st.date_input("End date (shows 30 days ending here)",
                                      value=_iv_default, key="iv_analysis_end_date",
                                      on_change=_sync_trade_date_from_iv)
     with _iv_col_days:
