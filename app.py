@@ -355,6 +355,100 @@ def ltp_from_chain(chain, strike, side):
             return round(float(ltp),1) if ltp else None
     return None
 
+def fetch_dhan_historical_candles(sec_id, exch_seg, instrument, from_date, to_date, tok):
+    """Fetch daily OHLCV from Dhan Historical API. Returns list of {date, open, high, low, close}."""
+    try:
+        payload = {
+            "securityId": str(sec_id),
+            "exchangeSegment": exch_seg,
+            "instrument": instrument,
+            "fromDate": from_date.strftime("%Y-%m-%d"),
+            "toDate": to_date.strftime("%Y-%m-%d"),
+        }
+        r = requests.post("https://api.dhan.co/v2/charts/historical",
+                          json=payload, headers=_hdr(tok), timeout=15)
+        d = r.json()
+        if "close" in d and "timestamp" in d:
+            rows = []
+            for ts, c in zip(d["timestamp"], d["close"]):
+                dt = datetime.fromtimestamp(ts).date()
+                rows.append({"date": dt, "close": float(c)})
+            return rows
+    except Exception as e:
+        pass
+    return []
+
+def backfill_iv_from_dhan(tok, from_date, to_date, rnd=50):
+    """
+    Reconstruct daily IV for each trading day in [from_date, to_date] using Dhan historical API.
+    Steps:
+      1. Fetch Nifty 50 spot close (securityId=13, NSE_EQ, INDEX)
+      2. For each day: ATM = round(spot/rnd)*rnd
+      3. Determine the nearest weekly expiry (Thursday)
+      4. Fetch ATM CE + PE closes using Dhan NFO historical API
+      5. Compute IV from straddle
+    Returns list of row dicts compatible with iv_history_daily.csv
+    """
+    import math
+
+    # Step 1: Nifty spot closes
+    spot_rows = fetch_dhan_historical_candles(13, "NSE_EQ", "INDEX", from_date, to_date, tok)
+    if not spot_rows:
+        return []
+
+    results = []
+    for row in spot_rows:
+        day = row["date"]
+        spot = row["close"]
+        if spot <= 0:
+            continue
+        atm = int(round(spot / rnd) * rnd)
+
+        # Nearest Thursday expiry on or after this day
+        days_to_thu = (3 - day.weekday()) % 7
+        if days_to_thu == 0 and day.weekday() == 3:
+            expiry = day
+        else:
+            expiry = day + timedelta(days=days_to_thu if days_to_thu > 0 else 7)
+        dte_cal = max((expiry - day).days, 1)
+
+        # Step 2: try to fetch ATM CE + PE from Dhan NFO
+        # Dhan NFO search: construct a date-range single-day fetch for the option
+        # We approximate straddle from ATM±50 average if direct fails
+        ce_close = pe_close = None
+        for strike_try in [atm, atm - rnd, atm + rnd]:
+            # Search for CE
+            ce_rows = fetch_dhan_historical_candles(
+                f"NIFTY{expiry.strftime('%d%b%y').upper()}{strike_try}CE",
+                "NSE_FNO", "OPTIDX", day, day, tok)
+            pe_rows = fetch_dhan_historical_candles(
+                f"NIFTY{expiry.strftime('%d%b%y').upper()}{strike_try}PE",
+                "NSE_FNO", "OPTIDX", day, day, tok)
+            if ce_rows and pe_rows:
+                ce_close = ce_rows[0]["close"]
+                pe_close = pe_rows[0]["close"]
+                atm = strike_try
+                break
+
+        if ce_close and pe_close and ce_close > 0 and pe_close > 0:
+            straddle = ce_close + pe_close
+            T = dte_cal / 365
+            iv_pct = round(straddle / (0.8 * spot * math.sqrt(T)) * 100, 2) if T > 0 else None
+            if iv_pct and 2 <= iv_pct <= 100:
+                results.append({
+                    "Date": day,
+                    "NIFTY Spot": round(spot, 2),
+                    "NIFTY IV %": iv_pct,
+                    "Expiry Used": str(expiry),
+                    "DTE (Cal Days)": dte_cal,
+                    "ATM Strike": atm,
+                    "Straddle Price": round(straddle, 1),
+                    "CE LTP": round(ce_close, 1),
+                    "PE LTP": round(pe_close, 1),
+                    "Source": "Dhan Historical",
+                })
+    return results
+
 # ── Dhan Partner OAuth constants ──────────────────────────────────────────────
 DHAN_PARTNER_KEY  = "12c0fd3e"
 DHAN_APP_URL      = "https://nifty-weekly-options-v2.streamlit.app/"
@@ -2633,6 +2727,28 @@ with tab_iv_analysis:
             elif not _lchain:
                 st.info("💡 Enter Dhan token in sidebar to show today's live IV in this chart.")
 
+        # ── Inject backfilled CSV rows (gap between parquet end and today) ─────────
+        _iv_csv = os.path.join(os.path.dirname(__file__), "data", "iv_history_daily.csv")
+        if os.path.exists(_iv_csv):
+            try:
+                _csv_df = pd.read_csv(_iv_csv)
+                _csv_df["date"] = pd.to_datetime(_csv_df["Date"]).dt.date
+                _csv_df = _csv_df.rename(columns={
+                    "NIFTY Spot": "spot", "NIFTY IV %": "iv",
+                    "ATM Strike": "atm_strike", "Expiry Used": "expiry",
+                    "DTE (Cal Days)": "dte", "Straddle Price": "straddle"
+                })[["date","iv","spot","atm_strike","expiry","dte","straddle"]]
+                _csv_df = _csv_df[_csv_df["date"].between(
+                    hist_end - timedelta(days=iv_window * 2), iv_end_date)]
+                if not _csv_df.empty and not iv_hist_df.empty:
+                    _existing_parquet_dates = set(iv_hist_df["date"])
+                    _csv_df = _csv_df[~_csv_df["date"].isin(_existing_parquet_dates)]
+                if not _csv_df.empty:
+                    iv_hist_df = pd.concat([iv_hist_df, _csv_df], ignore_index=True
+                                           ).sort_values("date").reset_index(drop=True)
+            except Exception:
+                pass
+
         # ── Combine historical + live row ─────────────────────────────────────────
         if live_row and (iv_hist_df.empty or iv_hist_df["date"].max() < date.today()):
             iv_combined = pd.concat([iv_hist_df,
@@ -2648,9 +2764,57 @@ with tab_iv_analysis:
                 st.success(f"🔴 **Live IV today ({date.today()}):** {live_row['iv']:.1f}%  "
                            f"| Spot ₹{live_row['spot']:,.0f}  | ATM {live_row['atm_strike']}  "
                            f"| Straddle ₹{live_row['straddle']:.1f}  | DTE {live_row['dte']} calendar days")
-            elif iv_end_date > BT_DATA_END:
+
+            # ── Gap detection + Backfill button ──────────────────────────────────
+            _iv_csv_path = os.path.join(os.path.dirname(__file__), "data", "iv_history_daily.csv")
+            _existing_dates = set()
+            if os.path.exists(_iv_csv_path):
+                _existing_df = pd.read_csv(_iv_csv_path)
+                _existing_dates = set(pd.to_datetime(_existing_df["Date"]).dt.date)
+
+            _gap_start = BT_DATA_END + timedelta(days=1)
+            _gap_end   = date.today() - timedelta(days=1)
+            _gap_days  = [_gap_start + timedelta(i) for i in range((_gap_end - _gap_start).days + 1)
+                          if (_gap_start + timedelta(i)).weekday() < 5]  # weekdays only
+            _missing   = [d for d in _gap_days if d not in _existing_dates]
+
+            _bf_tok = st.session_state.get("dhan_tok", "")
+            if _missing and _bf_tok:
+                _bc1, _bc2 = st.columns([2, 5])
+                with _bc1:
+                    if st.button(f"🔄 Backfill {len(_missing)} missing days from Dhan",
+                                 key="iv_backfill_btn", type="primary"):
+                        with st.spinner(f"Fetching historical IV for {len(_missing)} days…"):
+                            _bf_rows = backfill_iv_from_dhan(
+                                _bf_tok,
+                                min(_missing),
+                                max(_missing),
+                            )
+                        if _bf_rows:
+                            _new_df = pd.DataFrame(_bf_rows)
+                            if os.path.exists(_iv_csv_path):
+                                _combined = pd.concat([pd.read_csv(_iv_csv_path), _new_df], ignore_index=True)
+                                _combined["Date"] = pd.to_datetime(_combined["Date"]).dt.date
+                                _combined = _combined.drop_duplicates(subset=["Date"]).sort_values("Date")
+                            else:
+                                _combined = _new_df
+                            _combined.to_csv(_iv_csv_path, index=False)
+                            compute_iv_window.clear()
+                            st.success(f"✅ Backfilled {len(_bf_rows)} days. Reloading…")
+                            st.rerun()
+                        else:
+                            st.warning("⚠️ Dhan returned no historical option data. "
+                                       "This may be outside the 30-day window or security IDs differ.")
+                with _bc2:
+                    st.caption(f"Gap: **{BT_DATA_END}** → **{date.today()}** "
+                               f"({len(_missing)} trading days missing in iv_history_daily.csv). "
+                               "Uses Dhan Historical API — needs valid token.")
+            elif _missing and not _bf_tok:
+                st.info(f"💡 {len(_missing)} days missing since parquet ends {BT_DATA_END}. "
+                        "Enter Dhan token in sidebar to enable **Backfill from Dhan**.")
+            elif iv_end_date > BT_DATA_END and not live_row:
                 st.warning(f"⚠️ Data gap: parquet ends {BT_DATA_END}. "
-                           f"Enter Dhan token to show live IV for dates after {BT_DATA_END}.")
+                           "Enter Dhan token to show live IV.")
 
             # ── Metrics row ───────────────────────────────────────────────────────
             latest = iv_combined.iloc[-1]
