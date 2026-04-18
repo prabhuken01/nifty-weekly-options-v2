@@ -1027,19 +1027,23 @@ def val_leg_otm_pct(spot, strike, otype):
     return round((strike - spot) / spot * 100.0, 2)
 
 
-def val_kite_legs_dataframe(val_spot, dist_pct, strat_name, stype_v, rnd_v, val_exp, lot_v):
+def val_kite_legs_dataframe(val_spot, dist_pct, strat_name, stype_v, rnd_v, val_exp, lot_v, chain=None):
     """Per-leg rows: geometry names match bt_build_legs (inner / wing for IC)."""
     legs = bt_build_legs(val_spot, dist_pct, stype_v, rnd_v)
     rows = []
     for lbl, stk, otype, side in legs:
         otm = val_leg_otm_pct(val_spot, float(stk), otype)
         sym = f"NIFTY {val_exp.strftime('%d%b%y').upper()} {int(stk)} {otype}"
+        cur_price = None
+        if chain:
+            cur_price = ltp_from_chain(chain, float(stk), "call" if otype == "CE" else "put")
         rows.append({
             "Strategy": strat_name,
             "Geometry": lbl,
             "Strike": int(stk),
             "CE/PE": otype,
             "Action": "SELL" if side == "short" else "BUY",
+            "Curr Price": cur_price if cur_price else "—",
             "% OTM vs spot": otm,
             "Qty / lot": lot_v,
             "NFO hint": sym,
@@ -2269,17 +2273,21 @@ with tab_val:
 
             rnd_v = ROUND["NIFTY 50"]
             lot_v = LOT["NIFTY 50"]
+            _val_chain = st.session_state.get("nifty_chain", {})
 
             _strike_parts = [
-                val_kite_legs_dataframe(val_spot, d, n, t, rnd_v, val_exp, lot_v)
+                val_kite_legs_dataframe(val_spot, d, n, t, rnd_v, val_exp, lot_v, _val_chain)
                 for n, t, d in STRAT_TYPES]
             _strike_all_df = pd.concat(_strike_parts, ignore_index=True)
+            _has_live = _val_chain and any(
+                v != "—" for v in _strike_all_df["Curr Price"])
             with st.expander(
                     "📍 **Strike layout — all strategies** (IC inner shorts + wings · SS/WS/BP/BC legs · Kite)",
                     expanded=True):
                 st.caption(
                     f"**Spot** ₹{val_spot:,.0f} · **Expiry** {val_exp} · **{val_dist_pct:.1f}%** OTM vs spot on shorts "
-                    f"(spreads / IC add **+1%** wing buffer). **Geometry** column matches engine / Tab 2.")
+                    f"(spreads / IC add **+1%** wing buffer). **Geometry** column matches engine / Tab 2."
+                    + ("" if _has_live else " ⚠️ Fetch live chain (sidebar) to see current premiums."))
                 st.dataframe(
                     _strike_all_df,
                     use_container_width=True,
@@ -2467,7 +2475,7 @@ with tab_val:
                 _kdist = float(_kite_row["Dist%"])
                 _kl = bt_build_legs(val_spot, _kdist, _kst, rnd_v)
                 kite_geom = val_kite_legs_dataframe(
-                    val_spot, _kdist, _kite_sel, _kst, rnd_v, val_exp, lot_v)
+                    val_spot, _kdist, _kite_sel, _kst, rnd_v, val_exp, lot_v, _val_chain)
                 st.markdown(
                     f"**{_kite_sel}** · Entry **{val_date}** `{val_entry_hhmm}` · Expiry **{val_exp}** · "
                     f"Capital context **₹{val_capital_rs:,}** ({val_capital_pct}% of ₹1,20,000)")
@@ -2669,33 +2677,34 @@ with tab_iv_analysis:
                 "Narrow range = stable/low-vol environment."
             )
 
-            # ── Excel Download ───────────────────────────────────────────────────────
-            dl_col1, dl_col2, dl_col3 = st.columns([1, 3, 1])
-            with dl_col1:
-                excel_buffer = io.BytesIO()
-                with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
-                    disp_copy = disp.copy()
-                    disp_copy.to_excel(writer, index=False, sheet_name="IV Trend")
-                    if not vix_hist.empty:
-                        vix_hist.to_excel(writer, index=False, sheet_name="VIX")
-                excel_buffer.seek(0)
-                st.download_button(
-                    label="📥 Download Excel",
-                    data=excel_buffer.getvalue(),
-                    file_name=f"IV_Analysis_{date.today()}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True
-                )
+            # ── Build disp and load VIX early (needed for download + charts) ──────
+            disp = iv_combined.copy()
+            disp.columns = ["Date","IV %","Spot","ATM Strike","Expiry","DTE","Straddle"]
+            disp["Source"] = disp["Date"].apply(
+                lambda d: "🔴 Live" if live_row and d == date.today() else "📁 Parquet")
+
+            vix_hist = load_vix_history_csv()
+
+            # ── Excel Download ────────────────────────────────────────────────────
+            excel_buffer = io.BytesIO()
+            with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
+                disp[["Date","Source","IV %","Straddle","Spot","ATM Strike","DTE","Expiry"]].to_excel(
+                    writer, index=False, sheet_name="IV Trend")
+                if not vix_hist.empty:
+                    vix_hist.to_excel(writer, index=False, sheet_name="VIX")
+            excel_buffer.seek(0)
+            st.download_button(
+                label="📥 Download Excel",
+                data=excel_buffer.getvalue(),
+                file_name=f"IV_Analysis_{date.today()}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
 
             # ── Charts ────────────────────────────────────────────────────────────
             st.markdown(f"**IV % Trend — last {len(iv_combined)} trading days (DTE≥2 rule)**")
 
-            # Load VIX data if available
-            vix_hist = load_vix_history_csv()
             iv_combined_vix = iv_combined.copy()
-
             if not vix_hist.empty:
-                # Merge with VIX data
                 vix_window = vix_hist[vix_hist["Date"].isin(iv_combined["date"].tolist())].copy()
                 if not vix_window.empty:
                     iv_combined_vix = iv_combined.merge(
@@ -2706,7 +2715,6 @@ with tab_iv_analysis:
             chart_df = iv_combined_vix.copy()
             chart_df["date_str"] = chart_df["date"].astype(str)
 
-            # Plot IV and VIX side-by-side if VIX data exists
             if "vix" in chart_df.columns and chart_df["vix"].notna().any():
                 col_iv, col_vix = st.columns(2)
                 with col_iv:
@@ -2718,7 +2726,7 @@ with tab_iv_analysis:
             else:
                 st.line_chart(chart_df.set_index("date_str")[["iv"]], use_container_width=True)
                 if vix_hist.empty:
-                    st.caption("💡 VIX data not yet populated. Run daily_iv_updater.py to fetch Nifty VIX.")
+                    st.caption("💡 VIX data not yet available. Populate data/nifty_vix_daily.csv to see VIX chart.")
 
             # IVP from full history file
             bt_dir = os.path.join(os.path.dirname(__file__), "data")
@@ -2735,11 +2743,6 @@ with tab_iv_analysis:
 
             # ── Detail table ──────────────────────────────────────────────────────
             st.markdown("**Daily Breakdown**")
-            disp = iv_combined.copy()
-            disp.columns = ["Date","IV %","Spot","ATM Strike","Expiry","DTE","Straddle"]
-            # Mark live row
-            disp["Source"] = disp["Date"].apply(
-                lambda d: "🔴 Live" if live_row and d == date.today() else "📁 Parquet")
             st.dataframe(disp[["Date","Source","IV %","Straddle","Spot","ATM Strike","DTE","Expiry"]],
                          use_container_width=True, hide_index=True)
 
