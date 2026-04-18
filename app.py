@@ -432,8 +432,10 @@ def _find_option_sec_id(master, expiry_ts, strike, otype):
     hit = rows[m]
     return None if hit.empty else str(hit.iloc[0][sid_c])
 
+@st.cache_data(show_spinner=False, ttl=86400)
 def _dhan_hist_candles(sec_id, exch_seg, instrument, from_d, to_d, tok):
-    """POST /v2/charts/historical → DataFrame[date, close] or empty."""
+    """POST /v2/charts/historical → DataFrame[date, close] or empty.
+    Cached 24h since daily historical candles are immutable."""
     try:
         payload = {
             "securityId": str(sec_id),
@@ -3013,7 +3015,31 @@ with tab_iv_analysis:
             _iv_rnd        = ROUND["NIFTY 50"]
             _iv_entry_hhmm = "10:00" if "10:00" in _entry_timing else "15:00"
 
+            @st.cache_data(show_spinner=False, ttl=3600)
+            def _iv_best_net_for_row(row_date, row_exp, atm, otm_pct,
+                                      lot, rnd, entry_hhmm, iv_frac):
+                """Cached per-row Best-net pick. Re-loads parquet inside (cheap, also cached)."""
+                df = load_bt_df()
+                if df is None or df.empty:
+                    return None, None
+                bn_st, _ = bt_pick_best_stype_net(
+                    df, True, row_date, row_exp, row_exp,
+                    entry_hhmm, "15:00", float(atm), float(otm_pct),
+                    lot, rnd, None, iv_frac)
+                if not bn_st:
+                    return None, None
+                legs = bt_build_legs(float(atm), float(otm_pct), bn_st, rnd)
+                g, ok = bt_gross_pnl_for_legs(
+                    df, True, row_date, row_exp, row_exp,
+                    entry_hhmm, "15:00", legs, lot, float(atm), None, iv_frac)
+                if not ok:
+                    return bn_st, None
+                return bn_st, int(g)
+
             rows_out, _pnl_vals = [], []
+            _loop_total = len(_disp)
+            _loop_progress = (st.progress(0, text="Computing per-row P&L…")
+                              if _actual_toggle and _loop_total > 5 else None)
             for idx_, r in _disp.iterrows():
                 dte_int = int(r["dte"]) if pd.notna(r.get("dte")) else 0
                 iv_val  = float(r["iv"]) if pd.notna(r.get("iv")) else 0.0
@@ -3085,35 +3111,27 @@ with tab_iv_analysis:
                     _pnl_label = f"₹{total_pnl:+,.0f} (est.)"
 
                 # ── Best-net column (reconciles with Tab 3's bt_pick_best_stype_net) ──
+                # Cached per-row to avoid 5×30 parquet scans on every rerun.
                 best_strat_disp, best_pe_ce, best_pnl_label, best_pnl_pct_label = "—", "—", "—", "—"
                 _bn_total_for_color = float("nan")
                 if (_actual_toggle and atm_int > 0 and _row_exp is not None
-                        and _iv_bt_df is not None and not _iv_bt_df.empty
                         and _row_date <= BT_DATA_END):
                     try:
                         _otm_for_row = _otm_pct(dte_int)
-                        _bn_st, _ = bt_pick_best_stype_net(
-                            _iv_bt_df, True, _row_date, _row_exp, _row_exp,
-                            _iv_entry_hhmm, "15:00", float(atm_int), float(_otm_for_row),
-                            _iv_lot, _iv_rnd, None, iv_val / 100.0)
-                        if _bn_st:
-                            _bn_legs = bt_build_legs(float(atm_int), float(_otm_for_row),
-                                                      _bn_st, _iv_rnd)
-                            _bg, _bok = bt_gross_pnl_for_legs(
-                                _iv_bt_df, True, _row_date, _row_exp, _row_exp,
-                                _iv_entry_hhmm, "15:00", _bn_legs, _iv_lot,
-                                float(atm_int), None, iv_val / 100.0)
-                            if _bok:
-                                _bn_total = _n_lots * int(_bg)
-                                _bn_total_for_color = float(_bn_total)
-                                _bn_pct = (_bn_total / total_cap * 100) if total_cap > 0 else float("nan")
-                                best_strat_disp = BT_STYPE_LABELS.get(_bn_st, _bn_st.upper())
-                                best_pe_ce = _strike_str(atm_int, dte_int, _bn_st)
-                                best_pnl_label = f"₹{_bn_total:+,.0f}"
-                                best_pnl_pct_label = (f"{_bn_pct:+.2f}%"
-                                                      if not math.isnan(_bn_pct) else "—")
-                                if _bn_st == st_type:
-                                    best_strat_disp += " ↔"
+                        _bn_st, _bn_g = _iv_best_net_for_row(
+                            _row_date, _row_exp, atm_int, float(_otm_for_row),
+                            _iv_lot, _iv_rnd, _iv_entry_hhmm, iv_val / 100.0)
+                        if _bn_st and _bn_g is not None:
+                            _bn_total = _n_lots * int(_bn_g)
+                            _bn_total_for_color = float(_bn_total)
+                            _bn_pct = (_bn_total / total_cap * 100) if total_cap > 0 else float("nan")
+                            best_strat_disp = BT_STYPE_LABELS.get(_bn_st, _bn_st.upper())
+                            best_pe_ce = _strike_str(atm_int, dte_int, _bn_st)
+                            best_pnl_label = f"₹{_bn_total:+,.0f}"
+                            best_pnl_pct_label = (f"{_bn_pct:+.2f}%"
+                                                  if not math.isnan(_bn_pct) else "—")
+                            if _bn_st == st_type:
+                                best_strat_disp += " ↔"
                     except Exception:
                         pass
 
@@ -3138,6 +3156,17 @@ with tab_iv_analysis:
                     "P&L Source":    _pnl_source if lut_e else "—",
                 }
                 rows_out.append(row_d)
+                if _loop_progress is not None:
+                    try:
+                        _loop_progress.progress(min(1.0, len(rows_out) / max(_loop_total, 1)),
+                                                text=f"Computing per-row P&L… {len(rows_out)}/{_loop_total}")
+                    except Exception:
+                        pass
+            if _loop_progress is not None:
+                try:
+                    _loop_progress.empty()
+                except Exception:
+                    pass
 
             _tbl = pd.DataFrame(rows_out)
 
@@ -3190,11 +3219,17 @@ with tab_iv_analysis:
                            "LUT Strategy","LUT PE / CE","LUT P&L","LUT P&L %",
                            "Best Strategy","Best PE / CE","Best P&L","Best P&L %",
                            "P&L Source"])
-            st.dataframe(
-                _tbl[_show_cols].style.apply(_color_rows, axis=None),
-                use_container_width=True, hide_index=True,
-                height=min(650, 50 + len(_tbl) * 36),
-            )
+            try:
+                st.dataframe(
+                    _tbl[_show_cols].style.apply(_color_rows, axis=None),
+                    use_container_width=True, hide_index=True,
+                    height=min(650, 50 + len(_tbl) * 36),
+                )
+            except Exception as _ex_render:
+                # Fall back to unstyled table so the user always sees the data.
+                st.warning(f"Styled render failed ({type(_ex_render).__name__}); showing unstyled.")
+                st.dataframe(_tbl[_show_cols], use_container_width=True, hide_index=True,
+                             height=min(650, 50 + len(_tbl) * 36))
             st.caption(
                 "ATM Straddle IV%: 🟩 ▲ up · 🟥 ▼ down | Spot: 🟩 ▲ up · 🟥 ▼ down | "
                 "**LUT Strategy** = LUT statistical pick for `DTE × IV × NEUTRAL`; **LUT P&L** is its actual per-trade result "
