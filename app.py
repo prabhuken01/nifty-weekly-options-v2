@@ -10,6 +10,7 @@ from scipy.optimize import brentq
 from datetime import date, timedelta, datetime, timezone
 import math, requests, sys, os, re, json
 import io
+import plotly.graph_objects as go
 
 # ── IST helper ────────────────────────────────────────────────────────────────
 _IST = timezone(timedelta(hours=5, minutes=30))
@@ -2909,187 +2910,262 @@ with tab_iv_analysis:
         else:
             iv_combined = iv_hist_df.copy()
 
+        # ── Load VIX (auto-fetch if missing) ─────────────────────────────────────
+        _bf_tok  = st.session_state.get("dhan_tok", "")
+        vix_hist = load_vix_history_csv()
+        if vix_hist.empty and _bf_tok:
+            with st.spinner("Fetching India VIX history…"):
+                vix_hist = fetch_india_vix_history(_bf_tok, lookback_days=iv_window + 10)
+            if not vix_hist.empty:
+                _vix_csv = os.path.join(os.path.dirname(__file__), "data", "nifty_vix_daily.csv")
+                vix_hist.to_csv(_vix_csv, index=False)
+
+        # ── Auto-backfill: detect gap for selected end date, fill automatically ───
+        _iv_csv_path = os.path.join(os.path.dirname(__file__), "data", "iv_history_daily.csv")
+        _existing_dates = set()
+        if os.path.exists(_iv_csv_path):
+            _existing_df = pd.read_csv(_iv_csv_path)
+            _existing_dates = set(pd.to_datetime(_existing_df["Date"]).dt.date)
+
+        _gap_start = BT_DATA_END + timedelta(days=1)
+        _gap_end   = min(iv_end_date, date.today() - timedelta(days=1))
+        _missing   = sorted([
+            _gap_start + timedelta(i)
+            for i in range(max((_gap_end - _gap_start).days + 1, 0))
+            if (_gap_start + timedelta(i)).weekday() < 5
+            and (_gap_start + timedelta(i)) not in _existing_dates
+        ])
+
+        _bf_key = f"_iv_bf_done_{iv_end_date}"
+        if _missing and _bf_tok and not st.session_state.get(_bf_key):
+            with st.spinner(f"Auto-filling {len(_missing)} missing days from Dhan… (~1 min)"):
+                _bf_rows, _bf_err = backfill_iv_from_dhan(_bf_tok, lookback_days=len(_missing) + 5)
+            st.session_state[_bf_key] = True
+            if _bf_rows:
+                _new_df = pd.DataFrame(_bf_rows)
+                if os.path.exists(_iv_csv_path):
+                    _cb = pd.concat([pd.read_csv(_iv_csv_path), _new_df], ignore_index=True)
+                    _cb["Date"] = pd.to_datetime(_cb["Date"]).dt.date
+                    _cb = _cb.drop_duplicates("Date").sort_values("Date")
+                else:
+                    _cb = _new_df
+                _cb.to_csv(_iv_csv_path, index=False)
+                compute_iv_window.clear()
+                _existing_dates = set(_cb["Date"])
+                st.rerun()
+
+        # Re-inject CSV after backfill
+        if os.path.exists(_iv_csv_path):
+            try:
+                _csv_df2 = pd.read_csv(_iv_csv_path)
+                _csv_df2["date"] = pd.to_datetime(_csv_df2["Date"]).dt.date
+                _csv_df2 = _csv_df2.rename(columns={
+                    "NIFTY Spot":"spot","NIFTY IV %":"iv","ATM Strike":"atm_strike",
+                    "Expiry Used":"expiry","DTE (Cal Days)":"dte","Straddle Price":"straddle"
+                })[["date","iv","spot","atm_strike","expiry","dte","straddle"]]
+                _csv_df2 = _csv_df2[_csv_df2["date"].between(
+                    hist_end - timedelta(days=iv_window*2), iv_end_date)]
+                if not _csv_df2.empty:
+                    _excl = set(iv_hist_df["date"]) if not iv_hist_df.empty else set()
+                    _csv_df2 = _csv_df2[~_csv_df2["date"].isin(_excl)]
+                    if not _csv_df2.empty:
+                        iv_hist_df = pd.concat([iv_hist_df, _csv_df2], ignore_index=True
+                                               ).sort_values("date").reset_index(drop=True)
+            except Exception:
+                pass
+
+        if live_row and (iv_hist_df.empty or iv_hist_df["date"].max() < date.today()):
+            iv_combined = pd.concat([iv_hist_df, pd.DataFrame([live_row])], ignore_index=True)
+        else:
+            iv_combined = iv_hist_df.copy()
+
         if iv_combined.empty:
             st.warning("No IV data for the selected date range.")
+            if not _bf_tok:
+                st.info("💡 Enter Dhan token in sidebar to enable auto-fill of missing days.")
         else:
-            # ── Live IV banner (today) ────────────────────────────────────────────
             if live_row:
                 st.success(f"🔴 **Live IV today ({date.today()}):** {live_row['iv']:.1f}%  "
                            f"| Spot ₹{live_row['spot']:,.0f}  | ATM {live_row['atm_strike']}  "
-                           f"| Straddle ₹{live_row['straddle']:.1f}  | DTE {live_row['dte']} calendar days")
-
-            # ── Gap detection + Backfill button ──────────────────────────────────
-            _iv_csv_path = os.path.join(os.path.dirname(__file__), "data", "iv_history_daily.csv")
-            _existing_dates = set()
-            if os.path.exists(_iv_csv_path):
-                _existing_df = pd.read_csv(_iv_csv_path)
-                _existing_dates = set(pd.to_datetime(_existing_df["Date"]).dt.date)
-
-            _gap_start = BT_DATA_END + timedelta(days=1)
-            _gap_end   = date.today() - timedelta(days=1)
-            _gap_days  = [_gap_start + timedelta(i) for i in range((_gap_end - _gap_start).days + 1)
-                          if (_gap_start + timedelta(i)).weekday() < 5]  # weekdays only
-            _missing   = [d for d in _gap_days if d not in _existing_dates]
-
-            _bf_tok      = st.session_state.get("dhan_tok", "")
-            _today_saved = date.today() in _existing_dates
-
-            if _bf_tok:
-                _bc1, _bc2, _bc3 = st.columns([2, 2, 3])
-                with _bc1:
-                    if st.button(f"🔄 Backfill {len(_missing)} days from Dhan",
-                                 key="iv_backfill_btn", type="primary",
-                                 disabled=len(_missing) == 0):
-                        with st.spinner(f"Fetching historical option candles for {len(_missing)} days… (may take ~1 min)"):
-                            _bf_rows, _bf_err = backfill_iv_from_dhan(_bf_tok, lookback_days=len(_missing)+5)
-                        if _bf_rows:
-                            _new_df = pd.DataFrame(_bf_rows)
-                            if os.path.exists(_iv_csv_path):
-                                _combined = pd.concat([pd.read_csv(_iv_csv_path), _new_df], ignore_index=True)
-                                _combined["Date"] = pd.to_datetime(_combined["Date"]).dt.date
-                                _combined = _combined.drop_duplicates(subset=["Date"]).sort_values("Date")
-                            else:
-                                _combined = _new_df
-                            _combined.to_csv(_iv_csv_path, index=False)
-                            compute_iv_window.clear()
-                            msg = f"✅ Backfilled {len(_bf_rows)} days."
-                            if _bf_err:
-                                msg += f" Skipped: {_bf_err}"
-                            st.success(msg)
-                            st.rerun()
-                        else:
-                            st.error(f"⚠️ No data returned. {_bf_err}")
-                with _bc2:
-                    if not _today_saved:
-                        if st.button("💾 Save Today's IV", key="iv_save_today_btn"):
-                            with st.spinner("Capturing live IV…"):
-                                _today_row = capture_live_iv_row(_bf_tok)
-                            if _today_row:
-                                _new_df = pd.DataFrame([_today_row])
-                                if os.path.exists(_iv_csv_path):
-                                    _combined = pd.concat([pd.read_csv(_iv_csv_path), _new_df], ignore_index=True)
-                                    _combined["Date"] = pd.to_datetime(_combined["Date"]).dt.date
-                                    _combined = _combined.drop_duplicates(subset=["Date"]).sort_values("Date")
-                                else:
-                                    _combined = _new_df
-                                _combined.to_csv(_iv_csv_path, index=False)
-                                compute_iv_window.clear()
-                                st.success(f"✅ Saved IV {_today_row['NIFTY IV %']:.1f}% for {date.today()}")
-                                st.rerun()
-                            else:
-                                st.warning("⚠️ Could not capture IV — ensure market is open.")
-                    else:
-                        st.success(f"✅ Today saved")
-                with _bc3:
-                    if _missing:
-                        st.caption(f"Gap: **{BT_DATA_END}** → **{date.today()-timedelta(1)}** "
-                                   f"({len(_missing)} trading days). Backfill uses Dhan historical candles + BSM.")
-            elif not _bf_tok and _missing:
-                st.info(f"💡 {len(_missing)} days missing. Enter Dhan token to enable backfill.")
+                           f"| Straddle ₹{live_row['straddle']:.1f}  | DTE {live_row['dte']} cal days")
+            elif _missing and not _bf_tok:
+                st.info(f"💡 {len(_missing)} days missing ({BT_DATA_END}→{_gap_end}). "
+                        "Enter Dhan token to auto-fill.")
 
             # ── Metrics row ───────────────────────────────────────────────────────
-            latest = iv_combined.iloc[-1]
+            _last  = iv_combined.iloc[-1]
             _mean  = iv_combined["iv"].mean()
             _std   = iv_combined["iv"].std()
-            _zscore = (latest["iv"] - _mean) / _std if _std > 0 else 0
-            _pct_rank = (iv_combined["iv"] < latest["iv"]).mean() * 100
+            _zs    = (_last["iv"] - _mean) / _std if _std > 0 else 0
+            _pct   = (iv_combined["iv"] < _last["iv"]).mean() * 100
+            m1,m2,m3,m4 = st.columns(4)
+            _src = "Live (Dhan)" if (live_row and _last["date"]==date.today()) else f"Parquet ({_last['date']})"
+            m1.metric("Latest IV", f"{_last['iv']:.1f}%", _src)
+            m2.metric(f"{len(iv_combined)}-Day Mean", f"{_mean:.1f}%", f"Median {iv_combined['iv'].median():.1f}%")
+            m3.metric("Z-Score", f"{_zs:.2f}σ", f"Pctile {_pct:.0f}%")
+            m4.metric("Range", f"{iv_combined['iv'].min():.1f}%–{iv_combined['iv'].max():.1f}%", f"Std {_std:.2f}%")
 
-            m1, m2, m3, m4 = st.columns(4)
-            src_lbl = "Live (Dhan)" if (live_row and latest["date"] == date.today()) else f"Parquet ({latest['date']})"
-            m1.metric("Latest IV", f"{latest['iv']:.1f}%", f"{src_lbl}")
-            m2.metric(f"{len(iv_combined)}-Day Mean", f"{_mean:.1f}%",
-                      f"Median: {iv_combined['iv'].median():.1f}%")
-            m3.metric("Z-Score ①", f"{_zscore:.2f}σ", f"Pctile: {_pct_rank:.0f}%")
-            m4.metric("Range ②", f"{iv_combined['iv'].min():.1f}% – {iv_combined['iv'].max():.1f}%",
-                      f"Std: {_std:.2f}%")
+            # ── Merge VIX into iv_combined ────────────────────────────────────────
+            chart_df = iv_combined.copy()
+            chart_df["date_str"] = chart_df["date"].astype(str)
+            has_vix = False
+            if not vix_hist.empty:
+                _vw = vix_hist.rename(columns={"Date":"date","NIFTY VIX":"vix"})
+                _vw["date"] = pd.to_datetime(_vw["date"]).dt.date
+                chart_df = chart_df.merge(_vw[["date","vix"]], on="date", how="left")
+                has_vix = chart_df["vix"].notna().any()
 
-            st.caption(
-                "① **Z-Score** = (Latest IV − Mean) ÷ Std Dev over the window. "
-                "Interpretation: 0 = average | >+1σ = elevated | >+2σ = high | <−1σ = suppressed. "
-                "Useful to gauge if current IV is cheap or expensive vs recent history.  \n"
-                "② **Range** = Lowest to Highest IV seen in the window. "
-                "Wide range = volatile IV regime (e.g. event-driven spikes). "
-                "Narrow range = stable/low-vol environment."
-            )
+            # ── Build styled Daily Breakdown (BEFORE chart) ───────────────────────
+            st.markdown("---")
+            st.markdown("### 📋 Daily Breakdown")
 
-            # ── Build disp and load VIX early (needed for download + charts) ──────
-            disp = iv_combined.copy()
-            disp.columns = ["Date","IV %","Spot","ATM Strike","Expiry","DTE","Straddle"]
-            disp["Source"] = disp["Date"].apply(
+            _disp = chart_df[["date","iv","vix","straddle","spot","atm_strike","dte","expiry"]].copy() if has_vix \
+                else chart_df[["date","iv","straddle","spot","atm_strike","dte","expiry"]].copy()
+            _disp = _disp.sort_values("date", ascending=False).reset_index(drop=True)
+
+            # Day-over-day deltas (negative index because sorted desc)
+            _disp["Δ IV"]   = -_disp["iv"].diff(-1)
+            _disp["Δ Spot"] = -_disp["spot"].diff(-1)
+            if has_vix:
+                _disp["Δ VIX"] = -_disp["vix"].diff(-1)
+
+            _disp["Source"] = _disp["date"].apply(
                 lambda d: "🔴 Live" if live_row and d == date.today() else "📁 Parquet")
 
-            _vix_tok = st.session_state.get("dhan_tok", "")
-            vix_hist = load_vix_history_csv()
-            if vix_hist.empty and _vix_tok:
-                with st.spinner("Fetching India VIX history…"):
-                    vix_hist = fetch_india_vix_history(_vix_tok, lookback_days=iv_window + 5)
-                if not vix_hist.empty:
-                    _vix_csv = os.path.join(os.path.dirname(__file__), "data", "nifty_vix_daily.csv")
-                    vix_hist.to_csv(_vix_csv, index=False)
+            # Format expiry to show only nearest Thursday (weekly)
+            def _fmt_exp(e):
+                try:
+                    dt = pd.to_datetime(str(e)).date()
+                    return dt.strftime("%d %b")
+                except:
+                    return str(e)
+            _disp["expiry_fmt"] = _disp["expiry"].apply(_fmt_exp)
+
+            def _arrow(v):
+                if pd.isna(v): return ""
+                return "▲" if v > 0 else ("▼" if v < 0 else "—")
+
+            # Build display dataframe
+            rows_out = []
+            for _, r in _disp.iterrows():
+                row_d = {
+                    "Date":     r["date"].strftime("%d %b %y") if hasattr(r["date"], "strftime") else str(r["date"]),
+                    "Src":      r["Source"],
+                    "IV %":     f"{r['iv']:.1f}",
+                    "VIX %":    f"{r['vix']:.1f}" if has_vix and pd.notna(r.get("vix")) else "—",
+                    "Straddle": f"₹{r['straddle']:.0f}",
+                    "Spot":     f"₹{r['spot']:,.0f}",
+                    "ATM":      f"{int(r['atm_strike']):,}",
+                    "DTE":      f"{int(r['dte'])}d",
+                    "Expiry":   r["expiry_fmt"],
+                    # hidden for styling
+                    "_div":     r.get("Δ IV", float("nan")),
+                    "_dvix":    r.get("Δ VIX", float("nan")) if has_vix else float("nan"),
+                    "_dspot":   r.get("Δ Spot", float("nan")),
+                }
+                rows_out.append(row_d)
+
+            _tbl = pd.DataFrame(rows_out)
+
+            def _color_rows(df):
+                styles = pd.DataFrame("", index=df.index, columns=df.columns)
+                for i, r in df.iterrows():
+                    div = r["_div"]
+                    if pd.notna(div):
+                        # IV up = red (more expensive), down = green
+                        c = "#8B0000" if div > 0 else ("#006400" if div < 0 else "")
+                        styles.at[i, "IV %"] = f"color:{c};font-weight:600"
+                    dvix = r["_dvix"]
+                    if pd.notna(dvix) and r["VIX %"] != "—":
+                        c = "#8B0000" if dvix > 0 else ("#006400" if dvix < 0 else "")
+                        styles.at[i, "VIX %"] = f"color:{c};font-weight:600"
+                    dspot = r["_dspot"]
+                    if pd.notna(dspot):
+                        # Spot up = green, down = red (standard)
+                        c = "#006400" if dspot > 0 else ("#8B0000" if dspot < 0 else "")
+                        styles.at[i, "Spot"] = f"color:{c};font-weight:600"
+                    # Live row highlight
+                    if r["Src"] == "🔴 Live":
+                        for col in ["Date","IV %","VIX %","Straddle","Spot"]:
+                            if col in styles.columns:
+                                styles.at[i, col] += ";background-color:#1a3a2a"
+                return styles
+
+            _show_cols = ["Date","Src","IV %","VIX %","Straddle","Spot","ATM","DTE","Expiry"] if has_vix \
+                else ["Date","Src","IV %","Straddle","Spot","ATM","DTE","Expiry"]
+            st.dataframe(
+                _tbl[_show_cols + ["_div","_dvix","_dspot"]].style
+                    .apply(_color_rows, axis=None)
+                    .hide(axis="columns", subset=["_div","_dvix","_dspot"]),
+                use_container_width=True, hide_index=True,
+                height=min(600, 50 + len(_tbl) * 36),
+            )
+            st.caption("IV%/VIX%: 🟥 ▲ up (elevated) · 🟩 ▼ down (suppressed) | Spot: 🟩 ▲ up · 🟥 ▼ down | "
+                       "DTE = calendar days to nearest weekly expiry (Thursday)")
 
             # ── Excel Download ────────────────────────────────────────────────────
-            excel_buffer = io.BytesIO()
-            with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
-                disp[["Date","Source","IV %","Straddle","Spot","ATM Strike","DTE","Expiry"]].to_excel(
-                    writer, index=False, sheet_name="IV Trend")
+            _xbuf = io.BytesIO()
+            with pd.ExcelWriter(_xbuf, engine="openpyxl") as _xw:
+                _tbl[_show_cols].to_excel(_xw, index=False, sheet_name="IV Trend")
                 if not vix_hist.empty:
-                    vix_hist.to_excel(writer, index=False, sheet_name="VIX")
-            excel_buffer.seek(0)
-            st.download_button(
-                label="📥 Download Excel",
-                data=excel_buffer.getvalue(),
-                file_name=f"IV_Analysis_{date.today()}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    vix_hist.to_excel(_xw, index=False, sheet_name="VIX")
+            _xbuf.seek(0)
+            st.download_button("📥 Download Excel", _xbuf.getvalue(),
+                               f"IV_Analysis_{date.today()}.xlsx",
+                               "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+            # ── Combined Plotly chart: IV % + VIX on dual axis ────────────────────
+            st.markdown(f"**IV % vs India VIX — last {len(chart_df)} days**")
+            _plot_df = chart_df.sort_values("date")
+            _fig = go.Figure()
+            _fig.add_trace(go.Scatter(
+                x=_plot_df["date_str"], y=_plot_df["iv"],
+                name="ATM Straddle IV %", yaxis="y1",
+                line=dict(color="#4EA8DE", width=2),
+                mode="lines+markers+text",
+                text=[f"{v:.1f}" for v in _plot_df["iv"]],
+                textposition="top center",
+                textfont=dict(size=9, color="#4EA8DE"),
+                marker=dict(size=5),
+            ))
+            if has_vix:
+                _fig.add_trace(go.Scatter(
+                    x=_plot_df["date_str"], y=_plot_df["vix"],
+                    name="India VIX", yaxis="y2",
+                    line=dict(color="#FF6B6B", width=2, dash="dot"),
+                    mode="lines+markers+text",
+                    text=[f"{v:.1f}" if pd.notna(v) else "" for v in _plot_df["vix"]],
+                    textposition="bottom center",
+                    textfont=dict(size=9, color="#FF6B6B"),
+                    marker=dict(size=5),
+                ))
+            _fig.update_layout(
+                paper_bgcolor="#0D0D0D", plot_bgcolor="#0D0D0D",
+                font=dict(color="#F0F0F0", size=11),
+                legend=dict(bgcolor="#1A1A1A", bordercolor="#2A2A2A"),
+                xaxis=dict(showgrid=False, tickangle=-45, tickfont=dict(size=9)),
+                yaxis=dict(title="IV %", showgrid=True, gridcolor="#2A2A2A",
+                           side="left", tickfont=dict(size=10)),
+                yaxis2=dict(title="VIX", overlaying="y", side="right",
+                            showgrid=False, tickfont=dict(size=10, color="#FF6B6B")),
+                height=380, margin=dict(l=40, r=60, t=30, b=80),
+                hovermode="x unified",
             )
+            st.plotly_chart(_fig, use_container_width=True)
 
-            # ── Charts ────────────────────────────────────────────────────────────
-            st.markdown(f"**IV % Trend — last {len(iv_combined)} trading days (DTE≥2 rule)**")
-
-            iv_combined_vix = iv_combined.copy()
-            if not vix_hist.empty:
-                vix_window = vix_hist[vix_hist["Date"].isin(iv_combined["date"].tolist())].copy()
-                if not vix_window.empty:
-                    iv_combined_vix = iv_combined.merge(
-                        vix_window.rename(columns={"Date": "date", "NIFTY VIX": "vix"})[["date", "vix"]],
-                        on="date", how="left"
-                    )
-
-            chart_df = iv_combined_vix.copy()
-            chart_df["date_str"] = chart_df["date"].astype(str)
-
-            if "vix" in chart_df.columns and chart_df["vix"].notna().any():
-                col_iv, col_vix = st.columns(2)
-                with col_iv:
-                    st.markdown("**ATM Straddle IV %**")
-                    st.line_chart(chart_df.set_index("date_str")[["iv"]], use_container_width=True)
-                with col_vix:
-                    st.markdown("**Nifty VIX (Volatility Index)**")
-                    st.line_chart(chart_df.set_index("date_str")[["vix"]], use_container_width=True, color="#FF6B6B")
-            else:
-                st.line_chart(chart_df.set_index("date_str")[["iv"]], use_container_width=True)
-                if vix_hist.empty:
-                    st.caption("💡 VIX data not yet available. Populate data/nifty_vix_daily.csv to see VIX chart.")
-
-            # IVP from full history file
-            bt_dir = os.path.join(os.path.dirname(__file__), "data")
-            ivp_csv_path = os.path.join(bt_dir, "iv_impact_analysis_with_ivp.csv")
-            if os.path.exists(ivp_csv_path):
-                ivp_df = pd.read_csv(ivp_csv_path)
-                ivp_df["date"] = pd.to_datetime(ivp_df["date"]).dt.date
-                ivp_window = ivp_df[ivp_df["date"].isin(iv_combined["date"].tolist())].copy()
-                if not ivp_window.empty:
+            # IVP chart (unchanged)
+            _ivp_path = os.path.join(os.path.dirname(__file__), "data", "iv_impact_analysis_with_ivp.csv")
+            if os.path.exists(_ivp_path):
+                _ivp = pd.read_csv(_ivp_path)
+                _ivp["date"] = pd.to_datetime(_ivp["date"]).dt.date
+                _ivp_w = _ivp[_ivp["date"].isin(iv_combined["date"].tolist())].copy()
+                if not _ivp_w.empty:
                     st.markdown("**IVP (252-day percentile)**")
-                    ivp_window["date_str"] = ivp_window["date"].astype(str)
-                    st.line_chart(ivp_window.set_index("date_str")[["new_ivp"]],
-                                  use_container_width=True)
+                    _ivp_w["ds"] = _ivp_w["date"].astype(str)
+                    st.line_chart(_ivp_w.set_index("ds")[["new_ivp"]], use_container_width=True)
 
-            # ── Detail table ──────────────────────────────────────────────────────
-            st.markdown("**Daily Breakdown**")
-            st.dataframe(disp[["Date","Source","IV %","Straddle","Spot","ATM Strike","DTE","Expiry"]],
-                         use_container_width=True, hide_index=True)
-
-            st.info("**Formula:** IV = Straddle / (0.8 × Spot × √(DTE/365))  |  "
-                    "DTE≥2 rule: skips 0DTE/T-1 expiries  |  "
+            st.info("**Formula:** IV = Black-Scholes BSM (r=6%, q=1.5%) on ATM straddle  |  "
+                    "DTE≥1 rule, nearest weekly (Thursday) expiry  |  "
                     "IVP = 252-day rolling percentile")
 
     except Exception as e:
