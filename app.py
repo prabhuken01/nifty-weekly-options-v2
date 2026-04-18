@@ -460,13 +460,15 @@ def backfill_iv_from_dhan(tok, lookback_days=30, rnd=50, r=0.06, q=0.015):
     if master.empty:
         return [], "Failed to download scrip master"
 
-    # Expiry list from master
+    # Expiry list from master — filter for weekly (Thursday) only
     rows_all = _nifty_opt_rows(master)
     if rows_all.empty:
         return [], "No NIFTY OPTIDX rows in scrip master"
     exp_c = _scol(rows_all, "SM_EXPIRY_DATE", "EXPIRY_DATE", "SEM_EXPIRY_DATE")
     rows_all[exp_c] = pd.to_datetime(rows_all[exp_c], errors="coerce")
-    expiries = sorted(rows_all[exp_c].dropna().dt.normalize().unique())
+    all_exp = sorted(rows_all[exp_c].dropna().dt.normalize().unique())
+    # Filter for Thursday (weekday() == 3) only
+    expiries = [e for e in all_exp if pd.Timestamp(e).weekday() == 3]
 
     today   = date.today()
     buf_start = today - timedelta(days=lookback_days * 2)
@@ -1647,11 +1649,11 @@ _LBG = {"critical":"rgba(255,75,75,0.08)","important":"rgba(255,164,33,0.08)",
 _LICO = {"critical":"🔴","important":"🟡","monitor":"🔵","low":"⚪"}
 
 # ── TABS ──────────────────────────────────────────────────────────────────────
-tab1, tab2, tab_val, tab_iv_analysis, tab3 = st.tabs([
+tab1, tab_iv_analysis, tab2, tab_val, tab3 = st.tabs([
     "📡 Tab 1 — Live Signal",
-    "📈 Tab 2 — Backtest Engine",
-    "🔬 Tab 3 — Validation Explorer",
-    "📊 Tab 4 — IV Analysis",
+    "📊 Tab 2 — IV Analysis",
+    "📈 Tab 3 — Backtest Engine",
+    "🔬 Tab 4 — Validation Explorer",
     "📜 Tab 5 — IV History",
 ])
 
@@ -1667,6 +1669,11 @@ with tab1:
         _refresh_col1, _refresh_col2 = st.columns([3, 1])
         with _refresh_col2:
             if st.button("🔄 Refresh LTP", use_container_width=True, key="refresh_ltp_btn"):
+                # Clear cache for mobile + desktop to ensure fresh data
+                try:
+                    st.cache_data.clear()
+                except:
+                    pass
                 fresh_ltp = fetch_ltp(tok)
                 if fresh_ltp:
                     st.session_state["nifty_ltp_live"] = fresh_ltp["nifty"]
@@ -3072,12 +3079,13 @@ with tab_iv_analysis:
                 for i, r in df.iterrows():
                     div = r["_div"]
                     if pd.notna(div):
-                        # IV up = red (more expensive), down = green
-                        c = "#8B0000" if div > 0 else ("#006400" if div < 0 else "")
+                        # IV up = green (elevated), down = red (suppressed)
+                        c = "#006400" if div > 0 else ("#8B0000" if div < 0 else "")
                         styles.at[i, "IV %"] = f"color:{c};font-weight:600"
                     dvix = r["_dvix"]
                     if pd.notna(dvix) and r["VIX %"] != "—":
-                        c = "#8B0000" if dvix > 0 else ("#006400" if dvix < 0 else "")
+                        # VIX up = green (elevated), down = red (suppressed)
+                        c = "#006400" if dvix > 0 else ("#8B0000" if dvix < 0 else "")
                         styles.at[i, "VIX %"] = f"color:{c};font-weight:600"
                     dspot = r["_dspot"]
                     if pd.notna(dspot):
@@ -3100,7 +3108,7 @@ with tab_iv_analysis:
                 use_container_width=True, hide_index=True,
                 height=min(600, 50 + len(_tbl) * 36),
             )
-            st.caption("IV%/VIX%: 🟥 ▲ up (elevated) · 🟩 ▼ down (suppressed) | Spot: 🟩 ▲ up · 🟥 ▼ down | "
+            st.caption("IV%/VIX%: 🟩 ▲ up (elevated) · 🟥 ▼ down (suppressed) | Spot: 🟩 ▲ up · 🟥 ▼ down | "
                        "DTE = calendar days to nearest weekly expiry (Thursday)")
 
             # ── Excel Download ────────────────────────────────────────────────────
