@@ -1058,6 +1058,38 @@ def bt_find_expiry_dte2(df, d):
             return e
     return fut[0] if fut else None
 
+
+def get_expiry_for_date(df, d):
+    """UNIFIED expiry selection used by Tab 2 (IV Analysis), Tab 3 (Backtest) and
+    Tab 4 (Validation). Rule: prefer first parquet expiry with DTE>=2, else fall
+    back to the live weekly-expiry (Tue/Thu) rule. Guarantees all tabs pick the
+    same series for a given date (D1)."""
+    if df is not None and not df.empty:
+        exp = bt_find_expiry_dte2(df, d)
+        if exp is not None:
+            return exp
+    return bt_next_expiry_live(d)
+
+
+def dte_days_to_otm_key(dte_days):
+    """Map raw trading-days DTE to the Tab 2 per-DTE OTM slider key (M1)."""
+    try:
+        n = int(dte_days)
+    except Exception:
+        return "otm_3dte"
+    if n <= 1: return "otm_1dte"
+    if n == 2: return "otm_2dte"
+    if n == 3: return "otm_3dte"
+    if n == 4: return "otm_4dte"
+    return "otm_5dte"
+
+
+def dte_otm_slider_default(key):
+    """Default value for each Tab 2 per-DTE OTM slider (matches widget defaults)."""
+    return {"otm_1dte": 3.50, "otm_2dte": 4.25, "otm_3dte": 4.75,
+            "otm_4dte": 5.25, "otm_5dte": 5.75}.get(key, 4.75)
+
+
 def bt_get_spot_at(df, d, hhmm):
     r = df[(df["tdate"]==d) & (df["hhmm"]==hhmm)]
     return float(r["underlying_spot_close"].iloc[0]) if len(r) else None
@@ -1226,6 +1258,75 @@ def bt_pick_best_stype_net(bt_df, is_historical, bt_date, exit_date, bt_expiry,
     return best_st, best_net
 
 
+def dhan_gross_pnl_for_legs(legs_spec, entry_date, exit_date, expiry, lot,
+                            entry_hhmm="14:00", exit_hhmm="15:00", tok=None):
+    """Post-parquet gross P&L using Dhan DAILY candles (/v2/charts/historical).
+    Reuses the existing detailed scrip-master + _dhan_hist_candles pipeline so
+    we don't duplicate Dhan resolution logic. Daily candles only expose CLOSE
+    via _dhan_hist_candles, so intraday entry-timing is approximated by the
+    daily close (documented limitation; parquet covers the intraday case up to
+    BT_DATA_END). Returns (total, ok, details)."""
+    if not tok:
+        return 0, False, [{"error": "no_token"}]
+    try:
+        master = load_dhan_scrip_master_detailed()
+    except Exception as e:
+        return 0, False, [{"error": f"scrip_master:{e}"}]
+    if master is None or master.empty:
+        return 0, False, [{"error": "scrip_master_unavailable"}]
+    exp_ts = pd.Timestamp(expiry)
+    total, ok, details = 0, True, []
+    for label, strike, otype, side in legs_spec:
+        try:
+            sid = _find_option_sec_id(master, exp_ts, float(strike), otype)
+        except Exception as e:
+            sid = None
+            details.append({"leg": label, "strike": int(strike), "otype": otype,
+                            "error": f"resolve:{e}"})
+            ok = False
+            continue
+        if not sid:
+            ok = False
+            details.append({"leg": label, "strike": int(strike), "otype": otype,
+                            "error": "sec_id_unresolved"})
+            continue
+        try:
+            cdf = _dhan_hist_candles(sid, "NSE_FNO", "OPTIDX",
+                                      entry_date, exit_date, tok)
+        except Exception as e:
+            ok = False
+            details.append({"leg": label, "strike": int(strike), "otype": otype,
+                            "error": f"candles:{e}"})
+            continue
+        if cdf is None or cdf.empty:
+            ok = False
+            details.append({"leg": label, "strike": int(strike), "otype": otype,
+                            "error": "no_candles"})
+            continue
+        _entry_exact = cdf[cdf["date"] == entry_date]
+        if not _entry_exact.empty:
+            e_p = float(_entry_exact["close"].iloc[0])
+        else:
+            _fut = cdf[cdf["date"] > entry_date].sort_values("date")
+            e_p = float(_fut["close"].iloc[0]) if not _fut.empty else None
+        _exit_exact = cdf[cdf["date"] == exit_date]
+        if not _exit_exact.empty:
+            x_p = float(_exit_exact["close"].iloc[0])
+        else:
+            _past = cdf[cdf["date"] < exit_date].sort_values("date")
+            x_p = float(_past["close"].iloc[-1]) if not _past.empty else None
+        details.append({"leg": label, "strike": int(strike), "otype": otype,
+                        "side": side, "entry": e_p, "exit": x_p})
+        if e_p is None or x_p is None:
+            ok = False
+            continue
+        if side == "short":
+            total += round((e_p - x_p) * lot)
+        else:
+            total += round((x_p - e_p) * lot)
+    return total, ok, details
+
+
 def bt_default_dist_pct(dte_sel):
     return {"T": 2.0, "T-1": 2.0, "T-2": 3.5, "T-3": 5.0, "T-4": 6.0, "T-5": 6.0}.get(dte_sel, 5.0)
 
@@ -1286,9 +1387,19 @@ def val_leg_otm_pct(spot, strike, otype):
     return round((strike - spot) / spot * 100.0, 2)
 
 
-def val_kite_legs_dataframe(val_spot, dist_pct, strat_name, stype_v, rnd_v, val_exp, lot_v, chain=None):
-    """Per-leg rows: geometry names match bt_build_legs (inner / wing for IC)."""
+def val_kite_legs_dataframe(val_spot, dist_pct, strat_name, stype_v, rnd_v, val_exp, lot_v, chain=None,
+                             bt_df=None, entry_date=None, entry_hhmm=None,
+                             exit_date=None, exit_hhmm="15:00"):
+    """Per-leg rows: geometry names match bt_build_legs (inner / wing for IC).
+
+    D2: when historical parameters (bt_df + entry/exit dates + entry_hhmm) are
+    provided and parquet has data, we add 'Entry Price' (at entry_hhmm on
+    entry_date) and 'Exit Price' (at exit_hhmm on exit_date) columns. This
+    replaces the 'Curr Price' column which is only meaningful for live chains."""
     legs = bt_build_legs(val_spot, dist_pct, stype_v, rnd_v)
+    _has_hist = (bt_df is not None and not getattr(bt_df, "empty", True)
+                 and entry_date is not None and exit_date is not None
+                 and entry_hhmm is not None)
     rows = []
     for lbl, stk, otype, side in legs:
         otm = val_leg_otm_pct(val_spot, float(stk), otype)
@@ -1296,17 +1407,33 @@ def val_kite_legs_dataframe(val_spot, dist_pct, strat_name, stype_v, rnd_v, val_
         cur_price = None
         if chain:
             cur_price = ltp_from_chain(chain, float(stk), "call" if otype == "CE" else "put")
-        rows.append({
+        entry_price = "—"
+        exit_price  = "—"
+        if _has_hist:
+            try:
+                e_p, x_p = bt_get_prem(bt_df, entry_date, exit_date, val_exp,
+                                       float(stk), otype, entry_hhmm, exit_hhmm)
+                if e_p is not None:
+                    entry_price = f"₹{float(e_p):.2f}"
+                if x_p is not None:
+                    exit_price = f"₹{float(x_p):.2f}"
+            except Exception:
+                pass
+        row = {
             "Strategy": strat_name,
             "Geometry": lbl,
             "Strike": int(stk),
             "CE/PE": otype,
             "Action": "SELL" if side == "short" else "BUY",
-            "Curr Price": cur_price if cur_price else "—",
             "% OTM vs spot": otm,
             "Qty / lot": lot_v,
             "NFO hint": sym,
-        })
+        }
+        if _has_hist:
+            row["Entry Price"] = entry_price
+            row["Exit Price"]  = exit_price
+        row["Curr Price"] = cur_price if cur_price else "—"
+        rows.append(row)
     return pd.DataFrame(rows)
 
 
@@ -1754,15 +1881,40 @@ with tab2:
 
     # ── Section 1: Date & Mode ────────────────────────────────────────────────
     st.markdown("#### 1️⃣ Select Date, Entry & Exit Timing")
+    def _active_otm_key_for(d):
+        """M1: resolve which Tab 2 per-DTE slider applies to date `d`."""
+        try:
+            _df = load_bt_df()
+            _exp = get_expiry_for_date(_df, d)
+            _dte = effective_dte(d, _exp) if _exp else 3
+            return dte_days_to_otm_key(_dte)
+        except Exception:
+            return "otm_3dte"
+
     def _sync_val_date_from_bt2():
         st.session_state["val_date"] = st.session_state["bt_date2"]
         st.session_state["iv_analysis_end_date"] = st.session_state["bt_date2"]
+        # M1: auto-pull the matching Tab 2 per-DTE OTM value into bt_dist_slider + val_dist_slider
+        try:
+            _k = _active_otm_key_for(st.session_state["bt_date2"])
+            _v = float(st.session_state.get(_k, dte_otm_slider_default(_k)))
+            st.session_state["bt_dist_slider"] = _v
+            st.session_state["val_dist_slider"] = _v
+        except Exception:
+            pass
 
     def _sync_val_entry_from_bt2():
         st.session_state["val_entry_hhmm"] = st.session_state["bt_entry_hhmm"]
 
     def _sync_val_dist_from_bt2():
-        st.session_state["val_dist_slider"] = float(st.session_state["bt_dist_slider"])
+        _nv = float(st.session_state["bt_dist_slider"])
+        st.session_state["val_dist_slider"] = _nv
+        # M1: push back into the active per-DTE slider
+        try:
+            _k = _active_otm_key_for(st.session_state.get("bt_date2", date.today()))
+            st.session_state[_k] = _nv
+        except Exception:
+            pass
 
     _bt_bar_opts = ["14:00", "10:00", "15:00"]
     _bt_bar0 = st.session_state.get("bt_entry_hhmm", "14:00")
@@ -1856,7 +2008,7 @@ with tab2:
             if bt_expiry_from_picker is not None:
                 bt_expiry = bt_expiry_from_picker
             else:
-                bt_expiry = bt_find_expiry_dte2(bt_df, bt_date)  # DTE>=2 enforced
+                bt_expiry = get_expiry_for_date(bt_df, bt_date)  # D1: unified expiry
             if bt_expiry is None:
                 st.error("Could not find a future expiry in data for this date.")
                 bt_valid = False
@@ -1868,7 +2020,7 @@ with tab2:
         _live_chain = st.session_state.get("nifty_chain", {})
         bt_spot_val = (st.session_state.get("nifty_spot_live") or
                        st.session_state.get("nifty_ltp_live") or SPOT["NIFTY 50"])
-        bt_expiry       = bt_next_expiry_live(bt_date)
+        bt_expiry       = get_expiry_for_date(bt_df, bt_date)  # D1: unified expiry
         _exp_used = st.session_state.get("nifty_exp_used", sel_n_exp)
         _cal_dte  = max((parse_exp(_exp_used) - date.today()).days, 1)
         bt_iv_val       = live_iv_from_chain(_live_chain, bt_spot_val, "NIFTY 50", _cal_dte)
@@ -2420,12 +2572,33 @@ with tab_val:
     def _sync_bt_date_from_val():
         st.session_state["bt_date2"] = st.session_state["val_date"]
         st.session_state["iv_analysis_end_date"] = st.session_state["val_date"]
+        # M1: auto-pull the matching Tab 2 per-DTE OTM into both Tab 3 and Tab 4 sliders
+        try:
+            _df = load_bt_df()
+            _exp = get_expiry_for_date(_df, st.session_state["val_date"])
+            _dte = effective_dte(st.session_state["val_date"], _exp) if _exp else 3
+            _k = dte_days_to_otm_key(_dte)
+            _v = float(st.session_state.get(_k, dte_otm_slider_default(_k)))
+            st.session_state["val_dist_slider"] = _v
+            st.session_state["bt_dist_slider"] = _v
+        except Exception:
+            pass
 
     def _sync_bt_entry_from_val():
         st.session_state["bt_entry_hhmm"] = st.session_state["val_entry_hhmm"]
 
     def _sync_bt_dist_from_val():
-        st.session_state["bt_dist_slider"] = float(st.session_state["val_dist_slider"])
+        _nv = float(st.session_state["val_dist_slider"])
+        st.session_state["bt_dist_slider"] = _nv
+        # M1: push back into the active per-DTE slider
+        try:
+            _df = load_bt_df()
+            _exp = get_expiry_for_date(_df, st.session_state.get("val_date", date.today()))
+            _dte = effective_dte(st.session_state.get("val_date", date.today()), _exp) if _exp else 3
+            _k = dte_days_to_otm_key(_dte)
+            st.session_state[_k] = _nv
+        except Exception:
+            pass
 
     _val_date_min = date(2024, 9, 23)
     _val_date_max = date.today()
@@ -2505,13 +2678,11 @@ with tab_val:
                 "No spot — use a CSV trading day, or set **Dhan token** + **Fetch Live Chain** for Nifty LTP.")
         else:
             val_spot = float(_vsp)
-            val_exp = bt_find_expiry(_val_bt_df, val_date)
+            val_exp = get_expiry_for_date(_val_bt_df, val_date)  # D1: unified expiry
             if val_exp is None:
                 _exs = st.session_state.get("nifty_exp_used") or st.session_state.get("nifty_exp")
                 if isinstance(_exs, str) and _exs and _exs != "—":
                     val_exp = parse_exp(_exs)
-            if val_exp is None:
-                val_exp = bt_next_expiry_live(val_date)
 
             _csv_spot = (bt_get_spot_at(_val_bt_df, val_date, val_entry_hhmm)
                          or bt_get_spot(_val_bt_df, val_date))
@@ -2560,7 +2731,10 @@ with tab_val:
             _val_chain = st.session_state.get("nifty_chain", {})
 
             _strike_parts = [
-                val_kite_legs_dataframe(val_spot, d, n, t, rnd_v, val_exp, lot_v, _val_chain)
+                val_kite_legs_dataframe(val_spot, d, n, t, rnd_v, val_exp, lot_v, _val_chain,
+                                         bt_df=_val_bt_df, entry_date=val_date,
+                                         entry_hhmm=val_entry_hhmm, exit_date=val_exp,
+                                         exit_hhmm="15:00")
                 for n, t, d in STRAT_TYPES]
             _strike_all_df = pd.concat(_strike_parts, ignore_index=True)
             _has_live = _val_chain and any(
@@ -2759,7 +2933,9 @@ with tab_val:
                 _kdist = float(_kite_row["Dist%"])
                 _kl = bt_build_legs(val_spot, _kdist, _kst, rnd_v)
                 kite_geom = val_kite_legs_dataframe(
-                    val_spot, _kdist, _kite_sel, _kst, rnd_v, val_exp, lot_v, _val_chain)
+                    val_spot, _kdist, _kite_sel, _kst, rnd_v, val_exp, lot_v, _val_chain,
+                    bt_df=_val_bt_df, entry_date=val_date,
+                    entry_hhmm=val_entry_hhmm, exit_date=val_exp, exit_hhmm="15:00")
                 st.markdown(
                     f"**{_kite_sel}** · Entry **{val_date}** `{val_entry_hhmm}` · Expiry **{val_exp}** · "
                     f"Capital context **₹{val_capital_rs:,}** ({val_capital_pct}% of ₹1,20,000)")
@@ -3068,23 +3244,50 @@ with tab_iv_analysis:
                     index=0, key="bd_timing",
                     help="Reference timing for entry. EOD = 3PM close bar; morning = 10AM open bar.")
 
+            def _sync_dist_sliders_from_otm(dte_key):
+                """M1: when a Tab 2 per-DTE slider changes, update Tab 3/Tab 4
+                distance sliders if the *active* date in those tabs falls in
+                the same DTE bucket."""
+                try:
+                    _new = float(st.session_state.get(dte_key, dte_otm_slider_default(dte_key)))
+                    _df_c = load_bt_df()
+                    _bd = st.session_state.get("bt_date2")
+                    if _bd is not None:
+                        _bexp = get_expiry_for_date(_df_c, _bd)
+                        _bdte = effective_dte(_bd, _bexp) if _bexp else 3
+                        if dte_days_to_otm_key(_bdte) == dte_key:
+                            st.session_state["bt_dist_slider"] = _new
+                    _vd = st.session_state.get("val_date")
+                    if _vd is not None:
+                        _vexp = get_expiry_for_date(_df_c, _vd)
+                        _vdte = effective_dte(_vd, _vexp) if _vexp else 3
+                        if dte_days_to_otm_key(_vdte) == dte_key:
+                            st.session_state["val_dist_slider"] = _new
+                except Exception:
+                    pass
+
             with st.expander("⚙️ OTM % by DTE — defaults shown, adjust by 0.25% steps"):
                 _oc1, _oc2, _oc3, _oc4, _oc5 = st.columns(5)
                 _dte1_otm = _oc1.slider("1 DTE", 2.0, 6.0,
                                          st.session_state.get("otm_1dte", 3.50), 0.25, key="otm_1dte",
-                                         format="%.2f%%")
+                                         format="%.2f%%",
+                                         on_change=_sync_dist_sliders_from_otm, args=("otm_1dte",))
                 _dte2_otm = _oc2.slider("2 DTE", 2.0, 7.0,
                                          st.session_state.get("otm_2dte", 4.25), 0.25, key="otm_2dte",
-                                         format="%.2f%%")
+                                         format="%.2f%%",
+                                         on_change=_sync_dist_sliders_from_otm, args=("otm_2dte",))
                 _dte3_otm = _oc3.slider("3 DTE", 2.0, 7.0,
                                          st.session_state.get("otm_3dte", 4.75), 0.25, key="otm_3dte",
-                                         format="%.2f%%")
+                                         format="%.2f%%",
+                                         on_change=_sync_dist_sliders_from_otm, args=("otm_3dte",))
                 _dte4_otm = _oc4.slider("4 DTE", 2.0, 8.0,
                                          st.session_state.get("otm_4dte", 5.25), 0.25, key="otm_4dte",
-                                         format="%.2f%%")
+                                         format="%.2f%%",
+                                         on_change=_sync_dist_sliders_from_otm, args=("otm_4dte",))
                 _dte5_otm = _oc5.slider("5–6 DTE", 2.0, 8.0,
                                          st.session_state.get("otm_5dte", 5.75), 0.25, key="otm_5dte",
-                                         format="%.2f%%")
+                                         format="%.2f%%",
+                                         on_change=_sync_dist_sliders_from_otm, args=("otm_5dte",))
                 st.caption(
                     f"Current: 1d→{_dte1_otm:.2f}% | 2d→{_dte2_otm:.2f}% | "
                     f"3d→{_dte3_otm:.2f}% | 4d→{_dte4_otm:.2f}% | 5-6d→{_dte5_otm:.2f}% | "
@@ -3145,6 +3348,20 @@ with tab_iv_analysis:
                 if d > BT_DATA_END:               return "🟡 Dhan"
                 return "📁 Parquet"
 
+            # M2 + D3: actual per-trade NEUTRAL P&L (parquet for <=BT_DATA_END, Dhan for later)
+            _actual_toggle = st.toggle(
+                "💡 Compute actual per-trade NEUTRAL P&L (parquet + Dhan)",
+                value=st.session_state.get("iv_actual_pnl_toggle", True),
+                key="iv_actual_pnl_toggle",
+                help=("Parquet rows → `bt_gross_pnl_for_legs` (free, local). "
+                      "Post-parquet rows → Dhan daily candles (cached; 1 call/leg/date). "
+                      "Toggle off to fall back to LUT average × lots."))
+            _iv_bt_df      = load_bt_df() if _actual_toggle else None
+            _iv_dhan_tok   = st.session_state.get("dhan_tok", "") if _actual_toggle else ""
+            _iv_lot        = LOT["NIFTY 50"]
+            _iv_rnd        = ROUND["NIFTY 50"]
+            _iv_entry_hhmm = "10:00" if "10:00" in _entry_timing else "15:00"
+
             rows_out, _pnl_vals = [], []
             for idx_, r in _disp.iterrows():
                 dte_int = int(r["dte"]) if pd.notna(r.get("dte")) else 0
@@ -3160,10 +3377,61 @@ with tab_iv_analysis:
                     strat += " ⚠️"
                 elif lut_e.get("warn"):
                     strat += " ⚡"
-                total_pnl = _n_lots * pnl_lot if lut_e else 0
+
+                # ── Per-trade actual P&L (M2 for parquet dates, D3 for post-parquet) ──
+                _pnl_source = "LUT avg × lots (est.)"
+                _pnl_ok = False
+                actual_pnl_1lot = None
+                _row_date = r["date"]
+                if hasattr(_row_date, "date") and not isinstance(_row_date, date):
+                    _row_date = _row_date.date()
+                _row_exp = r["expiry"]
+                try:
+                    if hasattr(_row_exp, "date") and not isinstance(_row_exp, date):
+                        _row_exp = _row_exp.date()
+                    elif isinstance(_row_exp, str):
+                        _row_exp = pd.to_datetime(_row_exp).date()
+                except Exception:
+                    _row_exp = None
+
+                if (_actual_toggle and lut_e and st_type and atm_int > 0
+                        and _row_exp is not None and not lut_e.get("skip")):
+                    _otm = _otm_pct(dte_int)
+                    _legs_m2 = bt_build_legs(float(atm_int), float(_otm), st_type, _iv_rnd)
+                    if _row_date <= BT_DATA_END and _iv_bt_df is not None and not _iv_bt_df.empty:
+                        try:
+                            _g, _ok = bt_gross_pnl_for_legs(
+                                _iv_bt_df, True, _row_date, _row_exp, _row_exp,
+                                _iv_entry_hhmm, "15:00", _legs_m2, _iv_lot,
+                                float(atm_int), None, iv_val / 100.0)
+                            if _ok:
+                                actual_pnl_1lot = _g
+                                _pnl_ok = True
+                                _pnl_source = "📁 Parquet actual"
+                        except Exception:
+                            pass
+                    elif _row_date > BT_DATA_END and _iv_dhan_tok:
+                        try:
+                            _g, _ok, _ = dhan_gross_pnl_for_legs(
+                                _legs_m2, _row_date, _row_exp, _row_exp, _iv_lot,
+                                _iv_entry_hhmm, "15:00", tok=_iv_dhan_tok)
+                            if _ok:
+                                actual_pnl_1lot = _g
+                                _pnl_ok = True
+                                _pnl_source = "🟡 Dhan actual"
+                        except Exception:
+                            pass
+
+                if _pnl_ok and actual_pnl_1lot is not None:
+                    total_pnl = _n_lots * int(actual_pnl_1lot)
+                else:
+                    total_pnl = _n_lots * pnl_lot if lut_e else 0
                 total_cap = _n_lots * _CAP_PER_LOT
                 pnl_pct   = (total_pnl / total_cap * 100) if (lut_e and total_cap > 0) else float("nan")
                 _pnl_vals.append(total_pnl if lut_e else float("nan"))
+                _pnl_label = f"₹{total_pnl:+,.0f}"
+                if lut_e and not _pnl_ok and _actual_toggle:
+                    _pnl_label = f"₹{total_pnl:+,.0f} (est.)"
                 row_d = {
                     "Date":       r["date"].strftime("%d %b %y") if hasattr(r["date"], "strftime") else str(r["date"]),
                     "Src":        _src_label(r["date"]),
@@ -3176,8 +3444,9 @@ with tab_iv_analysis:
                     "Expiry":     _fmt_exp(r["expiry"]),
                     "Strategy":   strat,
                     "PE / CE":    _strike_str(atm_int, dte_int, st_type) if lut_e else "—",
-                    "P&L":        f"₹{total_pnl:+,.0f}" if lut_e else "—",
+                    "P&L":        _pnl_label if lut_e else "—",
                     "P&L %":      f"{pnl_pct:+.2f}%" if (lut_e and not math.isnan(pnl_pct)) else "—",
+                    "P&L Source": _pnl_source if lut_e else "—",
                 }
                 rows_out.append(row_d)
 
@@ -3213,10 +3482,10 @@ with tab_iv_analysis:
                 return styles
 
             _show_cols = (["Date","Src","ATM IV %","VIX %","Straddle","Spot","ATM","DTE","Expiry",
-                           "Strategy","PE / CE","P&L","P&L %"]
+                           "Strategy","PE / CE","P&L","P&L %","P&L Source"]
                           if has_vix else
                           ["Date","Src","ATM IV %","Straddle","Spot","ATM","DTE","Expiry",
-                           "Strategy","PE / CE","P&L","P&L %"])
+                           "Strategy","PE / CE","P&L","P&L %","P&L Source"])
             st.dataframe(
                 _tbl[_show_cols].style.apply(_color_rows, axis=None),
                 use_container_width=True, hide_index=True,
@@ -3224,7 +3493,8 @@ with tab_iv_analysis:
             )
             st.caption(
                 "ATM Straddle IV%: 🟩 ▲ up · 🟥 ▼ down | Spot: 🟩 ▲ up · 🟥 ▼ down | "
-                "P&L = backtested LUT avg (NEUTRAL) × lots — same DTE+IV band → same avg P&L | "
+                "**P&L** per row is **actual per-trade** (📁 Parquet ≤ " + str(BT_DATA_END) +
+                ", 🟡 Dhan after) when the toggle is on, else **LUT avg × lots** labelled `(est.)` | "
                 f"Capital = {_n_lots} lots × ₹1.25L = ₹{_n_lots * 1.25:.2f}L | "
                 f"Entry: {_entry_timing}"
             )
