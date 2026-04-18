@@ -8,6 +8,7 @@ import numpy as np
 from scipy.stats import norm
 from datetime import date, timedelta, datetime, timezone
 import math, requests, sys, os, re, json
+import io
 
 # ── IST helper ────────────────────────────────────────────────────────────────
 _IST = timezone(timedelta(hours=5, minutes=30))
@@ -535,12 +536,18 @@ with st.sidebar:
     # Strike parameters (below Fetch)
     _sc1, _sc2 = st.columns(2)
     with _sc1:
-        dist_pct = st.number_input("Dist from spot (%)", 0.1, 5.0, 0.5, 0.1,
-                                   key="dist_pct", help="Closest strike distance from spot")
+        if not _IS_MOBILE:
+            st.write(f"**Dist from spot (%)** — Enter value below")
+        dist_pct = st.number_input("Distance from spot (%)", 0.1, 5.0, 0.5, 0.1,
+                                   key="dist_pct", help="Closest strike distance from spot",
+                                   label_visibility="collapsed" if not _IS_MOBILE else "visible")
     with _sc2:
+        if not _IS_MOBILE:
+            st.write(f"**Offset step (%)** — Enter value below")
         step_pct = st.number_input("Offset step (%)", 0.1, 2.0, 0.5, 0.1,
-                                   key="step_pct", help="Gap between each of the 5 strikes")
-    st.caption(f"Put strikes: -{dist_pct:.1f}% to -{dist_pct+4*step_pct:.1f}% | "
+                                   key="step_pct", help="Gap between each of the 5 strikes",
+                                   label_visibility="collapsed" if not _IS_MOBILE else "visible")
+    st.caption(f"Put strikes: −{dist_pct:.1f}% to −{dist_pct+4*step_pct:.1f}% | "
                f"Call: +{dist_pct:.1f}% to +{dist_pct+4*step_pct:.1f}%")
     st.markdown("---")
 
@@ -752,7 +759,7 @@ BT_CSV_END = date(2026, 3, 24)
 
 @st.cache_data(show_spinner=False)
 def load_bt_df():
-    bt_dir = os.path.join(os.path.dirname(__file__), "Backtest-Engine")
+    bt_dir = os.path.join(os.path.dirname(__file__), "data")
     p_parquet = os.path.join(bt_dir, "final_merged_output_30m_strike_within_6pct.parquet")
 
     if os.path.exists(p_parquet):
@@ -880,6 +887,33 @@ def bt_prem_at(df, d, ed, strike, otype, hhmm):
 def bt_get_prem(df, entry_d, exit_d, ed, strike, otype, entry_hhmm="15:00", exit_hhmm="15:00"):
     return bt_prem_at(df, entry_d, ed, strike, otype, entry_hhmm), bt_prem_at(df, exit_d, ed, strike, otype, exit_hhmm)
 
+@st.cache_data(show_spinner=False)
+def load_iv_history_csv():
+    """Load daily IV history from CSV."""
+    bt_dir = os.path.join(os.path.dirname(__file__), "data")
+    csv_path = os.path.join(bt_dir, "iv_history_daily.csv")
+    if os.path.exists(csv_path):
+        try:
+            df = pd.read_csv(csv_path)
+            df['Date'] = pd.to_datetime(df['Date']).dt.date
+            return df
+        except:
+            return pd.DataFrame()
+    return pd.DataFrame()
+
+@st.cache_data(show_spinner=False)
+def load_vix_history_csv():
+    """Load Nifty VIX daily history from CSV."""
+    bt_dir = os.path.join(os.path.dirname(__file__), "data")
+    csv_path = os.path.join(bt_dir, "nifty_vix_daily.csv")
+    if os.path.exists(csv_path):
+        try:
+            df = pd.read_csv(csv_path)
+            df['Date'] = pd.to_datetime(df['Date']).dt.date
+            return df
+        except:
+            return pd.DataFrame()
+    return pd.DataFrame()
 
 def bt_gross_pnl_for_legs(bt_df, is_historical, bt_date, exit_date, bt_expiry,
                           bt_entry_hhmm, bt_exit_hhmm, legs_spec, lot,
@@ -2635,14 +2669,59 @@ with tab_iv_analysis:
                 "Narrow range = stable/low-vol environment."
             )
 
+            # ── Excel Download ───────────────────────────────────────────────────────
+            dl_col1, dl_col2, dl_col3 = st.columns([1, 3, 1])
+            with dl_col1:
+                excel_buffer = io.BytesIO()
+                with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
+                    disp_copy = disp.copy()
+                    disp_copy.to_excel(writer, index=False, sheet_name="IV Trend")
+                    if not vix_hist.empty:
+                        vix_hist.to_excel(writer, index=False, sheet_name="VIX")
+                excel_buffer.seek(0)
+                st.download_button(
+                    label="📥 Download Excel",
+                    data=excel_buffer.getvalue(),
+                    file_name=f"IV_Analysis_{date.today()}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True
+                )
+
             # ── Charts ────────────────────────────────────────────────────────────
             st.markdown(f"**IV % Trend — last {len(iv_combined)} trading days (DTE≥2 rule)**")
-            chart_df = iv_combined.copy()
+
+            # Load VIX data if available
+            vix_hist = load_vix_history_csv()
+            iv_combined_vix = iv_combined.copy()
+
+            if not vix_hist.empty:
+                # Merge with VIX data
+                vix_window = vix_hist[vix_hist["Date"].isin(iv_combined["date"].tolist())].copy()
+                if not vix_window.empty:
+                    iv_combined_vix = iv_combined.merge(
+                        vix_window.rename(columns={"Date": "date", "NIFTY VIX": "vix"})[["date", "vix"]],
+                        on="date", how="left"
+                    )
+
+            chart_df = iv_combined_vix.copy()
             chart_df["date_str"] = chart_df["date"].astype(str)
-            st.line_chart(chart_df.set_index("date_str")[["iv"]], use_container_width=True)
+
+            # Plot IV and VIX side-by-side if VIX data exists
+            if "vix" in chart_df.columns and chart_df["vix"].notna().any():
+                col_iv, col_vix = st.columns(2)
+                with col_iv:
+                    st.markdown("**ATM Straddle IV %**")
+                    st.line_chart(chart_df.set_index("date_str")[["iv"]], use_container_width=True)
+                with col_vix:
+                    st.markdown("**Nifty VIX (Volatility Index)**")
+                    st.line_chart(chart_df.set_index("date_str")[["vix"]], use_container_width=True, color="#FF6B6B")
+            else:
+                st.line_chart(chart_df.set_index("date_str")[["iv"]], use_container_width=True)
+                if vix_hist.empty:
+                    st.caption("💡 VIX data not yet populated. Run daily_iv_updater.py to fetch Nifty VIX.")
 
             # IVP from full history file
-            bt_dir = os.path.join(os.path.dirname(__file__), "Backtest-Engine")
+            bt_dir = os.path.join(os.path.dirname(__file__), "data")
             ivp_csv_path = os.path.join(bt_dir, "iv_impact_analysis_with_ivp.csv")
             if os.path.exists(ivp_csv_path):
                 ivp_df = pd.read_csv(ivp_csv_path)

@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "Bash(python:*)",
-      "mcp__kite__get_quotes"
+      "mcp__kite__get_quotes",
+      "Bash(python3)"
     ]
   }
 }
