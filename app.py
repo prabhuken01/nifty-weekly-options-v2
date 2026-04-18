@@ -356,14 +356,14 @@ def ltp_from_chain(chain, strike, side):
     return None
 
 def fetch_dhan_historical_candles(sec_id, exch_seg, instrument, from_date, to_date, tok):
-    """Fetch daily OHLCV from Dhan Historical API. Returns list of {date, open, high, low, close}."""
+    """Fetch daily OHLCV from Dhan Historical API. Returns list of {date, close}."""
     try:
         payload = {
             "securityId": str(sec_id),
             "exchangeSegment": exch_seg,
             "instrument": instrument,
             "fromDate": from_date.strftime("%Y-%m-%d"),
-            "toDate": to_date.strftime("%Y-%m-%d"),
+            "toDate":   to_date.strftime("%Y-%m-%d"),
         }
         r = requests.post("https://api.dhan.co/v2/charts/historical",
                           json=payload, headers=_hdr(tok), timeout=15)
@@ -374,78 +374,120 @@ def fetch_dhan_historical_candles(sec_id, exch_seg, instrument, from_date, to_da
                 dt = datetime.fromtimestamp(ts).date()
                 rows.append({"date": dt, "close": float(c)})
             return rows
-    except Exception as e:
+    except Exception:
         pass
     return []
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_dhan_scrip_master():
+    """
+    Download Dhan's instrument master (scraped from CDN).
+    Filtered to NIFTY weekly options in NSE_FNO.
+    Returns DataFrame with columns: security_id, strike, otype, expiry_date.
+    """
+    try:
+        url = "https://images.dhan.co/api-data/api-scrip-master.csv"
+        df = pd.read_csv(url, low_memory=False)
+        # Normalise column names (varies across versions)
+        df.columns = [c.strip() for c in df.columns]
+        # Keep only NIFTY weekly/monthly options on NSE_FNO
+        mask = (
+            df["SEM_INSTRUMENT_NAME"].str.upper().isin(["OPTIDX"]) &
+            df["SEM_TRADING_SYMBOL"].str.upper().str.startswith("NIFTY") &
+            (~df["SEM_TRADING_SYMBOL"].str.upper().str.startswith("NIFTYBANK")) &
+            (df["SEM_EXM_EXCH_ID"].str.upper() == "NSE")
+        )
+        opts = df[mask][["SEM_SMST_SECURITY_ID", "SEM_EXPIRY_DATE",
+                          "SEM_STRIKE_PRICE", "SEM_OPTION_TYPE"]].copy()
+        opts.columns = ["security_id", "expiry_date", "strike", "otype"]
+        opts["expiry_date"] = pd.to_datetime(opts["expiry_date"]).dt.date
+        opts["strike"]      = opts["strike"].astype(float)
+        opts["security_id"] = opts["security_id"].astype(str).str.strip()
+        return opts
+    except Exception:
+        return pd.DataFrame()
+
 def backfill_iv_from_dhan(tok, from_date, to_date, rnd=50):
     """
-    Reconstruct daily IV for each trading day in [from_date, to_date] using Dhan historical API.
-    Steps:
-      1. Fetch Nifty 50 spot close (securityId=13, NSE_EQ, INDEX)
-      2. For each day: ATM = round(spot/rnd)*rnd
-      3. Determine the nearest weekly expiry (Thursday)
-      4. Fetch ATM CE + PE closes using Dhan NFO historical API
-      5. Compute IV from straddle
-    Returns list of row dicts compatible with iv_history_daily.csv
+    Reconstruct daily IV for [from_date, to_date] using Dhan historical API.
+    1. Download Dhan scrip master → get numeric security IDs for NIFTY options
+    2. Fetch Nifty 50 spot closes (secId=13, NSE_EQ, INDEX)
+    3. Per day: find ATM, nearest Thursday expiry, look up CE/PE security IDs
+    4. Fetch ATM CE+PE historical close → straddle → IV
+    Returns list of row dicts compatible with iv_history_daily.csv.
     """
-    import math
+    master = load_dhan_scrip_master()
 
-    # Step 1: Nifty spot closes
+    # Nifty 50 spot historical (security ID = 13 on NSE_EQ INDEX)
     spot_rows = fetch_dhan_historical_candles(13, "NSE_EQ", "INDEX", from_date, to_date, tok)
     if not spot_rows:
         return []
 
     results = []
     for row in spot_rows:
-        day = row["date"]
-        spot = row["close"]
+        day   = row["date"]
+        spot  = row["close"]
         if spot <= 0:
             continue
         atm = int(round(spot / rnd) * rnd)
 
-        # Nearest Thursday expiry on or after this day
+        # Nearest Thursday on-or-after this day (DTE≥2 rule: skip if expiry==today)
         days_to_thu = (3 - day.weekday()) % 7
-        if days_to_thu == 0 and day.weekday() == 3:
-            expiry = day
-        else:
-            expiry = day + timedelta(days=days_to_thu if days_to_thu > 0 else 7)
+        expiry = day + timedelta(days=days_to_thu if days_to_thu > 0 else 7)
         dte_cal = max((expiry - day).days, 1)
+        if dte_cal < 2:                          # skip 0DTE / T-1
+            expiry  = expiry + timedelta(days=7)
+            dte_cal = (expiry - day).days
 
-        # Step 2: try to fetch ATM CE + PE from Dhan NFO
-        # Dhan NFO search: construct a date-range single-day fetch for the option
-        # We approximate straddle from ATM±50 average if direct fails
         ce_close = pe_close = None
+        used_strike = atm
+
         for strike_try in [atm, atm - rnd, atm + rnd]:
-            # Search for CE
+            if master.empty:
+                break
+            # Look up security IDs from master
+            _m = master[
+                (master["expiry_date"] == expiry) &
+                (master["strike"]      == float(strike_try))
+            ]
+            ce_id = _m[_m["otype"].str.upper() == "CALL"]["security_id"]
+            pe_id = _m[_m["otype"].str.upper() == "PUT"]["security_id"]
+            # Also try CE/PE as otype label variants
+            if ce_id.empty:
+                ce_id = _m[_m["otype"].str.upper() == "CE"]["security_id"]
+            if pe_id.empty:
+                pe_id = _m[_m["otype"].str.upper() == "PE"]["security_id"]
+
+            if ce_id.empty or pe_id.empty:
+                continue
+
             ce_rows = fetch_dhan_historical_candles(
-                f"NIFTY{expiry.strftime('%d%b%y').upper()}{strike_try}CE",
-                "NSE_FNO", "OPTIDX", day, day, tok)
+                ce_id.iloc[0], "NSE_FNO", "OPTIDX", day, day, tok)
             pe_rows = fetch_dhan_historical_candles(
-                f"NIFTY{expiry.strftime('%d%b%y').upper()}{strike_try}PE",
-                "NSE_FNO", "OPTIDX", day, day, tok)
+                pe_id.iloc[0], "NSE_FNO", "OPTIDX", day, day, tok)
+
             if ce_rows and pe_rows:
                 ce_close = ce_rows[0]["close"]
                 pe_close = pe_rows[0]["close"]
-                atm = strike_try
+                used_strike = strike_try
                 break
 
         if ce_close and pe_close and ce_close > 0 and pe_close > 0:
             straddle = ce_close + pe_close
-            T = dte_cal / 365
+            T  = dte_cal / 365
             iv_pct = round(straddle / (0.8 * spot * math.sqrt(T)) * 100, 2) if T > 0 else None
             if iv_pct and 2 <= iv_pct <= 100:
                 results.append({
-                    "Date": day,
-                    "NIFTY Spot": round(spot, 2),
-                    "NIFTY IV %": iv_pct,
-                    "Expiry Used": str(expiry),
+                    "Date":          day,
+                    "NIFTY Spot":    round(spot, 2),
+                    "NIFTY IV %":    iv_pct,
+                    "Expiry Used":   str(expiry),
                     "DTE (Cal Days)": dte_cal,
-                    "ATM Strike": atm,
+                    "ATM Strike":    used_strike,
                     "Straddle Price": round(straddle, 1),
-                    "CE LTP": round(ce_close, 1),
-                    "PE LTP": round(pe_close, 1),
-                    "Source": "Dhan Historical",
+                    "CE LTP":        round(ce_close, 1),
+                    "PE LTP":        round(pe_close, 1),
+                    "Source":        "Dhan Historical",
                 })
     return results
 
