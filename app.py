@@ -3035,22 +3035,44 @@ with tab_iv_analysis:
             st.markdown("---")
             st.markdown("### 📋 Daily Breakdown")
 
-            # Lots input + OTM % assumptions
-            _lots_col, _info_col = st.columns([1, 3])
-            with _lots_col:
+            # ── Controls row: Lots · Timing · OTM% sliders ───────────────────────
+            _ctrl1, _ctrl2 = st.columns([1, 1])
+            with _ctrl1:
                 _n_lots = st.number_input("Number of lots", min_value=1, max_value=50,
-                                          value=5, key="iv_lots",
+                                          value=st.session_state.get("iv_lots", 5),
+                                          key="iv_lots",
                                           help="Capital per lot ≈ ₹1.25L margin")
-            with _info_col:
-                st.info(
-                    "**Strike OTM % assumed by DTE** (for P&L estimate via backtested LUT):  \n"
-                    "1 DTE → **3.5%** · 2 DTE → **4.25%** · 3 DTE → **4.75%** · "
-                    "4 DTE → **5.25%** · 5-6 DTE → **5.75%**  \n"
-                    "Strategy = NEUTRAL outlook from LUT. P&L = avg per lot × lots. "
-                    "⚠️ = negative expected P&L (skip). ⚡ = caution (half-lot)."
+            with _ctrl2:
+                _entry_timing = st.selectbox(
+                    "Entry timing", ["3:00 PM (EOD)", "10:00 AM (morning)"],
+                    index=0, key="bd_timing",
+                    help="Reference timing for entry. EOD = 3PM close bar; morning = 10AM open bar.")
+
+            with st.expander("⚙️ OTM % by DTE — defaults shown, adjust by 0.25% steps"):
+                _oc1, _oc2, _oc3, _oc4, _oc5 = st.columns(5)
+                _dte1_otm = _oc1.slider("1 DTE", 2.0, 6.0,
+                                         st.session_state.get("otm_1dte", 3.50), 0.25, key="otm_1dte",
+                                         format="%.2f%%")
+                _dte2_otm = _oc2.slider("2 DTE", 2.0, 7.0,
+                                         st.session_state.get("otm_2dte", 4.25), 0.25, key="otm_2dte",
+                                         format="%.2f%%")
+                _dte3_otm = _oc3.slider("3 DTE", 2.0, 7.0,
+                                         st.session_state.get("otm_3dte", 4.75), 0.25, key="otm_3dte",
+                                         format="%.2f%%")
+                _dte4_otm = _oc4.slider("4 DTE", 2.0, 8.0,
+                                         st.session_state.get("otm_4dte", 5.25), 0.25, key="otm_4dte",
+                                         format="%.2f%%")
+                _dte5_otm = _oc5.slider("5–6 DTE", 2.0, 8.0,
+                                         st.session_state.get("otm_5dte", 5.75), 0.25, key="otm_5dte",
+                                         format="%.2f%%")
+                st.caption(
+                    f"Current: 1d→{_dte1_otm:.2f}% | 2d→{_dte2_otm:.2f}% | "
+                    f"3d→{_dte3_otm:.2f}% | 4d→{_dte4_otm:.2f}% | 5-6d→{_dte5_otm:.2f}% | "
+                    "+1% buffer on long legs (IC / spreads)"
                 )
 
             _CAP_PER_LOT = 125_000  # ₹1.25L per lot
+            _RND = 50               # Nifty strike rounding
 
             def _dte_lut_key(cal_dte):
                 if cal_dte <= 1: return "T-1"
@@ -3058,15 +3080,39 @@ with tab_iv_analysis:
                 if cal_dte <= 3: return "T-3"
                 return "T-4"
 
+            def _otm_pct(cal_dte):
+                if cal_dte <= 1: return _dte1_otm
+                if cal_dte <= 2: return _dte2_otm
+                if cal_dte <= 3: return _dte3_otm
+                if cal_dte <= 4: return _dte4_otm
+                return _dte5_otm
+
+            def _strike_str(atm, cal_dte, st_type):
+                otm = _otm_pct(cal_dte)
+                buf = otm + 1.0  # +1% for long legs
+                pe_s = int(round(atm * (1 - otm / 100) / _RND) * _RND)
+                ce_s = int(round(atm * (1 + otm / 100) / _RND) * _RND)
+                pe_l = int(round(atm * (1 - buf / 100) / _RND) * _RND)
+                ce_l = int(round(atm * (1 + buf / 100) / _RND) * _RND)
+                if st_type in ("ss", "ws"):
+                    return f"{pe_s:,}P / {ce_s:,}C"
+                if st_type == "bp":
+                    return f"{pe_l:,}P–{pe_s:,}P"   # long lower, short higher
+                if st_type == "bc":
+                    return f"{ce_s:,}C–{ce_l:,}C"   # short lower, long higher
+                if st_type == "ic":
+                    return f"{pe_l:,}+{pe_s:,}P / {ce_s:,}+{ce_l:,}C"
+                return "—"
+
             _disp = chart_df[["date","iv","vix","straddle","spot","atm_strike","dte","expiry"]].copy() if has_vix \
                 else chart_df[["date","iv","straddle","spot","atm_strike","dte","expiry"]].copy()
             _disp = _disp.sort_values("date", ascending=False).reset_index(drop=True)
 
-            # Day-over-day deltas (sorted desc, so diff(-1) = prev row = next older day)
-            _iv_delta   = (-_disp["iv"].diff(-1)).reset_index(drop=True)
-            _spot_delta = (-_disp["spot"].diff(-1)).reset_index(drop=True)
-            _vix_delta  = (-_disp["vix"].diff(-1)).reset_index(drop=True) if has_vix \
-                          else pd.Series([float("nan")] * len(_disp))
+            # Day-over-day deltas as plain lists (not stored in displayed DataFrame)
+            _iv_delta_arr   = (-_disp["iv"].diff(-1)).tolist()
+            _spot_delta_arr = (-_disp["spot"].diff(-1)).tolist()
+            _vix_delta_arr  = (-_disp["vix"].diff(-1)).tolist() if has_vix \
+                              else [float("nan")] * len(_disp)
 
             def _fmt_exp(e):
                 try:
@@ -3079,14 +3125,16 @@ with tab_iv_analysis:
                 if d > BT_DATA_END:               return "🟡 Dhan"
                 return "📁 Parquet"
 
-            rows_out = []
+            rows_out, _pnl_vals = [], []
             for idx_, r in _disp.iterrows():
                 dte_int = int(r["dte"]) if pd.notna(r.get("dte")) else 0
                 iv_val  = float(r["iv"]) if pd.notna(r.get("iv")) else 0.0
+                atm_int = int(r["atm_strike"]) if pd.notna(r.get("atm_strike")) else 0
                 iv_b    = iv_band(iv_val)
                 dte_key = _dte_lut_key(dte_int)
                 lut_e   = BT_LUT.get(f"{dte_key}|{iv_b}|NEUTRAL", {})
-                strat   = lut_e.get("s", "—")
+                st_type = lut_e.get("st", "")
+                strat   = lut_e.get("s", "—").replace(" (ONLY)", "")
                 pnl_lot = lut_e.get("pnl", 0)
                 if lut_e.get("skip"):
                     strat += " ⚠️"
@@ -3095,6 +3143,7 @@ with tab_iv_analysis:
                 total_pnl = _n_lots * pnl_lot if lut_e else 0
                 total_cap = _n_lots * _CAP_PER_LOT
                 pnl_pct   = (total_pnl / total_cap * 100) if (lut_e and total_cap > 0) else float("nan")
+                _pnl_vals.append(total_pnl if lut_e else float("nan"))
                 row_d = {
                     "Date":       r["date"].strftime("%d %b %y") if hasattr(r["date"], "strftime") else str(r["date"]),
                     "Src":        _src_label(r["date"]),
@@ -3102,64 +3151,62 @@ with tab_iv_analysis:
                     "VIX %":      f"{r['vix']:.1f}" if has_vix and pd.notna(r.get("vix")) else "—",
                     "Straddle":   f"₹{r['straddle']:.0f}",
                     "Spot":       f"₹{r['spot']:,.0f}",
-                    "ATM":        f"{int(r['atm_strike']):,}",
+                    "ATM":        f"{atm_int:,}",
                     "DTE":        f"{dte_int}d",
                     "Expiry":     _fmt_exp(r["expiry"]),
                     "Strategy":   strat,
+                    "PE / CE":    _strike_str(atm_int, dte_int, st_type) if lut_e else "—",
                     "P&L":        f"₹{total_pnl:+,.0f}" if lut_e else "—",
-                    "P&L %":      f"{pnl_pct:+.2f}%" if not math.isnan(pnl_pct) else "—",
-                    # hidden for styling only
-                    "_div":       _iv_delta.iloc[idx_] if idx_ < len(_iv_delta) else float("nan"),
-                    "_dvix":      _vix_delta.iloc[idx_] if idx_ < len(_vix_delta) else float("nan"),
-                    "_dspot":     _spot_delta.iloc[idx_] if idx_ < len(_spot_delta) else float("nan"),
-                    "_pnl_val":   total_pnl if lut_e else float("nan"),
+                    "P&L %":      f"{pnl_pct:+.2f}%" if (lut_e and not math.isnan(pnl_pct)) else "—",
                 }
                 rows_out.append(row_d)
 
             _tbl = pd.DataFrame(rows_out)
 
+            # Color styling using closure over delta arrays (no hidden columns in DF)
             def _color_rows(df):
                 styles = pd.DataFrame("", index=df.index, columns=df.columns)
-                for i, r in df.iterrows():
-                    div = r["_div"]
-                    if pd.notna(div):
+                for pos, i in enumerate(df.index):
+                    r = df.loc[i]
+                    div   = _iv_delta_arr[pos]   if pos < len(_iv_delta_arr)   else float("nan")
+                    dvix  = _vix_delta_arr[pos]  if pos < len(_vix_delta_arr)  else float("nan")
+                    dspot = _spot_delta_arr[pos] if pos < len(_spot_delta_arr) else float("nan")
+                    pnl_v = _pnl_vals[pos]       if pos < len(_pnl_vals)       else float("nan")
+                    if not (isinstance(div, float) and math.isnan(div)):
                         c = "#006400" if div > 0 else ("#8B0000" if div < 0 else "")
-                        styles.at[i, "ATM IV %"] = f"color:{c};font-weight:600"
-                    dvix = r["_dvix"]
-                    if pd.notna(dvix) and r["VIX %"] != "—":
+                        if c: styles.at[i, "ATM IV %"] = f"color:{c};font-weight:600"
+                    if not (isinstance(dvix, float) and math.isnan(dvix)) and r.get("VIX %", "—") != "—":
                         c = "#006400" if dvix > 0 else ("#8B0000" if dvix < 0 else "")
-                        styles.at[i, "VIX %"] = f"color:{c};font-weight:600"
-                    dspot = r["_dspot"]
-                    if pd.notna(dspot):
+                        if c: styles.at[i, "VIX %"] = f"color:{c};font-weight:600"
+                    if not (isinstance(dspot, float) and math.isnan(dspot)):
                         c = "#006400" if dspot > 0 else ("#8B0000" if dspot < 0 else "")
-                        styles.at[i, "Spot"] = f"color:{c};font-weight:600"
-                    pnl_v = r["_pnl_val"]
-                    if pd.notna(pnl_v):
+                        if c: styles.at[i, "Spot"] = f"color:{c};font-weight:600"
+                    if not (isinstance(pnl_v, float) and math.isnan(pnl_v)):
                         c = "#006400" if pnl_v > 0 else ("#8B0000" if pnl_v < 0 else "")
-                        styles.at[i, "P&L"]   = f"color:{c};font-weight:600"
-                        styles.at[i, "P&L %"] = f"color:{c};font-weight:600"
-                    if r["Src"] == "🔴 Live":
+                        if c:
+                            styles.at[i, "P&L"]   = f"color:{c};font-weight:600"
+                            styles.at[i, "P&L %"] = f"color:{c};font-weight:600"
+                    if r.get("Src") == "🔴 Live":
                         for col in ["Date","ATM IV %","VIX %","Straddle","Spot"]:
                             if col in styles.columns:
                                 styles.at[i, col] += ";background-color:#1a3a2a"
                 return styles
 
-            _show_cols = (["Date","Src","ATM IV %","VIX %","Straddle","Spot","ATM","DTE","Expiry","Strategy","P&L","P&L %"]
+            _show_cols = (["Date","Src","ATM IV %","VIX %","Straddle","Spot","ATM","DTE","Expiry",
+                           "Strategy","PE / CE","P&L","P&L %"]
                           if has_vix else
-                          ["Date","Src","ATM IV %","Straddle","Spot","ATM","DTE","Expiry","Strategy","P&L","P&L %"])
-            _hidden = ["_div","_dvix","_dspot","_pnl_val"]
+                          ["Date","Src","ATM IV %","Straddle","Spot","ATM","DTE","Expiry",
+                           "Strategy","PE / CE","P&L","P&L %"])
             st.dataframe(
-                _tbl[_show_cols + _hidden].style
-                    .apply(_color_rows, axis=None)
-                    .hide(axis="columns", subset=_hidden),
+                _tbl[_show_cols].style.apply(_color_rows, axis=None),
                 use_container_width=True, hide_index=True,
                 height=min(650, 50 + len(_tbl) * 36),
             )
             st.caption(
                 "ATM Straddle IV%: 🟩 ▲ up · 🟥 ▼ down | Spot: 🟩 ▲ up · 🟥 ▼ down | "
-                "P&L green=profit / red=loss (NEUTRAL LUT avg × lots) | "
-                "Expiry: Tuesday post-Sep 2025 / Thursday pre-Sep 2025 | "
-                f"Capital = {_n_lots} lots × ₹1.25L = ₹{_n_lots * 1.25:.2f}L"
+                "P&L = backtested LUT avg (NEUTRAL) × lots — same DTE+IV band → same avg P&L | "
+                f"Capital = {_n_lots} lots × ₹1.25L = ₹{_n_lots * 1.25:.2f}L | "
+                f"Entry: {_entry_timing}"
             )
 
             # ── Excel Download ────────────────────────────────────────────────────
