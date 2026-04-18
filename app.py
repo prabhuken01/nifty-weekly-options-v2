@@ -1864,7 +1864,7 @@ with tab2:
                 bt_iv_val, bt_straddle_val, bt_atm = bt_iv_straddle(
                     bt_df, bt_date, bt_expiry, bt_spot_val, bt_entry_hhmm)
     else:
-        # Live mode: use Dhan chain for real IV, not hardcoded fallback
+        # Post-parquet dates: prefer iv_history_daily.csv, fall back to live chain
         _live_chain = st.session_state.get("nifty_chain", {})
         bt_spot_val = (st.session_state.get("nifty_spot_live") or
                        st.session_state.get("nifty_ltp_live") or SPOT["NIFTY 50"])
@@ -1874,6 +1874,26 @@ with tab2:
         bt_iv_val       = live_iv_from_chain(_live_chain, bt_spot_val, "NIFTY 50", _cal_dte)
         bt_straddle_val = None
         bt_atm          = int(round(bt_spot_val / ROUND["NIFTY 50"]) * ROUND["NIFTY 50"])
+        # Override IV with recorded daily value if available (same source as Tab 2)
+        _iv_csv_path = os.path.join(os.path.dirname(__file__), "data", "iv_history_daily.csv")
+        if os.path.exists(_iv_csv_path) and bt_date < date.today():
+            try:
+                _ivh = pd.read_csv(_iv_csv_path)
+                _ivh["Date"] = pd.to_datetime(_ivh["Date"]).dt.date
+                _ivrow = _ivh[_ivh["Date"] == bt_date]
+                if not _ivrow.empty:
+                    bt_iv_val       = float(_ivrow.iloc[0]["NIFTY IV %"]) / 100.0
+                    _sdl = _ivrow.iloc[0].get("Straddle Price")
+                    if _sdl and float(_sdl) > 0:
+                        bt_straddle_val = float(_sdl)
+                    _sp = _ivrow.iloc[0].get("NIFTY Spot")
+                    if _sp and float(_sp) > 0:
+                        bt_spot_val = float(_sp)
+                    _atm_c = _ivrow.iloc[0].get("ATM Strike")
+                    if _atm_c and float(_atm_c) > 0:
+                        bt_atm = int(float(_atm_c))
+            except Exception:
+                pass
 
     if bt_valid:
         bt_iv_pct  = round(bt_iv_val * 100, 1)
@@ -3209,16 +3229,43 @@ with tab_iv_analysis:
                 f"Entry: {_entry_timing}"
             )
 
-            # ── Excel Download ────────────────────────────────────────────────────
+            # ── Excel Downloads ───────────────────────────────────────────────────
+            _dl1, _dl2 = st.columns(2)
+
+            # Window view (current display)
             _xbuf = io.BytesIO()
             with pd.ExcelWriter(_xbuf, engine="openpyxl") as _xw:
                 _tbl[_show_cols].to_excel(_xw, index=False, sheet_name="IV Trend")
                 if not vix_hist.empty:
                     vix_hist.to_excel(_xw, index=False, sheet_name="VIX")
             _xbuf.seek(0)
-            st.download_button("📥 Download Excel", _xbuf.getvalue(),
+            _dl1.download_button("📥 Download View (Excel)", _xbuf.getvalue(),
                                f"IV_Analysis_{date.today()}.xlsx",
-                               "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                               "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                               key="dl_view_xlsx")
+
+            # Full dump — all of iv_history_daily.csv + VIX
+            _iv_csv_path2 = os.path.join(os.path.dirname(__file__), "data", "iv_history_daily.csv")
+            if os.path.exists(_iv_csv_path2):
+                try:
+                    _full_iv = pd.read_csv(_iv_csv_path2)
+                    _full_buf = io.BytesIO()
+                    with pd.ExcelWriter(_full_buf, engine="openpyxl") as _xw2:
+                        _full_iv.to_excel(_xw2, index=False, sheet_name="IV History (full)")
+                        if not vix_hist.empty:
+                            vix_hist.to_excel(_xw2, index=False, sheet_name="VIX")
+                    _full_buf.seek(0)
+                    _sz_kb = len(_full_buf.getvalue()) // 1024
+                    _dl2.download_button(
+                        f"📦 Full IV Dump (Excel) ~{_sz_kb}KB",
+                        _full_buf.getvalue(),
+                        f"IV_FullDump_{date.today()}.xlsx",
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key="dl_full_xlsx")
+                except Exception as _xe:
+                    _dl2.caption(f"Full dump unavailable: {_xe}")
+            else:
+                _dl2.caption("No iv_history_daily.csv yet — run daily updater first")
 
             # ── Combined Plotly chart: IV % + VIX on dual axis ────────────────────
             st.markdown(f"**IV % vs India VIX — last {len(chart_df)} days**")
