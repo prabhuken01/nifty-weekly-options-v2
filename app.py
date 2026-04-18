@@ -177,6 +177,14 @@ NSE_HOLIDAYS = {
     date(2026,10,2), date(2026,10,26),date(2026,11,4),date(2026,12,25),
 }
 
+# NSE changed NIFTY weekly expiry from Thursday → Tuesday starting Sep 2025
+_NSE_TUESDAY_EXPIRY_START = date(2025, 9, 1)
+def _weekly_exp_day(for_date):
+    """Weekday of NIFTY weekly expiry: 1=Tuesday from Sep-2025, 3=Thursday before."""
+    if for_date >= _NSE_TUESDAY_EXPIRY_START:
+        return 1  # Tuesday
+    return 3  # Thursday
+
 LOT   = {"NIFTY 50": 65,      "SENSEX": 20}
 CAP   = {"NIFTY 50": 125_000, "SENSEX": 125_000}   # both default 1.25L
 ROUND = {"NIFTY 50": 50,      "SENSEX": 100}
@@ -467,8 +475,9 @@ def backfill_iv_from_dhan(tok, lookback_days=30, rnd=50, r=0.06, q=0.015):
     exp_c = _scol(rows_all, "SM_EXPIRY_DATE", "EXPIRY_DATE", "SEM_EXPIRY_DATE")
     rows_all[exp_c] = pd.to_datetime(rows_all[exp_c], errors="coerce")
     all_exp = sorted(rows_all[exp_c].dropna().dt.normalize().unique())
-    # Filter for Thursday (weekday() == 3) only
-    expiries = [e for e in all_exp if pd.Timestamp(e).weekday() == 3]
+    # Filter for weekly expiries: Tuesday from Sep 2025, Thursday before
+    expiries = [e for e in all_exp
+                if pd.Timestamp(e).weekday() == _weekly_exp_day(pd.Timestamp(e).date())]
 
     today   = date.today()
     buf_start = today - timedelta(days=lookback_days * 2)
@@ -3007,7 +3016,7 @@ with tab_iv_analysis:
             _pct   = (iv_combined["iv"] < _last["iv"]).mean() * 100
             m1,m2,m3,m4 = st.columns(4)
             _src = "Live (Dhan)" if (live_row and _last["date"]==date.today()) else f"Parquet ({_last['date']})"
-            m1.metric("Latest IV", f"{_last['iv']:.1f}%", _src)
+            m1.metric("Latest ATM Straddle IV", f"{_last['iv']:.1f}%", _src)
             m2.metric(f"{len(iv_combined)}-Day Mean", f"{_mean:.1f}%", f"Median {iv_combined['iv'].median():.1f}%")
             m3.metric("Z-Score", f"{_zs:.2f}σ", f"Pctile {_pct:.0f}%")
             m4.metric("Range", f"{iv_combined['iv'].min():.1f}%–{iv_combined['iv'].max():.1f}%", f"Std {_std:.2f}%")
@@ -3026,49 +3035,84 @@ with tab_iv_analysis:
             st.markdown("---")
             st.markdown("### 📋 Daily Breakdown")
 
+            # Lots input + OTM % assumptions
+            _lots_col, _info_col = st.columns([1, 3])
+            with _lots_col:
+                _n_lots = st.number_input("Number of lots", min_value=1, max_value=50,
+                                          value=5, key="iv_lots",
+                                          help="Capital per lot ≈ ₹1.25L margin")
+            with _info_col:
+                st.info(
+                    "**Strike OTM % assumed by DTE** (for P&L estimate via backtested LUT):  \n"
+                    "1 DTE → **3.5%** · 2 DTE → **4.25%** · 3 DTE → **4.75%** · "
+                    "4 DTE → **5.25%** · 5-6 DTE → **5.75%**  \n"
+                    "Strategy = NEUTRAL outlook from LUT. P&L = avg per lot × lots. "
+                    "⚠️ = negative expected P&L (skip). ⚡ = caution (half-lot)."
+                )
+
+            _CAP_PER_LOT = 125_000  # ₹1.25L per lot
+
+            def _dte_lut_key(cal_dte):
+                if cal_dte <= 1: return "T-1"
+                if cal_dte <= 2: return "T-2"
+                if cal_dte <= 3: return "T-3"
+                return "T-4"
+
             _disp = chart_df[["date","iv","vix","straddle","spot","atm_strike","dte","expiry"]].copy() if has_vix \
                 else chart_df[["date","iv","straddle","spot","atm_strike","dte","expiry"]].copy()
             _disp = _disp.sort_values("date", ascending=False).reset_index(drop=True)
 
-            # Day-over-day deltas (negative index because sorted desc)
-            _disp["Δ IV"]   = -_disp["iv"].diff(-1)
-            _disp["Δ Spot"] = -_disp["spot"].diff(-1)
-            if has_vix:
-                _disp["Δ VIX"] = -_disp["vix"].diff(-1)
+            # Day-over-day deltas (sorted desc, so diff(-1) = prev row = next older day)
+            _iv_delta   = (-_disp["iv"].diff(-1)).reset_index(drop=True)
+            _spot_delta = (-_disp["spot"].diff(-1)).reset_index(drop=True)
+            _vix_delta  = (-_disp["vix"].diff(-1)).reset_index(drop=True) if has_vix \
+                          else pd.Series([float("nan")] * len(_disp))
 
-            _disp["Source"] = _disp["date"].apply(
-                lambda d: "🔴 Live" if live_row and d == date.today() else "📁 Parquet")
-
-            # Format expiry to show only nearest Thursday (weekly)
             def _fmt_exp(e):
                 try:
-                    dt = pd.to_datetime(str(e)).date()
-                    return dt.strftime("%d %b")
+                    return pd.to_datetime(str(e)).date().strftime("%d %b")
                 except:
                     return str(e)
-            _disp["expiry_fmt"] = _disp["expiry"].apply(_fmt_exp)
 
-            def _arrow(v):
-                if pd.isna(v): return ""
-                return "▲" if v > 0 else ("▼" if v < 0 else "—")
+            def _src_label(d):
+                if live_row and d == date.today(): return "🔴 Live"
+                if d > BT_DATA_END:               return "🟡 Dhan"
+                return "📁 Parquet"
 
-            # Build display dataframe
             rows_out = []
-            for _, r in _disp.iterrows():
+            for idx_, r in _disp.iterrows():
+                dte_int = int(r["dte"]) if pd.notna(r.get("dte")) else 0
+                iv_val  = float(r["iv"]) if pd.notna(r.get("iv")) else 0.0
+                iv_b    = iv_band(iv_val)
+                dte_key = _dte_lut_key(dte_int)
+                lut_e   = BT_LUT.get(f"{dte_key}|{iv_b}|NEUTRAL", {})
+                strat   = lut_e.get("s", "—")
+                pnl_lot = lut_e.get("pnl", 0)
+                if lut_e.get("skip"):
+                    strat += " ⚠️"
+                elif lut_e.get("warn"):
+                    strat += " ⚡"
+                total_pnl = _n_lots * pnl_lot if lut_e else 0
+                total_cap = _n_lots * _CAP_PER_LOT
+                pnl_pct   = (total_pnl / total_cap * 100) if (lut_e and total_cap > 0) else float("nan")
                 row_d = {
-                    "Date":     r["date"].strftime("%d %b %y") if hasattr(r["date"], "strftime") else str(r["date"]),
-                    "Src":      r["Source"],
-                    "IV %":     f"{r['iv']:.1f}",
-                    "VIX %":    f"{r['vix']:.1f}" if has_vix and pd.notna(r.get("vix")) else "—",
-                    "Straddle": f"₹{r['straddle']:.0f}",
-                    "Spot":     f"₹{r['spot']:,.0f}",
-                    "ATM":      f"{int(r['atm_strike']):,}",
-                    "DTE":      f"{int(r['dte'])}d",
-                    "Expiry":   r["expiry_fmt"],
-                    # hidden for styling
-                    "_div":     r.get("Δ IV", float("nan")),
-                    "_dvix":    r.get("Δ VIX", float("nan")) if has_vix else float("nan"),
-                    "_dspot":   r.get("Δ Spot", float("nan")),
+                    "Date":       r["date"].strftime("%d %b %y") if hasattr(r["date"], "strftime") else str(r["date"]),
+                    "Src":        _src_label(r["date"]),
+                    "ATM IV %":   f"{iv_val:.1f}",
+                    "VIX %":      f"{r['vix']:.1f}" if has_vix and pd.notna(r.get("vix")) else "—",
+                    "Straddle":   f"₹{r['straddle']:.0f}",
+                    "Spot":       f"₹{r['spot']:,.0f}",
+                    "ATM":        f"{int(r['atm_strike']):,}",
+                    "DTE":        f"{dte_int}d",
+                    "Expiry":     _fmt_exp(r["expiry"]),
+                    "Strategy":   strat,
+                    "P&L":        f"₹{total_pnl:+,.0f}" if lut_e else "—",
+                    "P&L %":      f"{pnl_pct:+.2f}%" if not math.isnan(pnl_pct) else "—",
+                    # hidden for styling only
+                    "_div":       _iv_delta.iloc[idx_] if idx_ < len(_iv_delta) else float("nan"),
+                    "_dvix":      _vix_delta.iloc[idx_] if idx_ < len(_vix_delta) else float("nan"),
+                    "_dspot":     _spot_delta.iloc[idx_] if idx_ < len(_spot_delta) else float("nan"),
+                    "_pnl_val":   total_pnl if lut_e else float("nan"),
                 }
                 rows_out.append(row_d)
 
@@ -3079,37 +3123,44 @@ with tab_iv_analysis:
                 for i, r in df.iterrows():
                     div = r["_div"]
                     if pd.notna(div):
-                        # IV up = green (elevated), down = red (suppressed)
                         c = "#006400" if div > 0 else ("#8B0000" if div < 0 else "")
-                        styles.at[i, "IV %"] = f"color:{c};font-weight:600"
+                        styles.at[i, "ATM IV %"] = f"color:{c};font-weight:600"
                     dvix = r["_dvix"]
                     if pd.notna(dvix) and r["VIX %"] != "—":
-                        # VIX up = green (elevated), down = red (suppressed)
                         c = "#006400" if dvix > 0 else ("#8B0000" if dvix < 0 else "")
                         styles.at[i, "VIX %"] = f"color:{c};font-weight:600"
                     dspot = r["_dspot"]
                     if pd.notna(dspot):
-                        # Spot up = green, down = red (standard)
                         c = "#006400" if dspot > 0 else ("#8B0000" if dspot < 0 else "")
                         styles.at[i, "Spot"] = f"color:{c};font-weight:600"
-                    # Live row highlight
+                    pnl_v = r["_pnl_val"]
+                    if pd.notna(pnl_v):
+                        c = "#006400" if pnl_v > 0 else ("#8B0000" if pnl_v < 0 else "")
+                        styles.at[i, "P&L"]   = f"color:{c};font-weight:600"
+                        styles.at[i, "P&L %"] = f"color:{c};font-weight:600"
                     if r["Src"] == "🔴 Live":
-                        for col in ["Date","IV %","VIX %","Straddle","Spot"]:
+                        for col in ["Date","ATM IV %","VIX %","Straddle","Spot"]:
                             if col in styles.columns:
                                 styles.at[i, col] += ";background-color:#1a3a2a"
                 return styles
 
-            _show_cols = ["Date","Src","IV %","VIX %","Straddle","Spot","ATM","DTE","Expiry"] if has_vix \
-                else ["Date","Src","IV %","Straddle","Spot","ATM","DTE","Expiry"]
+            _show_cols = (["Date","Src","ATM IV %","VIX %","Straddle","Spot","ATM","DTE","Expiry","Strategy","P&L","P&L %"]
+                          if has_vix else
+                          ["Date","Src","ATM IV %","Straddle","Spot","ATM","DTE","Expiry","Strategy","P&L","P&L %"])
+            _hidden = ["_div","_dvix","_dspot","_pnl_val"]
             st.dataframe(
-                _tbl[_show_cols + ["_div","_dvix","_dspot"]].style
+                _tbl[_show_cols + _hidden].style
                     .apply(_color_rows, axis=None)
-                    .hide(axis="columns", subset=["_div","_dvix","_dspot"]),
+                    .hide(axis="columns", subset=_hidden),
                 use_container_width=True, hide_index=True,
-                height=min(600, 50 + len(_tbl) * 36),
+                height=min(650, 50 + len(_tbl) * 36),
             )
-            st.caption("IV%/VIX%: 🟩 ▲ up (elevated) · 🟥 ▼ down (suppressed) | Spot: 🟩 ▲ up · 🟥 ▼ down | "
-                       "DTE = calendar days to nearest weekly expiry (Thursday)")
+            st.caption(
+                "ATM Straddle IV%: 🟩 ▲ up · 🟥 ▼ down | Spot: 🟩 ▲ up · 🟥 ▼ down | "
+                "P&L green=profit / red=loss (NEUTRAL LUT avg × lots) | "
+                "Expiry: Tuesday post-Sep 2025 / Thursday pre-Sep 2025 | "
+                f"Capital = {_n_lots} lots × ₹1.25L = ₹{_n_lots * 1.25:.2f}L"
+            )
 
             # ── Excel Download ────────────────────────────────────────────────────
             _xbuf = io.BytesIO()
@@ -3172,9 +3223,10 @@ with tab_iv_analysis:
                     _ivp_w["ds"] = _ivp_w["date"].astype(str)
                     st.line_chart(_ivp_w.set_index("ds")[["new_ivp"]], use_container_width=True)
 
-            st.info("**Formula:** IV = Black-Scholes BSM (r=6%, q=1.5%) on ATM straddle  |  "
-                    "DTE≥1 rule, nearest weekly (Thursday) expiry  |  "
-                    "IVP = 252-day rolling percentile")
+            st.info("**Formula:** ATM Straddle IV = Black-Scholes BSM (r=6%, q=1.5%) on (CE+PE) ATM straddle  |  "
+                    "DTE≥1 rule, nearest weekly expiry (Tuesday from Sep 2025 / Thursday before)  |  "
+                    "IVP = 252-day rolling percentile  |  "
+                    "P&L = LUT average per lot × lots (NEUTRAL direction, approx backtested avg)")
 
     except Exception as e:
         st.error(f"Error in IV Analysis: {e}")
