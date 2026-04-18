@@ -1106,33 +1106,18 @@ def live_iv_from_chain(chain, spot, idx, dte_days):
 
 def bt_iv_straddle(df, d, ed, spot, hhmm="15:00"):
     """
-    Calculate IV from ATM straddle using DTE>=2 rule for stability.
-    Falls back to nearest expiry if no valid DTE>=2 expiry found.
+    Calculate IV from ATM straddle using the expiry passed by caller.
+    Uses Black-Scholes approximation for IV from straddle premium.
     """
     rnd = ROUND["NIFTY 50"]
     atm = int(round(spot/rnd)*rnd)
 
-    # NEW: Find first expiry with DTE >= 2 (instead of using provided ed)
-    # Get all available expiries from this date
-    available_expiries = sorted(df[df["tdate"]==d]["edate"].unique())
-
-    best_ed = None
-    for candidate_ed in available_expiries:
-        dte = effective_dte(d, candidate_ed)
-        if dte >= 2:
-            best_ed = candidate_ed
-            break
-
-    # Fallback to provided expiry if DTE < 2
-    if best_ed is None:
-        best_ed = ed
-
-    rows = df[(df["tdate"]==d) & (df["edate"]==best_ed) & (df["hhmm"]==hhmm)]
+    rows = df[(df["tdate"]==d) & (df["edate"]==ed) & (df["hhmm"]==hhmm)]
     ce = rows[(rows["strike_price"]==atm) & (rows["option_type"]=="CE")]["close"]
     pe = rows[(rows["strike_price"]==atm) & (rows["option_type"]=="PE")]["close"]
     if len(ce) and len(pe):
         stv = float(ce.iloc[0]) + float(pe.iloc[0])
-        T   = effective_dte(d, best_ed) / 365
+        T   = effective_dte(d, ed) / 365
         iv  = round(stv / (0.8 * spot * math.sqrt(T)), 4) if T > 0 else IV_ANN["NIFTY 50"]
         return iv, round(stv, 1), atm
     return IV_ANN["NIFTY 50"], None, atm
@@ -1227,7 +1212,7 @@ def bt_pick_best_stype_net(bt_df, is_historical, bt_date, exit_date, bt_expiry,
 
 
 def bt_default_dist_pct(dte_sel):
-    return {"T": 2.0, "T-1": 2.0, "T-2": 3.5, "T-3": 5.0, "T-4": 6.0, "T-5": 6.0}.get(dte_sel, 5.0)
+    return {"T": 3.5, "T-1": 3.5, "T-2": 4.25, "T-3": 4.75, "T-4": 5.25, "T-5": 5.75}.get(dte_sel, 5.25)
 
 
 def bt_lut_dte_key(dte_sel):
@@ -1286,23 +1271,31 @@ def val_leg_otm_pct(spot, strike, otype):
     return round((strike - spot) / spot * 100.0, 2)
 
 
-def val_kite_legs_dataframe(val_spot, dist_pct, strat_name, stype_v, rnd_v, val_exp, lot_v, chain=None):
-    """Per-leg rows: geometry names match bt_build_legs (inner / wing for IC)."""
+def val_kite_legs_dataframe(val_spot, dist_pct, strat_name, stype_v, rnd_v, val_exp, lot_v,
+                             val_date=None, val_entry_hhmm="15:00", val_btdf=None, chain=None):
+    """Per-leg rows: geometry names match bt_build_legs (inner / wing for IC).
+    For historical dates (val_date in parquet), show entry price; otherwise live chain."""
     legs = bt_build_legs(val_spot, dist_pct, stype_v, rnd_v)
     rows = []
     for lbl, stk, otype, side in legs:
         otm = val_leg_otm_pct(val_spot, float(stk), otype)
         sym = f"NIFTY {val_exp.strftime('%d%b%y').upper()} {int(stk)} {otype}"
-        cur_price = None
-        if chain:
-            cur_price = ltp_from_chain(chain, float(stk), "call" if otype == "CE" else "put")
+
+        # For historical dates with data, show entry price from parquet; otherwise use live chain
+        entry_price = None
+        if val_date and val_btdf is not None and not val_btdf.empty:
+            entry_price = bt_prem_at(val_btdf, val_date, val_exp, float(stk), otype, val_entry_hhmm)
+
+        if entry_price is None and chain:
+            entry_price = ltp_from_chain(chain, float(stk), "call" if otype == "CE" else "put")
+
         rows.append({
             "Strategy": strat_name,
             "Geometry": lbl,
             "Strike": int(stk),
             "CE/PE": otype,
             "Action": "SELL" if side == "short" else "BUY",
-            "Curr Price": cur_price if cur_price else "—",
+            "Curr Price": entry_price if entry_price else "—",
             "% OTM vs spot": otm,
             "Qty / lot": lot_v,
             "NFO hint": sym,
@@ -2505,7 +2498,7 @@ with tab_val:
                 "No spot — use a CSV trading day, or set **Dhan token** + **Fetch Live Chain** for Nifty LTP.")
         else:
             val_spot = float(_vsp)
-            val_exp = bt_find_expiry(_val_bt_df, val_date)
+            val_exp = bt_find_expiry_dte2(_val_bt_df, val_date)
             if val_exp is None:
                 _exs = st.session_state.get("nifty_exp_used") or st.session_state.get("nifty_exp")
                 if isinstance(_exs, str) and _exs and _exs != "—":
@@ -2560,7 +2553,8 @@ with tab_val:
             _val_chain = st.session_state.get("nifty_chain", {})
 
             _strike_parts = [
-                val_kite_legs_dataframe(val_spot, d, n, t, rnd_v, val_exp, lot_v, _val_chain)
+                val_kite_legs_dataframe(val_spot, d, n, t, rnd_v, val_exp, lot_v,
+                                       val_date, val_entry_hhmm, _val_bt_df, _val_chain)
                 for n, t, d in STRAT_TYPES]
             _strike_all_df = pd.concat(_strike_parts, ignore_index=True)
             _has_live = _val_chain and any(
@@ -2759,7 +2753,8 @@ with tab_val:
                 _kdist = float(_kite_row["Dist%"])
                 _kl = bt_build_legs(val_spot, _kdist, _kst, rnd_v)
                 kite_geom = val_kite_legs_dataframe(
-                    val_spot, _kdist, _kite_sel, _kst, rnd_v, val_exp, lot_v, _val_chain)
+                    val_spot, _kdist, _kite_sel, _kst, rnd_v, val_exp, lot_v,
+                    val_date, val_entry_hhmm, _val_bt_df, _val_chain)
                 st.markdown(
                     f"**{_kite_sel}** · Entry **{val_date}** `{val_entry_hhmm}` · Expiry **{val_exp}** · "
                     f"Capital context **₹{val_capital_rs:,}** ({val_capital_pct}% of ₹1,20,000)")
