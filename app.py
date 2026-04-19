@@ -665,43 +665,26 @@ def _generate_totp_code(totp_secret: str) -> str:
     except Exception:
         return None
 
-def _fetch_token_from_totp(client_id: str, totp_secret: str) -> str:
-    """Fetch access token from Dhan using client_id and TOTP code."""
-    if not client_id or not totp_secret:
+def _fetch_token_from_totp(client_id: str, totp_secret: str, pin: str) -> str:
+    """Fetch Dhan access token via auth.dhan.co using client_id + PIN + TOTP."""
+    if not client_id or not totp_secret or not pin:
         return None
-
     try:
         totp_code = _generate_totp_code(totp_secret)
         if not totp_code:
             return None
-
-        # Try Dhan auth endpoint with client_id and TOTP
-        headers = {
-            "Content-Type": "application/json",
-            "client-id": str(client_id)
-        }
-        payload = {
-            "clientId": str(client_id),
-            "totpCode": totp_code
-        }
-
         resp = requests.post(
-            "https://api.dhan.co/v2/auth/login",
-            json=payload,
-            headers=headers,
+            "https://auth.dhan.co/app/generateAccessToken",
+            params={"dhanClientId": str(client_id), "pin": str(pin), "totp": totp_code},
             timeout=10
         )
-
         if resp.status_code == 200:
             data = resp.json()
-            if data.get("status") == "success":
-                token = data.get("data", {}).get("accessToken") or data.get("accessToken")
-                if token:
-                    return token
-
+            token = data.get("accessToken") or data.get("data", {}).get("accessToken")
+            if token:
+                return token
         return None
-    except Exception as e:
-        st.error(f"Token fetch error: {str(e)[:100]}")
+    except Exception:
         return None
 
 # ── Token: OAuth redirect → secrets → cache file → session ───────────────────
@@ -719,12 +702,14 @@ if _tok_from_url and _tok_from_url.strip():
     except Exception:
         pass
 
-# 2. TOTP-based auto token generation (if secret available)
+# 2. TOTP-based auto token generation (if secret + pin available in secrets)
 if not st.session_state.get("dhan_tok"):
     try:
-        _totp_secret = st.secrets.get("dhan_totp_secret", "")
-        if _totp_secret and _totp_secret.strip():
-            _tok_from_totp = _fetch_token_from_totp(DHAN_CLIENT_ID, _totp_secret.strip())
+        _totp_secret = str(st.secrets.get("dhan_totp_secret", "")).strip()
+        _dhan_pin    = str(st.secrets.get("dhan_pin", "")).strip()
+        _cid         = str(st.secrets.get("dhan_client_id", DHAN_CLIENT_ID)).strip()
+        if _totp_secret and _dhan_pin:
+            _tok_from_totp = _fetch_token_from_totp(_cid, _totp_secret, _dhan_pin)
             if _tok_from_totp:
                 st.session_state["dhan_tok"] = _tok_from_totp
                 st.session_state["_tok_from_totp"] = True
@@ -812,20 +797,24 @@ with st.sidebar:
         _refresh_cols = st.columns([1, 1])
         with _refresh_cols[0]:
             if st.button("🔄 Refresh", use_container_width=True, key="refresh_token"):
-                # Fetch new token from Dhan using TOTP
-                _totp_secret = st.secrets.get("dhan_totp_secret", "")
-                if _totp_secret:
-                    _new_tok = _fetch_token_from_totp(DHAN_CLIENT_ID, _totp_secret.strip())
+                try:
+                    _ts  = str(st.secrets.get("dhan_totp_secret", "")).strip()
+                    _pin = str(st.secrets.get("dhan_pin", "")).strip()
+                    _cid = str(st.secrets.get("dhan_client_id", DHAN_CLIENT_ID)).strip()
+                except Exception:
+                    _ts = _pin = _cid = ""
+                if _ts and _pin:
+                    _generate_totp_code.clear()   # bust cache so fresh code is used
+                    _new_tok = _fetch_token_from_totp(_cid, _ts, _pin)
                     if _new_tok:
                         st.session_state["dhan_tok"] = _new_tok
                         _save_token_cache(_new_tok)
                         st.session_state.pop("_show_manual", None)
-                        st.success("✅ Token refreshed")
                         st.rerun()
                     else:
-                        st.error("Failed to refresh token. Check TOTP secret.")
+                        st.error("Auto-login failed — check PIN/TOTP in secrets.")
                 else:
-                    st.error("TOTP secret not configured in secrets")
+                    st.error("dhan_pin or dhan_totp_secret missing in secrets.")
 
         with _refresh_cols[1]:
             if st.button("⚙️ Manual", use_container_width=True, key="manual_token_btn"):
