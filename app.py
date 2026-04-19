@@ -3147,22 +3147,22 @@ with tab_iv_analysis:
                     _pnl_label = f"₹{total_pnl:+,.0f} (est.)"
 
                 row_d = {
-                    "Date":          r["date"].strftime("%d %b %y") if hasattr(r["date"], "strftime") else str(r["date"]),
-                    "Src":           _src_label(r["date"]),
-                    "ATM IV %":      f"{iv_val:.1f}",
-                    "VIX %":         f"{r['vix']:.1f}" if has_vix and pd.notna(r.get("vix")) else "—",
-                    "Straddle":      f"₹{r['straddle']:.0f}",
-                    "Spot":          f"₹{r['spot']:,.0f}",
-                    "ATM":           f"{atm_int:,}",
-                    "DTE":           f"{dte_int}d",
-                    "Expiry":        _fmt_exp(r["expiry"]),
-                    "LUT Strategy":  strat,
-                    "LUT PE / CE":   _strike_str(atm_int, dte_int, st_type) if lut_e else "—",
-                    "Prem @ entry":  prem_ent_s if lut_e else "—",
-                    "Prem @ exit":   prem_xit_s if lut_e else "—",
-                    "LUT P&L":       _pnl_label if lut_e else "—",
-                    "LUT P&L %":     f"{pnl_pct:+.2f}%" if (lut_e and not math.isnan(pnl_pct)) else "—",
-                    "P&L Source":    _pnl_source if lut_e else "—",
+                    "Date":               r["date"].strftime("%d %b %y") if hasattr(r["date"], "strftime") else str(r["date"]),
+                    "Src":                _src_label(r["date"]),
+                    "ATM IV %":           f"{iv_val:.1f}",
+                    "VIX %":              f"{r['vix']:.1f}" if has_vix and pd.notna(r.get("vix")) else "—",
+                    "Straddle":           f"₹{r['straddle']:.0f}",
+                    "Spot":               f"₹{r['spot']:,.0f}",
+                    "ATM":                f"{atm_int:,}",
+                    "DTE":                f"{dte_int}d",
+                    "Expiry":             _fmt_exp(r["expiry"]),
+                    "LUT Strategy":       strat,
+                    "LUT PE / CE":        _strike_str(atm_int, dte_int, st_type) if lut_e else "—",
+                    "Actual trade P&L":   _pnl_label if lut_e else "—",
+                    "Actual trade P&L %": f"{pnl_pct:+.2f}%" if (lut_e and not math.isnan(pnl_pct)) else "—",
+                    "Prem @ entry":       prem_ent_s if lut_e else "—",
+                    "Prem @ exit":        prem_xit_s if lut_e else "—",
+                    "P&L Source":         _pnl_source if lut_e else "—",
                 }
                 rows_out.append(row_d)
                 if _loop_progress is not None:
@@ -3200,8 +3200,8 @@ with tab_iv_analysis:
                     if not (isinstance(pnl_v, float) and math.isnan(pnl_v)):
                         c = "#006400" if pnl_v > 0 else ("#8B0000" if pnl_v < 0 else "")
                         if c:
-                            styles.at[i, "LUT P&L"]   = f"color:{c};font-weight:600"
-                            styles.at[i, "LUT P&L %"] = f"color:{c};font-weight:600"
+                            styles.at[i, "Actual trade P&L"]   = f"color:{c};font-weight:600"
+                            styles.at[i, "Actual trade P&L %"] = f"color:{c};font-weight:600"
                     if r.get("Src") == "🔴 Live":
                         for col in ["Date","ATM IV %","VIX %","Straddle","Spot"]:
                             if col in styles.columns:
@@ -3209,12 +3209,14 @@ with tab_iv_analysis:
                 return styles
 
             _show_cols = (["Date","Src","ATM IV %","VIX %","Straddle","Spot","ATM","DTE","Expiry",
-                           "LUT Strategy","LUT PE / CE","Prem @ entry","Prem @ exit",
-                           "LUT P&L","LUT P&L %","P&L Source"]
+                           "LUT Strategy","LUT PE / CE",
+                           "Actual trade P&L","Actual trade P&L %",
+                           "Prem @ entry","Prem @ exit","P&L Source"]
                           if has_vix else
                           ["Date","Src","ATM IV %","Straddle","Spot","ATM","DTE","Expiry",
-                           "LUT Strategy","LUT PE / CE","Prem @ entry","Prem @ exit",
-                           "LUT P&L","LUT P&L %","P&L Source"])
+                           "LUT Strategy","LUT PE / CE",
+                           "Actual trade P&L","Actual trade P&L %",
+                           "Prem @ entry","Prem @ exit","P&L Source"])
             try:
                 st.dataframe(
                     _tbl[_show_cols].style.apply(_color_rows, axis=None),
@@ -3229,13 +3231,12 @@ with tab_iv_analysis:
             st.caption(
                 "ATM Straddle IV%: 🟩 ▲ up · 🟥 ▼ down | Spot: 🟩 ▲ up · 🟥 ▼ down | "
                 "**LUT Strategy** = statistical pick for `DTE × IV × NEUTRAL`. "
-                "**Prem @ entry / Prem @ exit** = first two legs of the built structure (short put · short call for "
-                "short strangle & IC; long put · long call for long strangle; two puts for bull put; two calls for "
-                "bear call), at your **Entry timing** bar on the trade date "
-                "and **15:00** on expiry (parquet); long legs at expiry use intrinsic if OTM. "
-                "**LUT P&L** = gross P&L for that full leg set × lots from those premiums when the toggle is on "
-                "(📁 Parquet ≤ " + str(BT_DATA_END) + ", 🟡 Dhan daily close after — same engine as Tab 3); "
-                "toggle off → LUT avg × lots `(est.)`. Brokerage not subtracted here (gross). | "
+                "**Actual trade P&L** = gross P&L for the **full** LUT leg set × your lot count from entry/exit "
+                "premiums when the toggle is on (📁 Parquet ≤ " + str(BT_DATA_END) + ", 🟡 Dhan after); "
+                "toggle off → LUT table average × lots `(est.)`. **Brokerage not subtracted** (gross). "
+                "**Prem @ entry / exit** = first two legs only (see strikes in LUT PE/CE); "
+                "short strangle & IC: inner short put · short call; long strangle: long put · long call; "
+                "bull put: two strikes; bear call: two strikes — same timing as the P&L engine. | "
                 f"Capital = {_n_lots} lots × ₹1.25L = ₹{_n_lots * 1.25:.2f}L | "
                 f"Entry: {_entry_timing}"
             )
