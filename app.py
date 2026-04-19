@@ -665,6 +665,45 @@ def _generate_totp_code(totp_secret: str) -> str:
     except Exception:
         return None
 
+def _fetch_token_from_totp(client_id: str, totp_secret: str) -> str:
+    """Fetch access token from Dhan using client_id and TOTP code."""
+    if not client_id or not totp_secret:
+        return None
+
+    try:
+        totp_code = _generate_totp_code(totp_secret)
+        if not totp_code:
+            return None
+
+        # Try Dhan auth endpoint with client_id and TOTP
+        headers = {
+            "Content-Type": "application/json",
+            "client-id": str(client_id)
+        }
+        payload = {
+            "clientId": str(client_id),
+            "totpCode": totp_code
+        }
+
+        resp = requests.post(
+            "https://api.dhan.co/v2/auth/login",
+            json=payload,
+            headers=headers,
+            timeout=10
+        )
+
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get("status") == "success":
+                token = data.get("data", {}).get("accessToken") or data.get("accessToken")
+                if token:
+                    return token
+
+        return None
+    except Exception as e:
+        st.error(f"Token fetch error: {str(e)[:100]}")
+        return None
+
 # ── Token: OAuth redirect → secrets → cache file → session ───────────────────
 # 1. Check if Dhan redirected back with tokenId in URL (Partner OAuth flow)
 _qp = st.query_params
@@ -685,9 +724,13 @@ if not st.session_state.get("dhan_tok"):
     try:
         _totp_secret = st.secrets.get("dhan_totp_secret", "")
         if _totp_secret and _totp_secret.strip():
-            st.session_state["_totp_secret"] = _totp_secret.strip()
-            st.session_state["_tok_from_totp"] = True
-    except: pass
+            _tok_from_totp = _fetch_token_from_totp(DHAN_CLIENT_ID, _totp_secret.strip())
+            if _tok_from_totp:
+                st.session_state["dhan_tok"] = _tok_from_totp
+                st.session_state["_tok_from_totp"] = True
+                _save_token_cache(_tok_from_totp)
+    except Exception:
+        pass
 
 # 3. Pre-generated token from secrets (fallback)
 if not st.session_state.get("dhan_tok"):
@@ -769,10 +812,20 @@ with st.sidebar:
         _refresh_cols = st.columns([1, 1])
         with _refresh_cols[0]:
             if st.button("🔄 Refresh", use_container_width=True, key="refresh_token"):
-                # Clear cached token to force regeneration on next run
-                st.session_state.pop("dhan_tok", None)
-                st.session_state.pop("_tok_from_totp", None)
-                st.rerun()
+                # Fetch new token from Dhan using TOTP
+                _totp_secret = st.secrets.get("dhan_totp_secret", "")
+                if _totp_secret:
+                    _new_tok = _fetch_token_from_totp(DHAN_CLIENT_ID, _totp_secret.strip())
+                    if _new_tok:
+                        st.session_state["dhan_tok"] = _new_tok
+                        _save_token_cache(_new_tok)
+                        st.session_state.pop("_show_manual", None)
+                        st.success("✅ Token refreshed")
+                        st.rerun()
+                    else:
+                        st.error("Failed to refresh token. Check TOTP secret.")
+                else:
+                    st.error("TOTP secret not configured in secrets")
 
         with _refresh_cols[1]:
             if st.button("⚙️ Manual", use_container_width=True, key="manual_token_btn"):
