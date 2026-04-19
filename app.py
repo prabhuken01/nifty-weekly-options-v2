@@ -8,7 +8,7 @@ import numpy as np
 from scipy.stats import norm
 from scipy.optimize import brentq
 from datetime import date, timedelta, datetime, timezone
-import math, requests, sys, os, re, json
+import math, requests, sys, os, re, json, time
 import io
 import plotly.graph_objects as go
 
@@ -246,9 +246,76 @@ def lut_strategy_base(lut_entry):
     return norm_strategy_name(lut_entry.get("s", ""))
 
 # ── Dhan API ──────────────────────────────────────────────────────────────────
-def _hdr(tok): return {"Content-Type":"application/json","client-id":DHAN_CLIENT_ID,"access-token":tok}
+def _dhan_client_id():
+    """Prefer `[dhan] client_id` from Secrets; else built-in default."""
+    try:
+        v = st.secrets["dhan"].get("client_id")
+        if v and str(v).strip():
+            return str(v).strip()
+    except Exception:
+        pass
+    return str(DHAN_CLIENT_ID)
 
-@st.cache_data(ttl=DHAN_LTP_TTL, show_spinner=False)
+
+def _hdr(tok):
+    return {"Content-Type": "application/json",
+            "client-id": _dhan_client_id(), "access-token": tok}
+
+
+def _jwt_expiry_hours_left(tok_str):
+    """Return (expiry_dt, hours_remaining) from JWT, or (None, None)."""
+    try:
+        import base64 as _b64, json as _json
+        payload = _json.loads(_b64.urlsafe_b64decode(tok_str.split(".")[1] + "=="))
+        exp_dt = datetime.fromtimestamp(payload["exp"])
+        hrs = (exp_dt - now_ist()).total_seconds() / 3600.0
+        return exp_dt, hrs
+    except Exception:
+        return None, None
+
+
+def dhan_exchange_totp_for_token(client_id: str, pin: str, totp: str):
+    """POST Dhan `generateAccessToken` (PIN + TOTP). Returns (access_token, err_msg)."""
+    from urllib.parse import quote
+    cid, pn, tp = str(client_id).strip(), str(pin).strip(), str(totp).strip()
+    if len(pn) != 6 or not pn.isdigit():
+        return None, "PIN must be 6 digits"
+    if len(tp) != 6 or not tp.isdigit():
+        return None, "TOTP must be 6 digits"
+    url = ("https://auth.dhan.co/app/generateAccessToken?"
+           f"dhanClientId={quote(cid, safe='')}&pin={quote(pn, safe='')}&totp={quote(tp, safe='')}")
+    try:
+        r = requests.post(url, timeout=25)
+        j = r.json() if r.text else {}
+        if r.status_code != 200:
+            return None, str(j.get("message", j.get("error", r.text[:200])))
+        tok = j.get("accessToken") or j.get("access_token")
+        if not tok:
+            return None, "No accessToken in response"
+        return str(tok).strip(), None
+    except Exception as e:
+        return None, str(e)
+
+
+def dhan_renew_access_token(client_id: str, tok: str):
+    """POST `/v2/RenewToken` — extends active web-issued JWT (~24h). May fail for TOTP-issued tokens."""
+    h = {"Content-Type": "application/json",
+         "access-token": tok, "dhanClientId": str(client_id).strip()}
+    try:
+        r = requests.post("https://api.dhan.co/v2/RenewToken", headers=h, timeout=25)
+        j = r.json() if r.text else {}
+        if r.status_code not in (200, 201):
+            return None, str(j.get("message", f"HTTP {r.status_code}"))[:220]
+        if isinstance(j, dict) and j.get("status") == "failure":
+            return None, str(j.get("message", "failure"))[:220]
+        new = j.get("accessToken") or j.get("access_token")
+        if new:
+            return str(new).strip(), None
+        return None, str(j)[:220]
+    except Exception as e:
+        return None, str(e)
+
+
 @st.cache_data(ttl=DHAN_LTP_TTL, show_spinner=False)
 def fetch_ltp_cached(tok):
     """Cached LTP fetch (respects DHAN_LTP_TTL, default 15 min)."""
@@ -680,6 +747,23 @@ if not st.session_state.get("dhan_tok"):
     if _cached:
         st.session_state["dhan_tok"] = _cached
 
+# 4. Auto-renew JWT when still valid but expiring soon (broker cap ~24h / renewal)
+_tok_auto = st.session_state.get("dhan_tok")
+if _tok_auto:
+    _exp_dt, _hrs_rm = _jwt_expiry_hours_left(_tok_auto)
+    if _hrs_rm is not None and 0.12 < _hrs_rm < 3.0:
+        _last_rn = float(st.session_state.get("_dhan_renew_mono", 0.0))
+        if time.monotonic() - _last_rn > 20 * 60:
+            st.session_state["_dhan_renew_mono"] = time.monotonic()
+            _nid = _dhan_client_id()
+            _new_t, _rn_err = dhan_renew_access_token(_nid, _tok_auto)
+            if _new_t:
+                st.session_state["dhan_tok"] = _new_t
+                st.session_state["_tok_manually_set"] = True
+                _save_token_cache(_new_t)
+            else:
+                st.session_state["_dhan_renew_err"] = (_rn_err or "")[:240]
+
 if not st.session_state.get("kite_loaded"):
     try:
         kite_cfg = st.secrets.get("kite", {})
@@ -703,17 +787,8 @@ with st.sidebar:
     _tab_dhan, _tab_kite = st.tabs(["Dhan (Primary)", "Kite (Fallback)"])
 
     with _tab_dhan:
-        # ── Decode token expiry from JWT ──────────────────────────────────────
         def _tok_expiry_info(tok_str):
-            """Return (expires_dt, hours_left) from JWT payload, or (None, None)."""
-            try:
-                import base64, json as _json
-                payload = _json.loads(base64.urlsafe_b64decode(tok_str.split('.')[1] + '=='))
-                exp_dt  = datetime.fromtimestamp(payload['exp'])
-                hrs     = (exp_dt - now_ist()).total_seconds() / 3600
-                return exp_dt, hrs
-            except Exception:
-                return None, None
+            return _jwt_expiry_hours_left(tok_str)
 
         _cur_tok = st.session_state.get("dhan_tok", "")
         _exp_dt, _hrs_left = _tok_expiry_info(_cur_tok) if _cur_tok else (None, None)
@@ -744,16 +819,45 @@ with st.sidebar:
 """, unsafe_allow_html=True)
         st.caption("Clicking opens Dhan login → after login you're redirected back with token auto-loaded.")
 
-        # ── Manual fallback ───────────────────────────────────────────────────
-        with st.expander("Or paste token manually"):
-            _inp_key = "dhan_token_override" if _cur_tok else "dhan_token"
-            _inp = st.text_input("Dhan access token", type="password", key=_inp_key)
-            if _inp:
-                _inp_clean = _inp.strip()
-                st.session_state["dhan_tok"] = _inp_clean
-                st.session_state["_tok_manually_set"] = True
-                _save_token_cache(_inp_clean)   # persist for other sessions
-                st.success("✓ Token loaded & shared with all sessions")
+        # ── Manual fallback: JWT paste **or** PIN+TOTP (Dhan docs) ────────────
+        with st.expander("Manual login: access token **or** PIN + TOTP"):
+            _auth_m = st.radio(
+                "Method", ["Paste access token", "PIN + TOTP"],
+                horizontal=True, key="dhan_manual_auth_mode",
+                help="Both produce the same JWT used by the app. Broker validity is typically **24h**.")
+            if _auth_m.startswith("Paste"):
+                _inp_key = "dhan_token_override" if _cur_tok else "dhan_token"
+                _inp = st.text_input("Dhan access token (JWT)", type="password", key=_inp_key)
+                if _inp:
+                    _inp_clean = _inp.strip()
+                    st.session_state["dhan_tok"] = _inp_clean
+                    st.session_state["_tok_manually_set"] = True
+                    st.session_state.pop("_dhan_auth_totp", None)
+                    _save_token_cache(_inp_clean)
+                    st.success("✓ Token loaded & shared with all sessions")
+            else:
+                st.caption(
+                    "Calls Dhan `generateAccessToken`. Use a fresh **6-digit TOTP** from your authenticator. "
+                    "While the JWT is still valid, the app tries **`RenewToken`** when fewer than **3 hours** "
+                    "remain (often works for web-issued tokens; if it fails, exchange PIN+TOTP again).")
+                _cid_in = st.text_input("Dhan Client ID", value=_dhan_client_id(), key="dhan_totp_client_id")
+                _pin_in = st.text_input("6-digit Dhan PIN", type="password", max_chars=6, key="dhan_pin_6")
+                _totp_in = st.text_input("6-digit TOTP", max_chars=6, key="dhan_totp_6")
+                if st.button("Exchange PIN + TOTP for access token", key="dhan_totp_exchange_btn"):
+                    _nt, _em = dhan_exchange_totp_for_token(_cid_in, _pin_in, _totp_in)
+                    if _nt:
+                        st.session_state["dhan_tok"] = _nt
+                        st.session_state["_tok_manually_set"] = True
+                        st.session_state["_dhan_auth_totp"] = True
+                        st.session_state.pop("_dhan_renew_err", None)
+                        _save_token_cache(_nt)
+                        st.success("✓ Access token issued (~24h) — saved for this session & server cache")
+                        st.rerun()
+                    else:
+                        st.error(_em or "Exchange failed")
+            _re = st.session_state.get("_dhan_renew_err")
+            if _re:
+                st.caption(f"ℹ️ Last auto-renew attempt: {_re[:160]}")
 
     with _tab_kite:
         if st.session_state.get("kite_loaded"):
