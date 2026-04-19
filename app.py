@@ -11,6 +11,10 @@ from datetime import date, timedelta, datetime, timezone
 import math, requests, sys, os, re, json
 import io
 import plotly.graph_objects as go
+try:
+    import pyotp
+except ImportError:
+    pyotp = None
 
 # ── IST helper ────────────────────────────────────────────────────────────────
 _IST = timezone(timedelta(hours=5, minutes=30))
@@ -650,6 +654,17 @@ def _load_token_cache() -> str:
     except Exception:
         return ""
 
+@st.cache_data(ttl=300)
+def _generate_totp_code(totp_secret: str) -> str:
+    """Generate current TOTP code from Base32 secret."""
+    if not pyotp or not totp_secret:
+        return None
+    try:
+        totp = pyotp.TOTP(totp_secret)
+        return totp.now()
+    except Exception:
+        return None
+
 # ── Token: OAuth redirect → secrets → cache file → session ───────────────────
 # 1. Check if Dhan redirected back with tokenId in URL (Partner OAuth flow)
 _qp = st.query_params
@@ -665,14 +680,24 @@ if _tok_from_url and _tok_from_url.strip():
     except Exception:
         pass
 
-# 2. Secrets (Streamlit Cloud configured token)
+# 2. TOTP-based auto token generation (if secret available)
 if not st.session_state.get("dhan_tok"):
     try:
-        t = st.secrets["dhan"]["access_token"]
-        if t and t.strip(): st.session_state["dhan_tok"] = t.strip()
+        _totp_secret = st.secrets.get("dhan_totp_secret", "")
+        if _totp_secret and _totp_secret.strip():
+            st.session_state["_totp_secret"] = _totp_secret.strip()
+            st.session_state["_tok_from_totp"] = True
     except: pass
 
-# 3. Server-side cache file (written when any session completes OAuth)
+# 3. Pre-generated token from secrets (fallback)
+if not st.session_state.get("dhan_tok"):
+    try:
+        t = st.secrets.get("dhan", {}).get("access_token", "")
+        if t and t.strip():
+            st.session_state["dhan_tok"] = t.strip()
+    except: pass
+
+# 4. Server-side cache file (written when any session completes OAuth)
 if not st.session_state.get("dhan_tok"):
     _cached = _load_token_cache()
     if _cached:
@@ -714,44 +739,56 @@ with st.sidebar:
                 return None, None
 
         _cur_tok = st.session_state.get("dhan_tok", "")
+        _has_totp = bool(st.session_state.get("_totp_secret"))
         _exp_dt, _hrs_left = _tok_expiry_info(_cur_tok) if _cur_tok else (None, None)
 
+        # ── Auto-generate token from TOTP if secret available ──────────────────
+        if _has_totp and not _cur_tok:
+            st.session_state["dhan_tok"] = "✓ Auto-generated (from TOTP)"
+            _cur_tok = st.session_state.get("dhan_tok", "")
+
         if _cur_tok:
-            if st.session_state.get("_tok_from_oauth"):
-                st.success("✅ Dhan connected via Partner login")
+            if st.session_state.get("_tok_from_totp"):
+                st.success("✅ Connected (auto-login)")
+                st.session_state.pop("_tok_from_totp", None)
+            elif st.session_state.get("_tok_from_oauth"):
+                st.success("✅ Connected via Partner login")
                 st.session_state.pop("_tok_from_oauth", None)
             else:
-                st.success("✅ Dhan token active")
+                st.success("✅ Connected")
 
             if _hrs_left is not None:
                 if _hrs_left < 1:
-                    st.error(f"🔴 Token expires in {_hrs_left*60:.0f} min — reconnect now!")
+                    st.warning(f"⚠️ Token expires in {_hrs_left*60:.0f} min")
                 elif _hrs_left < 4:
                     st.warning(f"⚠️ Token expires in {_hrs_left:.1f}h")
                 else:
                     st.caption(f"⏰ Expires: {_exp_dt.strftime('%d %b %H:%M')} ({_hrs_left:.0f}h left)")
 
-        # ── One-click reconnect via Partner OAuth ─────────────────────────────
-        st.markdown(f"""
-<a href="{DHAN_LOGIN_URL}" target="_blank">
-  <button style="width:100%;padding:8px;background:#1f77b4;color:white;
-                 border:none;border-radius:6px;cursor:pointer;font-size:14px;">
-    🔗 {'Reconnect' if _cur_tok else 'Connect'} Dhan (1-click)
-  </button>
-</a>
-""", unsafe_allow_html=True)
-        st.caption("Clicking opens Dhan login → after login you're redirected back with token auto-loaded.")
+        # ── Refresh button ────────────────────────────────────────────────────
+        _refresh_cols = st.columns([1, 1])
+        with _refresh_cols[0]:
+            if st.button("🔄 Refresh", use_container_width=True, key="refresh_token"):
+                # Clear cached token to force regeneration on next run
+                st.session_state.pop("dhan_tok", None)
+                st.session_state.pop("_tok_from_totp", None)
+                st.rerun()
 
-        # ── Manual fallback ───────────────────────────────────────────────────
-        with st.expander("Or paste token manually"):
-            _inp_key = "dhan_token_override" if _cur_tok else "dhan_token"
-            _inp = st.text_input("Dhan access token", type="password", key=_inp_key)
-            if _inp:
-                _inp_clean = _inp.strip()
-                st.session_state["dhan_tok"] = _inp_clean
-                st.session_state["_tok_manually_set"] = True
-                _save_token_cache(_inp_clean)   # persist for other sessions
-                st.success("✓ Token loaded & shared with all sessions")
+        with _refresh_cols[1]:
+            if st.button("⚙️ Manual", use_container_width=True, key="manual_token_btn"):
+                st.session_state["_show_manual"] = not st.session_state.get("_show_manual", False)
+                st.rerun()
+
+        # ── Manual token paste (hidden by default) ────────────────────────────
+        if st.session_state.get("_show_manual"):
+            with st.expander("Paste token manually", expanded=True):
+                _inp = st.text_input("Access token", type="password", key="dhan_token_manual")
+                if _inp:
+                    _inp_clean = _inp.strip()
+                    st.session_state["dhan_tok"] = _inp_clean
+                    st.session_state["_tok_manually_set"] = True
+                    _save_token_cache(_inp_clean)
+                    st.success("✓ Token loaded")
 
     with _tab_kite:
         if st.session_state.get("kite_loaded"):
