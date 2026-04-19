@@ -1180,6 +1180,48 @@ def bt_prem_at(df, d, ed, strike, otype, hhmm):
 def bt_get_prem(df, entry_d, exit_d, ed, strike, otype, entry_hhmm="15:00", exit_hhmm="15:00"):
     return bt_prem_at(df, entry_d, ed, strike, otype, entry_hhmm), bt_prem_at(df, exit_d, ed, strike, otype, exit_hhmm)
 
+
+def bt_first_two_leg_entry_exit_premiums(bt_df, entry_d, exit_d, expiry, legs_spec,
+                                         entry_hhmm, exit_hhmm):
+    """Human-readable entry / exit premium pair for the first two legs (Tab 2 Daily Breakdown).
+
+    Uses same entry/exit dates and intrinsic fallback as `bt_gross_pnl_for_legs`. For
+    Bull Put / Bear Call both values are on the same option type — still shown as `a / b`.
+    """
+    if not legs_spec or len(legs_spec) < 2:
+        return "—", "—"
+    ent_parts, xit_parts = [], []
+    for _lbl, strike, otype, side in legs_spec[:2]:
+        e_p, x_p = bt_get_prem(bt_df, entry_d, exit_d, expiry, strike, otype,
+                               entry_hhmm, exit_hhmm)
+        if x_p is None and side == "long" and exit_d == expiry:
+            _esp = (bt_get_spot_at(bt_df, exit_d, exit_hhmm)
+                    or bt_get_spot(bt_df, exit_d))
+            if _esp is not None:
+                x_p = max(0.0, (_esp - strike) if otype == "CE" else (strike - _esp))
+        ent_parts.append(f"₹{e_p:,.1f}" if e_p is not None else "—")
+        xit_parts.append(f"₹{x_p:,.1f}" if x_p is not None else "—")
+    return " / ".join(ent_parts), " / ".join(xit_parts)
+
+
+def _dhan_first_two_premium_cells(details):
+    """Format first two legs from dhan_gross_pnl_for_legs `details` for display."""
+    if not details or len(details) < 2:
+        return "—", "—"
+    ent_parts, xit_parts = [], []
+    for d in details[:2]:
+        e_p, x_p = d.get("entry"), d.get("exit")
+        try:
+            ent_parts.append(f"₹{float(e_p):,.1f}" if e_p is not None else "—")
+        except (TypeError, ValueError):
+            ent_parts.append("—")
+        try:
+            xit_parts.append(f"₹{float(x_p):,.1f}" if x_p is not None else "—")
+        except (TypeError, ValueError):
+            xit_parts.append("—")
+    return " / ".join(ent_parts), " / ".join(xit_parts)
+
+
 @st.cache_data(show_spinner=False)
 def load_iv_history_csv():
     """Load daily IV history from CSV."""
@@ -2984,12 +3026,6 @@ with tab_iv_analysis:
                 else chart_df[["date","iv","straddle","spot","atm_strike","dte","expiry"]].copy()
             _disp = _disp.sort_values("date", ascending=False).reset_index(drop=True)
 
-            # Day-over-day deltas as plain lists (not stored in displayed DataFrame)
-            _iv_delta_arr   = (-_disp["iv"].diff(-1)).tolist()
-            _spot_delta_arr = (-_disp["spot"].diff(-1)).tolist()
-            _vix_delta_arr  = (-_disp["vix"].diff(-1)).tolist() if has_vix \
-                              else [float("nan")] * len(_disp)
-
             def _fmt_exp(e):
                 try:
                     return pd.to_datetime(str(e)).date().strftime("%d %b")
@@ -3015,26 +3051,21 @@ with tab_iv_analysis:
             _iv_rnd        = ROUND["NIFTY 50"]
             _iv_entry_hhmm = "10:00" if "10:00" in _entry_timing else "15:00"
 
-            @st.cache_data(show_spinner=False, ttl=3600)
-            def _iv_best_net_for_row(row_date, row_exp, atm, otm_pct,
-                                      lot, rnd, entry_hhmm, iv_frac):
-                """Cached per-row Best-net pick. Re-loads parquet inside (cheap, also cached)."""
-                df = load_bt_df()
-                if df is None or df.empty:
-                    return None, None
-                bn_st, _ = bt_pick_best_stype_net(
-                    df, True, row_date, row_exp, row_exp,
-                    entry_hhmm, "15:00", float(atm), float(otm_pct),
-                    lot, rnd, None, iv_frac)
-                if not bn_st:
-                    return None, None
-                legs = bt_build_legs(float(atm), float(otm_pct), bn_st, rnd)
-                g, ok = bt_gross_pnl_for_legs(
-                    df, True, row_date, row_exp, row_exp,
-                    entry_hhmm, "15:00", legs, lot, float(atm), None, iv_frac)
-                if not ok:
-                    return bn_st, None
-                return bn_st, int(g)
+            _bd_n = st.radio(
+                "Rows in Daily Breakdown",
+                options=[10, 30],
+                index=0,
+                horizontal=True,
+                key="iv_bd_row_limit",
+                help="Default 10 keeps the table fast. The IV chart below still uses the full date window.",
+            )
+            _disp = _disp.head(int(_bd_n)).reset_index(drop=True)
+
+            # Day-over-day deltas (only for displayed rows)
+            _iv_delta_arr   = (-_disp["iv"].diff(-1)).tolist()
+            _spot_delta_arr = (-_disp["spot"].diff(-1)).tolist()
+            _vix_delta_arr  = (-_disp["vix"].diff(-1)).tolist() if has_vix \
+                              else [float("nan")] * len(_disp)
 
             rows_out, _pnl_vals = [], []
             _loop_total = len(_disp)
@@ -3059,6 +3090,7 @@ with tab_iv_analysis:
                 _pnl_source = "LUT avg × lots (est.)"
                 _pnl_ok = False
                 actual_pnl_1lot = None
+                prem_ent_s, prem_xit_s = "—", "—"
                 _row_date = r["date"]
                 if hasattr(_row_date, "date") and not isinstance(_row_date, date):
                     _row_date = _row_date.date()
@@ -3077,6 +3109,9 @@ with tab_iv_analysis:
                     _legs_m2 = bt_build_legs(float(atm_int), float(_otm), st_type, _iv_rnd)
                     if _row_date <= BT_DATA_END and _iv_bt_df is not None and not _iv_bt_df.empty:
                         try:
+                            prem_ent_s, prem_xit_s = bt_first_two_leg_entry_exit_premiums(
+                                _iv_bt_df, _row_date, _row_exp, _row_exp, _legs_m2,
+                                _iv_entry_hhmm, "15:00")
                             _g, _ok = bt_gross_pnl_for_legs(
                                 _iv_bt_df, True, _row_date, _row_exp, _row_exp,
                                 _iv_entry_hhmm, "15:00", _legs_m2, _iv_lot,
@@ -3089,9 +3124,10 @@ with tab_iv_analysis:
                             pass
                     elif _row_date > BT_DATA_END and _iv_dhan_tok:
                         try:
-                            _g, _ok, _ = dhan_gross_pnl_for_legs(
+                            _g, _ok, _dhan_dets = dhan_gross_pnl_for_legs(
                                 _legs_m2, _row_date, _row_exp, _row_exp, _iv_lot,
                                 _iv_entry_hhmm, "15:00", tok=_iv_dhan_tok)
+                            prem_ent_s, prem_xit_s = _dhan_first_two_premium_cells(_dhan_dets)
                             if _ok:
                                 actual_pnl_1lot = _g
                                 _pnl_ok = True
@@ -3110,31 +3146,6 @@ with tab_iv_analysis:
                 if lut_e and not _pnl_ok and _actual_toggle:
                     _pnl_label = f"₹{total_pnl:+,.0f} (est.)"
 
-                # ── Best-net column (reconciles with Tab 3's bt_pick_best_stype_net) ──
-                # Cached per-row to avoid 5×30 parquet scans on every rerun.
-                best_strat_disp, best_pe_ce, best_pnl_label, best_pnl_pct_label = "—", "—", "—", "—"
-                _bn_total_for_color = float("nan")
-                if (_actual_toggle and atm_int > 0 and _row_exp is not None
-                        and _row_date <= BT_DATA_END):
-                    try:
-                        _otm_for_row = _otm_pct(dte_int)
-                        _bn_st, _bn_g = _iv_best_net_for_row(
-                            _row_date, _row_exp, atm_int, float(_otm_for_row),
-                            _iv_lot, _iv_rnd, _iv_entry_hhmm, iv_val / 100.0)
-                        if _bn_st and _bn_g is not None:
-                            _bn_total = _n_lots * int(_bn_g)
-                            _bn_total_for_color = float(_bn_total)
-                            _bn_pct = (_bn_total / total_cap * 100) if total_cap > 0 else float("nan")
-                            best_strat_disp = BT_STYPE_LABELS.get(_bn_st, _bn_st.upper())
-                            best_pe_ce = _strike_str(atm_int, dte_int, _bn_st)
-                            best_pnl_label = f"₹{_bn_total:+,.0f}"
-                            best_pnl_pct_label = (f"{_bn_pct:+.2f}%"
-                                                  if not math.isnan(_bn_pct) else "—")
-                            if _bn_st == st_type:
-                                best_strat_disp += " ↔"
-                    except Exception:
-                        pass
-
                 row_d = {
                     "Date":          r["date"].strftime("%d %b %y") if hasattr(r["date"], "strftime") else str(r["date"]),
                     "Src":           _src_label(r["date"]),
@@ -3147,12 +3158,10 @@ with tab_iv_analysis:
                     "Expiry":        _fmt_exp(r["expiry"]),
                     "LUT Strategy":  strat,
                     "LUT PE / CE":   _strike_str(atm_int, dte_int, st_type) if lut_e else "—",
+                    "Prem @ entry":  prem_ent_s if lut_e else "—",
+                    "Prem @ exit":   prem_xit_s if lut_e else "—",
                     "LUT P&L":       _pnl_label if lut_e else "—",
                     "LUT P&L %":     f"{pnl_pct:+.2f}%" if (lut_e and not math.isnan(pnl_pct)) else "—",
-                    "Best Strategy": best_strat_disp,
-                    "Best PE / CE":  best_pe_ce,
-                    "Best P&L":      best_pnl_label,
-                    "Best P&L %":    best_pnl_pct_label,
                     "P&L Source":    _pnl_source if lut_e else "—",
                 }
                 rows_out.append(row_d)
@@ -3193,17 +3202,6 @@ with tab_iv_analysis:
                         if c:
                             styles.at[i, "LUT P&L"]   = f"color:{c};font-weight:600"
                             styles.at[i, "LUT P&L %"] = f"color:{c};font-weight:600"
-                    _bp_cell = r.get("Best P&L", "—")
-                    if isinstance(_bp_cell, str) and _bp_cell != "—":
-                        try:
-                            _bp_v = float(_bp_cell.replace("₹", "").replace(",", "")
-                                          .replace("+", "").strip())
-                            cb = "#006400" if _bp_v > 0 else ("#8B0000" if _bp_v < 0 else "")
-                            if cb:
-                                styles.at[i, "Best P&L"]   = f"color:{cb};font-weight:600"
-                                styles.at[i, "Best P&L %"] = f"color:{cb};font-weight:600"
-                        except Exception:
-                            pass
                     if r.get("Src") == "🔴 Live":
                         for col in ["Date","ATM IV %","VIX %","Straddle","Spot"]:
                             if col in styles.columns:
@@ -3211,14 +3209,12 @@ with tab_iv_analysis:
                 return styles
 
             _show_cols = (["Date","Src","ATM IV %","VIX %","Straddle","Spot","ATM","DTE","Expiry",
-                           "LUT Strategy","LUT PE / CE","LUT P&L","LUT P&L %",
-                           "Best Strategy","Best PE / CE","Best P&L","Best P&L %",
-                           "P&L Source"]
+                           "LUT Strategy","LUT PE / CE","Prem @ entry","Prem @ exit",
+                           "LUT P&L","LUT P&L %","P&L Source"]
                           if has_vix else
                           ["Date","Src","ATM IV %","Straddle","Spot","ATM","DTE","Expiry",
-                           "LUT Strategy","LUT PE / CE","LUT P&L","LUT P&L %",
-                           "Best Strategy","Best PE / CE","Best P&L","Best P&L %",
-                           "P&L Source"])
+                           "LUT Strategy","LUT PE / CE","Prem @ entry","Prem @ exit",
+                           "LUT P&L","LUT P&L %","P&L Source"])
             try:
                 st.dataframe(
                     _tbl[_show_cols].style.apply(_color_rows, axis=None),
@@ -3232,11 +3228,14 @@ with tab_iv_analysis:
                              height=min(650, 50 + len(_tbl) * 36))
             st.caption(
                 "ATM Straddle IV%: 🟩 ▲ up · 🟥 ▼ down | Spot: 🟩 ▲ up · 🟥 ▼ down | "
-                "**LUT Strategy** = LUT statistical pick for `DTE × IV × NEUTRAL`; **LUT P&L** is its actual per-trade result "
-                "(📁 Parquet ≤ " + str(BT_DATA_END) + ", 🟡 Dhan after) when the toggle is on, else LUT avg × lots `(est.)`. "
-                "**Best Strategy** = the strategy with the highest realised **net** P&L on that day at the same OTM% — same pick Tab 3 shows. "
-                "`↔` after Best Strategy means LUT pick = Best pick (perfect reconciliation). "
-                "Best column is parquet-only (≤ " + str(BT_DATA_END) + ") to avoid burning Dhan API quota. | "
+                "**LUT Strategy** = statistical pick for `DTE × IV × NEUTRAL`. "
+                "**Prem @ entry / Prem @ exit** = first two legs of the built structure (short put · short call for "
+                "short strangle & IC; long put · long call for long strangle; two puts for bull put; two calls for "
+                "bear call), at your **Entry timing** bar on the trade date "
+                "and **15:00** on expiry (parquet); long legs at expiry use intrinsic if OTM. "
+                "**LUT P&L** = gross P&L for that full leg set × lots from those premiums when the toggle is on "
+                "(📁 Parquet ≤ " + str(BT_DATA_END) + ", 🟡 Dhan daily close after — same engine as Tab 3); "
+                "toggle off → LUT avg × lots `(est.)`. Brokerage not subtracted here (gross). | "
                 f"Capital = {_n_lots} lots × ₹1.25L = ₹{_n_lots * 1.25:.2f}L | "
                 f"Entry: {_entry_timing}"
             )
@@ -3332,7 +3331,8 @@ with tab_iv_analysis:
             st.info("**Formula:** ATM Straddle IV = Black-Scholes BSM (r=6%, q=1.5%) on (CE+PE) ATM straddle  |  "
                     "DTE≥1 rule, nearest weekly expiry (Tuesday from Sep 2025 / Thursday before)  |  "
                     "IVP = 252-day rolling percentile  |  "
-                    "P&L = LUT average per lot × lots (NEUTRAL direction, approx backtested avg)")
+                    "Daily Breakdown P&L = actual gross from leg entry/exit premiums when toggle is on, "
+                    "else LUT average × lots (NEUTRAL).")
 
     except Exception as e:
         st.error(f"Error in IV Analysis: {e}")
