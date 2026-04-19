@@ -740,110 +740,56 @@ if not st.session_state.get("kite_loaded"):
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
-    # ── SECTION 1: Data Source ────────────────────────────────────────────────
-    st.markdown("### 1️⃣ Data Source")
-    st.selectbox("Source", ["DhanHQ API","NSE Bhavcopy (EOD)","Kite Connect"], key="data_src")
 
-    # Token — only show input if NOT already loaded from secrets
-    _tok_from_secret = bool(
-        not st.session_state.get("_tok_manually_set") and
-        st.session_state.get("dhan_tok") and
-        not st.session_state.get("dhan_token")
-    )
-    st.markdown("**📊 Live Data Source**")
-    _tab_dhan, _tab_kite = st.tabs(["Dhan (Primary)", "Kite (Fallback)"])
+    # ── Connection status ─────────────────────────────────────────────────────
+    def _tok_expiry_info(tok_str):
+        try:
+            import base64, json as _json
+            payload = _json.loads(base64.urlsafe_b64decode(tok_str.split('.')[1] + '=='))
+            exp_dt  = datetime.fromtimestamp(payload['exp'])
+            hrs     = (exp_dt - now_ist()).total_seconds() / 3600
+            return exp_dt, hrs
+        except Exception:
+            return None, None
 
-    with _tab_dhan:
-        # ── Decode token expiry from JWT ──────────────────────────────────────
-        def _tok_expiry_info(tok_str):
-            """Return (expires_dt, hours_left) from JWT payload, or (None, None)."""
-            try:
-                import base64, json as _json
-                payload = _json.loads(base64.urlsafe_b64decode(tok_str.split('.')[1] + '=='))
-                exp_dt  = datetime.fromtimestamp(payload['exp'])
-                hrs     = (exp_dt - now_ist()).total_seconds() / 3600
-                return exp_dt, hrs
-            except Exception:
-                return None, None
-
-        _cur_tok = st.session_state.get("dhan_tok", "")
-        _has_totp = bool(st.session_state.get("_totp_secret"))
-        _exp_dt, _hrs_left = _tok_expiry_info(_cur_tok) if _cur_tok else (None, None)
-
-        # ── Auto-generate token from TOTP if secret available ──────────────────
-        if _has_totp and not _cur_tok:
-            st.session_state["dhan_tok"] = "✓ Auto-generated (from TOTP)"
-            _cur_tok = st.session_state.get("dhan_tok", "")
-
-        if _cur_tok:
-            if st.session_state.get("_tok_from_totp"):
-                st.success("✅ Connected (auto-login)")
-                st.session_state.pop("_tok_from_totp", None)
-            elif st.session_state.get("_tok_from_oauth"):
-                st.success("✅ Connected via Partner login")
-                st.session_state.pop("_tok_from_oauth", None)
-            else:
-                st.success("✅ Connected")
-
-            if _hrs_left is not None:
-                if _hrs_left < 1:
-                    st.warning(f"⚠️ Token expires in {_hrs_left*60:.0f} min")
-                elif _hrs_left < 4:
-                    st.warning(f"⚠️ Token expires in {_hrs_left:.1f}h")
-                else:
-                    st.caption(f"⏰ Expires: {_exp_dt.strftime('%d %b %H:%M')} ({_hrs_left:.0f}h left)")
-
-        # ── Refresh button ────────────────────────────────────────────────────
-        _refresh_cols = st.columns([1, 1])
-        with _refresh_cols[0]:
-            if st.button("🔄 Refresh", use_container_width=True, key="refresh_token"):
-                try:
-                    _ts  = str(st.secrets.get("dhan_totp_secret", "")).strip()
-                    _pin = str(st.secrets.get("dhan_pin", "")).strip()
-                    _cid = str(st.secrets.get("dhan_client_id", DHAN_CLIENT_ID)).strip()
-                except Exception:
-                    _ts = _pin = _cid = ""
-                if _ts and _pin:
-                    _generate_totp_code.clear()   # bust cache so fresh code is used
-                    _new_tok = _fetch_token_from_totp(_cid, _ts, _pin)
-                    if _new_tok:
-                        st.session_state["dhan_tok"] = _new_tok
-                        _save_token_cache(_new_tok)
-                        st.session_state.pop("_show_manual", None)
-                        st.rerun()
-                    else:
-                        st.error("Auto-login failed — check PIN/TOTP in secrets.")
-                else:
-                    st.error("dhan_pin or dhan_totp_secret missing in secrets.")
-
-        with _refresh_cols[1]:
-            if st.button("⚙️ Manual", use_container_width=True, key="manual_token_btn"):
-                st.session_state["_show_manual"] = not st.session_state.get("_show_manual", False)
-                st.rerun()
-
-        # ── Manual token paste (hidden by default) ────────────────────────────
-        if st.session_state.get("_show_manual"):
-            with st.expander("Paste token manually", expanded=True):
-                _inp = st.text_input("Access token", type="password", key="dhan_token_manual")
-                if _inp:
-                    _inp_clean = _inp.strip()
-                    st.session_state["dhan_tok"] = _inp_clean
-                    st.session_state["_tok_manually_set"] = True
-                    _save_token_cache(_inp_clean)
-                    st.success("✓ Token loaded")
-
-    with _tab_kite:
-        if st.session_state.get("kite_loaded"):
-            st.success("✅ Kite token configured")
-            st.caption("Kite is ready as fallback when Dhan unavailable")
-        else:
-            st.info("Kite provides fallback LTP when Dhan fails")
-            st.caption("Setup: Run `python kite_token_generator.py` then add to secrets.toml [kite] section")
-
-    tok = st.session_state.get("dhan_tok","")
+    tok     = st.session_state.get("dhan_tok", "")
     has_tok = bool(tok)
+    _exp_dt, _hrs_left = _tok_expiry_info(tok) if has_tok else (None, None)
 
-    # Expiry selectors
+    if has_tok:
+        if _hrs_left is not None and _hrs_left < 1:
+            st.warning(f"⚠️ Session expires in {_hrs_left*60:.0f} min")
+        elif _hrs_left is not None and _hrs_left < 4:
+            st.warning(f"⚠️ Session expires in {_hrs_left:.1f}h")
+        else:
+            st.success("✅ Connected")
+            if _exp_dt:
+                st.caption(f"⏰ Expires: {_exp_dt.strftime('%d %b %H:%M')} ({_hrs_left:.0f}h left)")
+    else:
+        st.error("Not connected — check Secrets (dhan_pin / dhan_totp_secret)")
+
+    if st.button("🔄 Refresh", use_container_width=True, key="refresh_token"):
+        try:
+            _ts  = str(st.secrets.get("dhan_totp_secret", "")).strip()
+            _pin = str(st.secrets.get("dhan_pin", "")).strip()
+            _cid = str(st.secrets.get("dhan_client_id", DHAN_CLIENT_ID)).strip()
+        except Exception:
+            _ts = _pin = _cid = ""
+        if _ts and _pin:
+            _generate_totp_code.clear()
+            _new_tok = _fetch_token_from_totp(_cid, _ts, _pin)
+            if _new_tok:
+                st.session_state["dhan_tok"] = _new_tok
+                _save_token_cache(_new_tok)
+                st.rerun()
+            else:
+                st.error("Refresh failed — check Secrets.")
+        else:
+            st.error("dhan_pin or dhan_totp_secret missing in Secrets.")
+
+    st.markdown("---")
+
+    # ── Expiry selectors ──────────────────────────────────────────────────────
     if has_tok:
         n_exps = fetch_expiry_list(NIFTY_SCRIP_ID, tok)
         s_exps = fetch_expiry_list(SENSEX_SCRIP_ID, tok)
@@ -856,13 +802,9 @@ with st.sidebar:
         sel_n_exp = str(date.today() + timedelta(days=3))
         sel_s_exp = str(date.today() + timedelta(days=4))
 
-    # DTE derived from Nifty expiry
     dte_adj = effective_dte(date.today(), parse_exp(sel_n_exp))
-    st.caption(f"DTE: **{dte_adj}** trading days to {sel_n_exp} (weekends + holidays excluded)")
+    st.caption(f"DTE: **{dte_adj}** trading days to {sel_n_exp}")
 
-    st.caption(
-        f"⏱️ **Dhan cache:** LTP **{DHAN_LTP_TTL // 60}m** · funds/expiry list **{DHAN_MISC_TTL // 60}m** "
-        f"(env `DHAN_LTP_TTL_SECONDS`, `DHAN_MISC_TTL_SECONDS`). **Chains** refresh each **Fetch** click.")
     fetch_btn = st.button("📡 Fetch Live Chain", type="primary", disabled=not has_tok,
                           use_container_width=True, key="fetch_live_btn")
     if fetch_btn:
