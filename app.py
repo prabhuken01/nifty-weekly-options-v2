@@ -8,7 +8,7 @@ import numpy as np
 from scipy.stats import norm
 from scipy.optimize import brentq
 from datetime import date, timedelta, datetime, timezone
-import math, requests, sys, os, re, json, time
+import math, requests, sys, os, re, json, time, hmac, struct, base64
 import io
 import plotly.graph_objects as go
 
@@ -147,6 +147,20 @@ DHAN_LTP_TTL   = max(60, int(os.environ.get("DHAN_LTP_TTL_SECONDS", "900")))    
 DHAN_MISC_TTL  = max(120, int(os.environ.get("DHAN_MISC_TTL_SECONDS", "1800")))   # funds / expiry list
 DHAN_CLIENT_ID  = "1109450231"
 
+
+def load_dhan_credentials():
+    """Load Dhan auth credentials strictly from Streamlit secrets."""
+    try:
+        client_id = str(st.secrets["DHAN_CLIENT_ID"]).strip()
+        pin = str(st.secrets["DHAN_PIN"]).strip()
+        totp_secret = str(st.secrets["DHAN_TOTP_SECRET"]).strip()
+        if client_id and pin and totp_secret:
+            return client_id, pin, totp_secret
+    except Exception:
+        pass
+    st.error("Missing Dhan credentials in Streamlit secrets: DHAN_CLIENT_ID / DHAN_PIN / DHAN_TOTP_SECRET")
+    st.stop()
+
 # Tab 2 ↔ Validation Explorer: same five cores, same ranking order (first wins ties)
 BT_CORE_STYPES = ("ss", "ws", "ic", "bp", "bc")
 BT_STYPE_LABELS = {
@@ -247,14 +261,12 @@ def lut_strategy_base(lut_entry):
 
 # ── Dhan API ──────────────────────────────────────────────────────────────────
 def _dhan_client_id():
-    """Prefer `[dhan] client_id` from Secrets; else built-in default."""
+    """Client ID from strict secrets-only loader."""
     try:
-        v = st.secrets["dhan"].get("client_id")
-        if v and str(v).strip():
-            return str(v).strip()
+        return _DHAN_CLIENT_ID_SEC
     except Exception:
-        pass
-    return str(DHAN_CLIENT_ID)
+        cid, _, _ = load_dhan_credentials()
+        return cid
 
 
 def _hdr(tok):
@@ -274,14 +286,43 @@ def _jwt_expiry_hours_left(tok_str):
         return None, None
 
 
-def dhan_exchange_totp_for_token(client_id: str, pin: str, totp: str):
-    """POST Dhan `generateAccessToken` (PIN + TOTP). Returns (access_token, err_msg)."""
+def _totp_now(secret: str):
+    """Return current 6-digit TOTP from a base32 secret (or pass-through 6-digit code)."""
+    sec = str(secret or "").strip().replace(" ", "")
+    if re.fullmatch(r"\d{6}", sec):
+        return sec
+    try:
+        # Optional fast path when dependency exists.
+        import pyotp  # type: ignore
+        return pyotp.TOTP(sec).now()
+    except Exception:
+        pass
+    try:
+        pad = "=" * ((8 - len(sec) % 8) % 8)
+        key = base64.b32decode((sec + pad).upper(), casefold=True)
+        counter = int(time.time()) // 30
+        msg = struct.pack(">Q", counter)
+        digest = hmac.new(key, msg, digestmod="sha1").digest()
+        off = digest[-1] & 0x0F
+        code = (struct.unpack(">I", digest[off:off + 4])[0] & 0x7FFFFFFF) % 1_000_000
+        return f"{code:06d}"
+    except Exception:
+        return None
+
+
+def dhan_exchange_totp_for_token():
+    """POST Dhan `generateAccessToken` using secrets-loaded client id, pin and totp secret."""
     from urllib.parse import quote
-    cid, pn, tp = str(client_id).strip(), str(pin).strip(), str(totp).strip()
+    try:
+        cid, pn, totp_secret = _DHAN_CLIENT_ID_SEC, _DHAN_PIN_SEC, _DHAN_TOTP_SECRET_SEC
+    except Exception:
+        cid, pn, totp_secret = load_dhan_credentials()
+    tp = _totp_now(totp_secret)
+    cid, pn = str(cid).strip(), str(pn).strip()
     if len(pn) != 6 or not pn.isdigit():
         return None, "PIN must be 6 digits"
     if len(tp) != 6 or not tp.isdigit():
-        return None, "TOTP must be 6 digits"
+        return None, "Invalid TOTP generated from DHAN_TOTP_SECRET"
     url = ("https://auth.dhan.co/app/generateAccessToken?"
            f"dhanClientId={quote(cid, safe='')}&pin={quote(pn, safe='')}&totp={quote(tp, safe='')}")
     try:
@@ -719,6 +760,9 @@ def _load_token_cache() -> str:
     except Exception:
         return ""
 
+# Mandatory secrets-only Dhan credentials check (fails fast if missing)
+_DHAN_CLIENT_ID_SEC, _DHAN_PIN_SEC, _DHAN_TOTP_SECRET_SEC = load_dhan_credentials()
+
 # ── Token: OAuth redirect → secrets → cache file → session ───────────────────
 # 1. Check if Dhan redirected back with tokenId in URL (Partner OAuth flow)
 _qp = st.query_params
@@ -819,42 +863,23 @@ with st.sidebar:
 """, unsafe_allow_html=True)
         st.caption("Clicking opens Dhan login → after login you're redirected back with token auto-loaded.")
 
-        # ── Manual fallback: JWT paste **or** PIN+TOTP (Dhan docs) ────────────
-        with st.expander("Manual login: access token **or** PIN + TOTP"):
-            _auth_m = st.radio(
-                "Method", ["Paste access token", "PIN + TOTP"],
-                horizontal=True, key="dhan_manual_auth_mode",
-                help="Both produce the same JWT used by the app. Broker validity is typically **24h**.")
-            if _auth_m.startswith("Paste"):
-                _inp_key = "dhan_token_override" if _cur_tok else "dhan_token"
-                _inp = st.text_input("Dhan access token (JWT)", type="password", key=_inp_key)
-                if _inp:
-                    _inp_clean = _inp.strip()
-                    st.session_state["dhan_tok"] = _inp_clean
+        # ── Manual fallback: credential values are secrets-only; no credential input UI ──
+        with st.expander("Manual login (secrets-only PIN + TOTP)"):
+            st.caption(
+                "Uses Streamlit secrets keys `DHAN_CLIENT_ID`, `DHAN_PIN`, `DHAN_TOTP_SECRET` only. "
+                "No credential values are read from sidebar inputs.")
+            if st.button("Generate access token from secrets", key="dhan_totp_exchange_btn"):
+                _nt, _em = dhan_exchange_totp_for_token()
+                if _nt:
+                    st.session_state["dhan_tok"] = _nt
                     st.session_state["_tok_manually_set"] = True
-                    st.session_state.pop("_dhan_auth_totp", None)
-                    _save_token_cache(_inp_clean)
-                    st.success("✓ Token loaded & shared with all sessions")
-            else:
-                st.caption(
-                    "Calls Dhan `generateAccessToken`. Use a fresh **6-digit TOTP** from your authenticator. "
-                    "While the JWT is still valid, the app tries **`RenewToken`** when fewer than **3 hours** "
-                    "remain (often works for web-issued tokens; if it fails, exchange PIN+TOTP again).")
-                _cid_in = st.text_input("Dhan Client ID", value=_dhan_client_id(), key="dhan_totp_client_id")
-                _pin_in = st.text_input("6-digit Dhan PIN", type="password", max_chars=6, key="dhan_pin_6")
-                _totp_in = st.text_input("6-digit TOTP", max_chars=6, key="dhan_totp_6")
-                if st.button("Exchange PIN + TOTP for access token", key="dhan_totp_exchange_btn"):
-                    _nt, _em = dhan_exchange_totp_for_token(_cid_in, _pin_in, _totp_in)
-                    if _nt:
-                        st.session_state["dhan_tok"] = _nt
-                        st.session_state["_tok_manually_set"] = True
-                        st.session_state["_dhan_auth_totp"] = True
-                        st.session_state.pop("_dhan_renew_err", None)
-                        _save_token_cache(_nt)
-                        st.success("✓ Access token issued (~24h) — saved for this session & server cache")
-                        st.rerun()
-                    else:
-                        st.error(_em or "Exchange failed")
+                    st.session_state["_dhan_auth_totp"] = True
+                    st.session_state.pop("_dhan_renew_err", None)
+                    _save_token_cache(_nt)
+                    st.success("✓ Access token issued (~24h) — saved for this session & server cache")
+                    st.rerun()
+                else:
+                    st.error(_em or "Token generation failed")
             _re = st.session_state.get("_dhan_renew_err")
             if _re:
                 st.caption(f"ℹ️ Last auto-renew attempt: {_re[:160]}")
