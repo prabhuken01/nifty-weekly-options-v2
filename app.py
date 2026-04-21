@@ -821,12 +821,6 @@ with st.sidebar:
     st.markdown("### 1️⃣ Data Source")
     st.selectbox("Source", ["DhanHQ API","NSE Bhavcopy (EOD)","Kite Connect"], key="data_src")
 
-    # Token — only show input if NOT already loaded from secrets
-    _tok_from_secret = bool(
-        not st.session_state.get("_tok_manually_set") and
-        st.session_state.get("dhan_tok") and
-        not st.session_state.get("dhan_token")
-    )
     st.markdown("**📊 Live Data Source**")
     _tab_dhan, _tab_kite = st.tabs(["Dhan (Primary)", "Kite (Fallback)"])
 
@@ -839,16 +833,16 @@ with st.sidebar:
 
         if _cur_tok:
             if st.session_state.get("_tok_from_oauth"):
-                st.success("✅ Dhan connected via Partner login")
+                st.success("✅ Dhan connected")
                 st.session_state.pop("_tok_from_oauth", None)
             else:
                 st.success("✅ Dhan token active")
 
             if _hrs_left is not None:
                 if _hrs_left < 1:
-                    st.error(f"🔴 Token expires in {_hrs_left*60:.0f} min — reconnect now!")
+                    st.error(f"🔴 Expires in {_hrs_left*60:.0f} min")
                 elif _hrs_left < 4:
-                    st.warning(f"⚠️ Token expires in {_hrs_left:.1f}h")
+                    st.warning(f"⚠️ Expires in {_hrs_left:.1f}h")
                 else:
                     st.caption(f"⏰ Expires: {_exp_dt.strftime('%d %b %H:%M')} ({_hrs_left:.0f}h left)")
 
@@ -861,13 +855,10 @@ with st.sidebar:
   </button>
 </a>
 """, unsafe_allow_html=True)
-        st.caption("Clicking opens Dhan login → after login you're redirected back with token auto-loaded.")
 
         # ── Manual fallback: credential values are secrets-only; no credential input UI ──
-        with st.expander("Manual login (secrets-only PIN + TOTP)"):
-            st.caption(
-                "Uses Streamlit secrets keys `DHAN_CLIENT_ID`, `DHAN_PIN`, `DHAN_TOTP_SECRET` only. "
-                "No credential values are read from sidebar inputs.")
+        with st.expander("Manual token refresh"):
+            st.caption("Uses secrets-only credentials (no sidebar credential inputs).")
             if st.button("Generate access token from secrets", key="dhan_totp_exchange_btn"):
                 _nt, _em = dhan_exchange_totp_for_token()
                 if _nt:
@@ -887,10 +878,8 @@ with st.sidebar:
     with _tab_kite:
         if st.session_state.get("kite_loaded"):
             st.success("✅ Kite token configured")
-            st.caption("Kite is ready as fallback when Dhan unavailable")
         else:
-            st.info("Kite provides fallback LTP when Dhan fails")
-            st.caption("Setup: Run `python kite_token_generator.py` then add to secrets.toml [kite] section")
+            st.info("Kite fallback not configured")
 
     tok = st.session_state.get("dhan_tok","")
     has_tok = bool(tok)
@@ -910,11 +899,7 @@ with st.sidebar:
 
     # DTE derived from Nifty expiry
     dte_adj = effective_dte(date.today(), parse_exp(sel_n_exp))
-    st.caption(f"DTE: **{dte_adj}** trading days to {sel_n_exp} (weekends + holidays excluded)")
-
-    st.caption(
-        f"⏱️ **Dhan cache:** LTP **{DHAN_LTP_TTL // 60}m** · funds/expiry list **{DHAN_MISC_TTL // 60}m** "
-        f"(env `DHAN_LTP_TTL_SECONDS`, `DHAN_MISC_TTL_SECONDS`). **Chains** refresh each **Fetch** click.")
+    st.caption(f"DTE: **{dte_adj}** trading days to {sel_n_exp}")
     fetch_btn = st.button("📡 Fetch Live Chain", type="primary", disabled=not has_tok,
                           use_container_width=True, key="fetch_live_btn")
     if fetch_btn:
@@ -1009,7 +994,9 @@ def make_leg(offsets, side, idx):
     spot       = st.session_state.get("nifty_spot_live" if idx=="NIFTY 50" else "sensex_spot_live", SPOT[idx])
     chain      = st.session_state.get("nifty_chain"     if idx=="NIFTY 50" else "sensex_chain",     {})
     _exp_key = "nifty_exp_used" if idx=="NIFTY 50" else "sensex_exp_used"
-    _cal_dte = max((parse_exp(st.session_state.get(_exp_key, sel_n_exp if idx=="NIFTY 50" else sel_s_exp)) - date.today()).days, 1)
+    _exp_sel = st.session_state.get(_exp_key, sel_n_exp if idx=="NIFTY 50" else sel_s_exp)
+    _cal_dte = max((parse_exp(_exp_sel) - date.today()).days, 1)
+    _trd_dte = effective_dte(date.today(), parse_exp(_exp_sel))
     iv         = live_iv_from_chain(chain, spot, idx, _cal_dte)  # Calendar DTE for Black-Scholes
     lot        = LOT[idx];    rnd = ROUND[idx]
     cap        = capital_base  # same for both (1.25L default or Dhan total)
@@ -1017,6 +1004,22 @@ def make_leg(offsets, side, idx):
     for off in offsets:
         strike = int(round(spot*(1+off)/rnd)*rnd)
         prem = ltp_from_chain(chain, strike, side) if chain else None
+        if not prem and chain:
+            # Sensex/Nifty chains can occasionally miss one rounded strike; use nearest live strike
+            # before falling back to model estimate.
+            try:
+                oc = chain.get("oc", {})
+                kf = [float(k) for k in oc.keys()]
+                if kf:
+                    nearest = min(kf, key=lambda x: abs(x - float(strike)))
+                    tol = max(2 * rnd, 150)
+                    if abs(nearest - float(strike)) <= tol:
+                        nrow = oc.get(str(int(nearest))) or oc.get(str(nearest)) or oc.get(f"{nearest:.1f}") or {}
+                        nltp = nrow.get("ce" if side == "call" else "pe", {}).get("last_price", 0)
+                        if nltp:
+                            prem = round(float(nltp), 1)
+            except Exception:
+                pass
         if not prem:
             base = 1267 if idx=="NIFTY 50" else 450
             prem = round(max(5.0, base*max(0.3,1-(abs(off)-0.005)/0.02)*(iv/0.14)/lot), 1)
@@ -1025,9 +1028,9 @@ def make_leg(offsets, side, idx):
             src = "live"
         profit  = round(prem*lot, 1)
         ret     = round(profit/cap*100, 1)
-        prob    = prob_nd2(spot, strike, iv, dte_adj, side)
-        dlt     = delta_bs(spot, strike, iv, dte_adj, side)
-        theta   = round(prem*lot/dte_adj, 1)
+        prob    = prob_nd2(spot, strike, iv, _trd_dte, side)
+        dlt     = delta_bs(spot, strike, iv, _trd_dte, side)
+        theta   = round(prem*lot/max(_trd_dte, 1), 1)
         vega    = round(-prem*lot*0.15, 1)
         cushion = round(theta/abs(vega), 1) if vega else 0
         score   = comp_score(prob, ret)
